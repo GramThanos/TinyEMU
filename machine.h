@@ -131,8 +131,12 @@ struct VirtMachineClass {
     void (*vm_send_key_event)(VirtMachine *s1, BOOL is_down, uint16_t key_code);
 };
 
+#ifndef CONFIG_X86EMU
 extern const VirtMachineClass riscv_machine_class;
+#endif
+#ifdef CONFIG_X86EMU
 extern const VirtMachineClass pc_machine_class;
+#endif
 
 void __attribute__((format(printf, 1, 2))) vm_error(const char *fmt, ...);
 int vm_get_int(JSONValue obj, const char *name, int *pval);
