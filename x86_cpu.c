@@ -868,6 +868,14 @@ typedef struct {
     uint64_t     fetch_page;   /* vaddr & ~PAGE_MASK of the cached code page */
     uint64_t     fetch_paddr;  /* physical page base address */
     uint8_t     *fetch_ptr;    /* host pointer to fetch_paddr (NULL = I/O region) */
+
+    /*
+     * rip_set: TRUE when a control-flow instruction (JMP/CALL/RET/IRET/INT/Jcc
+     * etc.) has explicitly updated s->rip to the branch target.  The post-decode
+     * RIP update at the end of exec_one is suppressed in this case so that it
+     * does not overwrite the target with the sequential fall-through address.
+     */
+    BOOL         rip_set;
 } DecodeState;
 
 /* Slow path: cross-page or cold fetch — fills the fetch cache then returns byte. */
@@ -1585,6 +1593,7 @@ static void exec_0f(DecodeState *ds)
         s->eflags &= ~EF_IF;
         /* Jump to LSTAR */
         s->rip = s->msr_lstar;
+        ds->rip_set = TRUE;
         break; }
 
     case 0x07: { /* SYSRET (64-bit) */
@@ -1610,6 +1619,7 @@ static void exec_0f(DecodeState *ds)
             s->segs[X86_CPU_SEG_SS].sel   = (uint16_t)((s->msr_star >> 48) - 8) | 3;
             s->segs[X86_CPU_SEG_SS].flags = 0xc0f3;
         }
+        ds->rip_set = TRUE;
         break; }
 
     case 0x06: /* CLTS */
@@ -1732,6 +1742,7 @@ static void exec_0f(DecodeState *ds)
         s->regs[4] = s->sysenter_esp;
         s->rip     = s->sysenter_eip;
         s->eflags &= ~(EF_VM | EF_IF | EF_RF);
+        ds->rip_set = TRUE;
         break; }
 
     case 0x35: { /* SYSEXIT */
@@ -1745,6 +1756,7 @@ static void exec_0f(DecodeState *ds)
         s->segs[X86_CPU_SEG_SS].flags = 0xc093;
         s->regs[4] = s->regs[2]; /* ESP = EDX */
         s->rip     = s->regs[1]; /* EIP = ECX */
+        ds->rip_set = TRUE;
         break; }
 
     case 0x40: { /* CMOVcc r, r/m (0x0) */
@@ -1990,145 +2002,129 @@ static void exec_0f(DecodeState *ds)
     case 0x80: { /* Jcc near (0x0) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x0)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x81: { /* Jcc near (0x1) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x1)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x82: { /* Jcc near (0x2) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x2)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x83: { /* Jcc near (0x3) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x3)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x84: { /* Jcc near (0x4) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x4)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x85: { /* Jcc near (0x5) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x5)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x86: { /* Jcc near (0x6) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x6)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x87: { /* Jcc near (0x7) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x7)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x88: { /* Jcc near (0x8) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x8)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x89: { /* Jcc near (0x9) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0x9)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x8A: { /* Jcc near (0xa) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0xA)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x8B: { /* Jcc near (0xb) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0xB)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x8C: { /* Jcc near (0xc) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0xC)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x8D: { /* Jcc near (0xd) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0xD)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x8E: { /* Jcc near (0xe) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0xE)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x8F: { /* Jcc near (0xf) */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (test_cc(s, 0xF)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x90: { /* SETcc (0x0) */
@@ -2768,6 +2764,7 @@ static void exec_one(DecodeState *ds)
     ds->rep = ds->repne = FALSE;
     ds->rex_r = ds->rex_x = ds->rex_b = 0;
     ds->has_rex = FALSE;
+    ds->rip_set = FALSE; /* no control-flow instruction has updated RIP yet */
 
 prefix_loop:
     op = fetch_byte(ds);
@@ -3592,145 +3589,129 @@ prefix_loop:
     case 0x70: { /* J0 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x0)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x71: { /* J1 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x1)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x72: { /* J2 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x2)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x73: { /* J3 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x3)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x74: { /* J4 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x4)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x75: { /* J5 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x5)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x76: { /* J6 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x6)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x77: { /* J7 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x7)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x78: { /* J8 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x8)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x79: { /* J9 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x9)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x7A: { /* J10 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0xA)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x7B: { /* J11 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0xB)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x7C: { /* J12 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0xC)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x7D: { /* J13 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0xD)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x7E: { /* J14 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0xE)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
     case 0x7F: { /* J15 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0xF)) {
-            if (is_long_mode(s))
-                s->rip = ds->pc + (int64_t)rel;
-            else
-                s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
+            else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
 
@@ -4206,11 +4187,13 @@ prefix_loop:
         if (is_long_mode(s)) { s->rip = pop64(s); s->regs[4] += imm; }
         else if (ds->op32) { s->rip = pop32(s); s->regs[4] = (s->regs[4] & 0xFFFFFFFF00000000ULL) | ((uint32_t)s->regs[4] + imm); }
         else { s->rip = (uint32_t)pop16(s); s->regs[4] = (s->regs[4] & 0xFFFFFFFF00000000ULL) | ((uint32_t)(uint16_t)s->regs[4] + imm); }
+        ds->rip_set = TRUE;
         break; }
     case 0xC3: { /* RET near */
         if (is_long_mode(s)) s->rip = pop64(s);
         else if (ds->op32) s->rip = pop32(s);
         else s->rip = (uint32_t)pop16(s);
+        ds->rip_set = TRUE;
         break; }
     case 0xC4: { /* LES - not in 64-bit; use for VEX prefix placeholder */
         if (is_long_mode(s)) raise_exception(s, EXCP_UD);
@@ -4283,20 +4266,31 @@ prefix_loop:
         s->segs[X86_CPU_SEG_CS].sel = (uint16_t)ret_cs;
         s->rip = ret_ip;
         s->regs[4] = (s->regs[4] & 0xFFFFFFFF00000000ULL) | ((uint32_t)s->regs[4] + imm);
+        ds->rip_set = TRUE;
         break; }
     case 0xCB: { /* RETF */
         uint32_t ret_ip, ret_cs;
         ret_ip = pop32(s); ret_cs = pop32(s);
         s->segs[X86_CPU_SEG_CS].sel = (uint16_t)ret_cs;
         s->rip = ret_ip;
+        ds->rip_set = TRUE;
         break; }
 
-    case 0xCC: /* INT 3 */ x86_do_interrupt(s, 3, FALSE, 0); break;
+    case 0xCC: /* INT 3 */
+        x86_do_interrupt(s, 3, FALSE, 0);
+        ds->rip_set = TRUE;
+        break;
     case 0xCD: { /* INT imm8 */
         uint8_t n = fetch_byte(ds);
         x86_do_interrupt(s, n, FALSE, 0);
+        ds->rip_set = TRUE;
         break; }
-    case 0xCE: /* INTO */ if (s->eflags & EF_OF) x86_do_interrupt(s, 4, FALSE, 0); break;
+    case 0xCE: /* INTO */
+        if (s->eflags & EF_OF) {
+            x86_do_interrupt(s, 4, FALSE, 0);
+            ds->rip_set = TRUE;
+        }
+        break;
     case 0xCF: { /* IRET/IRETD/IRETQ */
         if (is_long_mode(s)) {
             uint64_t new_rip = pop64(s);
@@ -4324,6 +4318,7 @@ prefix_loop:
             s->segs[X86_CPU_SEG_CS].sel = new_cs;
             s->eflags = (s->eflags & ~0xFFFFU) | new_fl;
         }
+        ds->rip_set = TRUE;
         break; }
 
     case 0xD0: { /* GROUP 2 r/m8, 1 */
@@ -4430,6 +4425,7 @@ prefix_loop:
         if (taken) {
             if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
             else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+            ds->rip_set = TRUE;
         }
         break; }
 
@@ -4464,11 +4460,13 @@ prefix_loop:
             push16(s, (uint16_t)((uint32_t)ds->pc - (uint32_t)s->segs[X86_CPU_SEG_CS].base));
             s->rip = (uint32_t)(uint16_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
         }
+        ds->rip_set = TRUE;
         break; }
     case 0xE9: { /* JMP rel near */
         int32_t rel = (int32_t)fetch_dword(ds);
         if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
         else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+        ds->rip_set = TRUE;
         break; }
     case 0xEA: { /* JMP far (not in 64-bit) */
         uint32_t off;
@@ -4477,11 +4475,13 @@ prefix_loop:
         else { off = fetch_word(ds); sel = fetch_word(ds); }
         load_seg_desc(s, X86_CPU_SEG_CS, sel);
         s->rip = off;
+        ds->rip_set = TRUE;
         break; }
     case 0xEB: { /* JMP rel8 */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (is_long_mode(s)) s->rip = ds->pc + (int64_t)rel;
         else s->rip = (uint32_t)(ds->pc + rel - s->segs[X86_CPU_SEG_CS].base);
+        ds->rip_set = TRUE;
         break; }
 
     case 0xEC: { /* IN AL, DX */
@@ -4708,6 +4708,7 @@ prefix_loop:
                 push16(s, (uint16_t)((uint32_t)ds->pc - (uint32_t)s->segs[X86_CPU_SEG_CS].base));
                 s->rip = (uint32_t)(uint16_t)target;
             }
+            ds->rip_set = TRUE;
             break; }
         case 3: { /* CALL far */
             uint32_t off = vmem_read32(s, laddr);
@@ -4716,6 +4717,7 @@ prefix_loop:
             push32(s, (uint32_t)ds->pc - (uint32_t)s->segs[X86_CPU_SEG_CS].base);
             load_seg_desc(s, X86_CPU_SEG_CS, sel);
             s->rip = off;
+            ds->rip_set = TRUE;
             break; }
         case 4: { /* JMP near r/m */
             uint64_t target;
@@ -4724,12 +4726,14 @@ prefix_loop:
             else target = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, laddr);
             if (is_long_mode(s)) s->rip = target;
             else s->rip = (uint32_t)target;
+            ds->rip_set = TRUE;
             break; }
         case 5: { /* JMP far */
             uint32_t off = vmem_read32(s, laddr);
             uint16_t sel = vmem_read16(s, laddr + 4);
             load_seg_desc(s, X86_CPU_SEG_CS, sel);
             s->rip = off;
+            ds->rip_set = TRUE;
             break; }
         case 6: { /* PUSH r/m */
             if (is_long_mode(s)) {
@@ -4753,11 +4757,15 @@ prefix_loop:
         raise_exception(s, EXCP_UD);
     }
 
-    /* Update RIP after successful decode (for non-jump instructions) */
-    if (is_long_mode(s))
-        s->rip = ds->pc;
-    else
-        s->rip = (uint32_t)(ds->pc - s->segs[X86_CPU_SEG_CS].base);
+    /* Update RIP after successful decode.
+     * Skipped when rip_set=TRUE (a control-flow instruction already set RIP to
+     * the branch target; overwriting it with ds->pc would break all jumps). */
+    if (!ds->rip_set) {
+        if (is_long_mode(s))
+            s->rip = ds->pc;
+        else
+            s->rip = (uint32_t)(ds->pc - s->segs[X86_CPU_SEG_CS].base);
+    }
 }/* ------------------------------------------------------------------
  * Interp loop and public API
  * ------------------------------------------------------------------ */
@@ -4858,13 +4866,19 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
     if (!(s->cr0 & CR0_PE)) {
         /*
          * Real mode is not supported.  Print a one-time warning and
-         * suspend execution (power_down) so the machine sleeps rather
-         * than burning 100 % CPU or misinterpreting real-mode code as
-         * protected-mode instructions.
+         * suspend execution (power_down) so the machine sleeps between
+         * PIT ticks rather than burning 100% CPU spinning in the main loop.
+         *
+         * The power_down flag is normally cleared inside do_interp when an
+         * IRQ arrives.  Since we never call do_interp in real mode, clear it
+         * here if an IRQ is pending and interrupts are enabled, so that the
+         * machine wakes up properly when needed (e.g. to re-check CR0.PE).
          */
         if (!s->power_down) {
             fprintf(stderr, "x86: real mode not supported\n");
             s->power_down = TRUE;
+        } else if (s->irq_level && (s->eflags & EF_IF)) {
+            s->power_down = FALSE;
         }
         return;
     }
