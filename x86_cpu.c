@@ -715,6 +715,10 @@ static void flags_adc64(X86CPUState *s, uint64_t a, uint64_t b, uint64_t cin, ui
  * Exception / interrupt delivery
  * ------------------------------------------------------------------ */
 
+/* Forward declaration: raise_exception_err is defined below */
+static void __attribute__((noreturn))
+raise_exception_err(X86CPUState *s, int intno, uint32_t err);
+
 static void x86_do_interrupt(X86CPUState *s, int intno,
                               BOOL has_error_code, uint32_t error_code)
 {
@@ -723,22 +727,21 @@ static void x86_do_interrupt(X86CPUState *s, int intno,
     uint64_t idt_addr;
     uint8_t gate_type;
 
-    if ((uint32_t)(intno * 8 + 7) > idt_limit) {
-        fprintf(stderr, "x86: IDT too small for vector %d\n", intno);
-        exit(1);
-    }
-
     if (is_long_mode(s)) {
-        /* 64-bit IDT gate: 16 bytes */
+        /* 64-bit IDT gate: 16 bytes per entry */
         uint64_t lo, hi;
         uint64_t gate_offset;
         uint16_t gate_sel;
         uint64_t rsp;
 
-        if ((uint32_t)(intno * 16 + 15) > idt_limit) {
-            fprintf(stderr, "x86: 64-bit IDT too small for vector %d\n", intno);
-            exit(1);
-        }
+        /*
+         * If the IDT is too small for this vector, raise #GP.
+         * This happens legitimately before the kernel installs the IDT.
+         * Error code: (vector << 3) | IDT=1, EXT=0.
+         */
+        if ((uint32_t)(intno * 16 + 15) > idt_limit)
+            raise_exception_err(s, EXCP_GP, (intno << 3) | 2);
+
         idt_addr = idt_base + intno * 16;
         lo = phys_read64(s, idt_addr);
         hi = phys_read64(s, idt_addr + 8);
@@ -749,10 +752,12 @@ static void x86_do_interrupt(X86CPUState *s, int intno,
         gate_sel    = (uint16_t)(lo >> 16);
         gate_type   = (uint8_t)(lo >> 40);
 
-        if (!(gate_type & 0x80)) {
-            fprintf(stderr, "x86: 64-bit IDT gate %d not present\n", intno);
-            exit(1);
-        }
+        /*
+         * Gate-not-present (P=0): raise #NP with the gate selector.
+         * Error code: (selector_index << 3) | IDT=1, EXT=0.
+         */
+        if (!(gate_type & 0x80))
+            raise_exception_err(s, EXCP_NP, (gate_sel & ~7) | 2);
 
         rsp = s->regs[4]; /* RSP */
         /* Push SS:RSP (at CPL3→0 no actual stack switch here - simplified) */
@@ -776,11 +781,18 @@ static void x86_do_interrupt(X86CPUState *s, int intno,
             s->eflags &= ~EF_IF;
         s->eflags &= ~(EF_TF | EF_NT | EF_RF);
     } else {
-        /* 32-bit IDT gate: 8 bytes */
+        /* 32-bit IDT gate: 8 bytes per entry */
         uint32_t lo, hi;
         uint32_t gate_offset;
         uint16_t gate_sel;
         uint32_t esp;
+
+        /*
+         * If the IDT is too small for this vector, raise #GP.
+         * Error code: (vector << 3) | IDT=1, EXT=0.
+         */
+        if ((uint32_t)(intno * 8 + 7) > idt_limit)
+            raise_exception_err(s, EXCP_GP, (intno << 3) | 2);
 
         idt_addr = idt_base + intno * 8;
         lo = phys_read32(s, idt_addr);
@@ -790,10 +802,12 @@ static void x86_do_interrupt(X86CPUState *s, int intno,
         gate_sel    = (uint16_t)(lo >> 16);
         gate_type   = (uint8_t)(hi >> 8);
 
-        if (!(gate_type & 0x80)) {
-            fprintf(stderr, "x86: IDT gate %d not present\n", intno);
-            exit(1);
-        }
+        /*
+         * Gate-not-present (P=0): raise #NP.
+         * Error code: (selector_index << 3) | IDT=1, EXT=0.
+         */
+        if (!(gate_type & 0x80))
+            raise_exception_err(s, EXCP_NP, (gate_sel & ~7) | 2);
 
         esp = (uint32_t)s->regs[4];
         esp -= 4; vmem_write32(s, LIN_ADDR(X86_CPU_SEG_SS, esp), s->eflags | EF_FIXED);
@@ -819,7 +833,7 @@ static void __attribute__((noreturn)) raise_exception(X86CPUState *s, int intno)
     longjmp(s->jmp_env, 1);
 }
 
-static void __attribute__((noreturn)) __maybe_unused
+static void __attribute__((noreturn))
 raise_exception_err(X86CPUState *s, int intno, uint32_t err)
 {
     s->exception_num = intno;
