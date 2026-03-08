@@ -2663,6 +2663,74 @@ static void exec_0f(DecodeState *ds)
         }
         break; }
 
+    case 0x09: /* WBINVD: write-back and invalidate caches; no-op in emulation */
+        break;
+
+    case 0x0B: /* UD2: explicitly invalid instruction */
+        raise_exception(s, EXCP_UD);
+        break;
+
+    /*
+     * 0F 18 /0-3: PREFETCHNTA/T0/T1/T2 (prefetch hints, no effect in emulation)
+     * 0F 19-1E:   reserved NOP encodings (treated as NOPs by hardware)
+     * 0F 1F /0:   NOP r/m32 — the standard multi-byte NOP emitted by GCC
+     *             for code-alignment padding.  ALL variants must consume
+     *             their full ModRM + SIB + displacement to advance the PC.
+     */
+    case 0x18:
+    case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E:
+    case 0x1F:
+        /* Consume ModRM + SIB + displacement; the result is discarded. */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
+
+    case 0xAE: {
+        /*
+         * Subgroup dispatched by ModRM.reg:
+         *   0: FXSAVE     1: FXRSTOR   2: LDMXCSR   3: STMXCSR
+         *   4: XSAVE      5: XRSTOR / LFENCE (mod=3)
+         *   6: XSAVEOPT / SFENCE (mod=3)
+         *   7: CLFLUSH  / MFENCE  (mod=3)
+         * Memory barriers and CLFLUSH are no-ops in emulation.
+         * FXSAVE writes a zeroed 512-byte area with default FPU state.
+         * FXRSTOR / LDMXCSR are ignored (no real FPU state).
+         * STMXCSR writes the default MXCSR value (0x1F80).
+         */
+#define FXSAVE_AREA_SIZE 512 /* bytes, per Intel SDM Vol.2A FXSAVE */
+        int ae_reg, ae_rm;
+        uint64_t ae_ea;
+        int ae_seg;
+        decode_modrm(ds, &ae_reg, &ae_rm, &ae_ea, &ae_seg);
+        switch (ae_reg) {
+        case 0: { /* FXSAVE m512 — ae_rm < 0 means memory operand (not register) */
+            if (ae_rm < 0) {
+                uint64_t fxaddr = seg_ea(s, ae_ea, ae_seg);
+                int j;
+                /* Write a zeroed FXSAVE area, then set the fields that
+                 * matter so the kernel sees a sane FPU state. */
+                for (j = 0; j < FXSAVE_AREA_SIZE; j += 8)
+                    vmem_write64(s, fxaddr + j, 0);
+                vmem_write16(s, fxaddr + 0,  0x037F); /* FCW */
+                vmem_write32(s, fxaddr + 24, 0x1F80); /* MXCSR */
+            }
+            break; }
+        case 1: /* FXRSTOR: ignore (no real FPU state to restore) */
+        case 2: /* LDMXCSR: ignore */
+        case 4: /* XSAVE: ignore */
+        case 5: /* XRSTOR / LFENCE: both are no-ops here */
+        case 6: /* XSAVEOPT / SFENCE: no-op */
+        case 7: /* CLFLUSH / MFENCE: no-op */
+            break;
+        case 3: { /* STMXCSR m32 — ae_rm < 0 means memory operand */
+            if (ae_rm < 0)
+                vmem_write32(s, seg_ea(s, ae_ea, ae_seg), 0x1F80);
+            break; }
+        default:
+            break;
+        }
+#undef FXSAVE_AREA_SIZE
+        break; }
+
     default:
         fprintf(stderr, "x86: unhandled 0F opcode 0x%02X at RIP=%llx\n",
                 op2, (unsigned long long)s->rip);
@@ -4707,6 +4775,21 @@ static void do_interp(X86CPUState *s, int max_cycles)
     ds.fetch_ptr  = NULL;
 
     /*
+     * Compute the absolute cycle target for this invocation BEFORE setjmp
+     * so it is visible after any longjmp.  max_cycles is a per-call delta,
+     * not an absolute limit; using cycle_count directly as the limit would
+     * cause the loop to execute zero iterations after the first call.
+     *
+     * target_cycles is volatile so its value is correctly observed after
+     * a longjmp (even though we never modify it after initialisation).
+     *
+     * Overflow of the int64_t addition is not a practical concern: at
+     * 500,000 instructions per call the counter would overflow in ~37,000
+     * years of continuous emulation.
+     */
+    volatile int64_t target_cycles = (int64_t)s->cycle_count + (int64_t)max_cycles;
+
+    /*
      * setjmp called ONCE per do_interp invocation rather than once per
      * instruction.  On a longjmp (exception), we handle the exception
      * below and fall through to resume the main loop.
@@ -4734,7 +4817,7 @@ static void do_interp(X86CPUState *s, int max_cycles)
         /* Fall through to the main loop below */
     }
 
-    while (s->cycle_count < (int64_t)max_cycles) {
+    while (s->cycle_count < target_cycles) {
         /* Check for halted state */
         if (unlikely(s->power_down)) {
             if (s->irq_level && (s->eflags & EF_IF)) {
@@ -4773,12 +4856,19 @@ static void do_interp(X86CPUState *s, int max_cycles)
 void x86_cpu_interp(X86CPUState *s, int max_cycles)
 {
     if (!(s->cr0 & CR0_PE)) {
-        /* Real mode - not fully supported; treat as already in protected mode */
-        fprintf(stderr, "x86: real mode not supported\n");
-        
+        /*
+         * Real mode is not supported.  Print a one-time warning and
+         * suspend execution (power_down) so the machine sleeps rather
+         * than burning 100 % CPU or misinterpreting real-mode code as
+         * protected-mode instructions.
+         */
+        if (!s->power_down) {
+            fprintf(stderr, "x86: real mode not supported\n");
+            s->power_down = TRUE;
+        }
+        return;
     }
     do_interp(s, max_cycles);
-    
 }
 
 X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
