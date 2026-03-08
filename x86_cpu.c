@@ -2213,7 +2213,7 @@ prefix_loop:
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         uint8_t a = get_reg8(s, reg);
         uint8_t b2 = (rm_reg >= 0) ? get_reg8(s, rm_reg) : vmem_read8(s, seg_ea(s, ea, ea_seg));
-        set_reg8(s, reg, alu_op8(s, 7, a, b2));
+        (void)alu_op8(s, 7, a, b2);
         break; }
     case 0x3B: { /* CMP r32, r/m32 */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
@@ -2221,11 +2221,11 @@ prefix_loop:
         if (ds->op32) {
             uint32_t a = s->regs[reg];
             uint32_t b2 = (rm_reg >= 0) ? s->regs[rm_reg] : vmem_read32(s, laddr);
-            s->regs[reg] = alu_op32(s, 7, a, b2);
+            (void)alu_op32(s, 7, a, b2);
         } else {
             uint16_t a = get_reg16(s, reg);
             uint16_t b2 = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, laddr);
-            set_reg16(s, reg, alu_op16(s, 7, a, b2));
+            (void)alu_op16(s, 7, a, b2);
         }
         break; }
     case 0x3C: { /* CMP AL, imm8 */
