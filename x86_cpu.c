@@ -33,6 +33,21 @@
 #include "iomem.h"
 #include "x86_cpu.h"
 
+/* Branch-prediction hints */
+#ifndef likely
+# define likely(x)   __builtin_expect(!!(x), 1)
+# define unlikely(x) __builtin_expect(!!(x), 0)
+#endif
+
+/* Force / prevent inlining */
+#ifdef __GNUC__
+# define ALWAYS_INLINE __attribute__((always_inline)) static inline
+# define NOINLINE      __attribute__((noinline))
+#else
+# define ALWAYS_INLINE static inline
+# define NOINLINE
+#endif
+
 /* EFLAGS bits */
 #define EF_CF    (1U << 0)
 #define EF_FIXED (1U << 1)  /* always 1 */
@@ -83,6 +98,9 @@
 #define EXCP_PF  14
 #define EXCP_MF  16
 #define EXCP_AC  17
+
+/* Maximum number of nested exceptions before treating it as a triple fault */
+#define MAX_EXCEPTION_DEPTH 3
 
 /* TLB */
 #define TLB_SIZE  512
@@ -347,14 +365,14 @@ static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
 static uint64_t virt_to_phys(X86CPUState *s, uint64_t vaddr, BOOL is_write)
 {
     uint64_t paddr;
-    int tlb_idx;
     TLBEntry *tlb;
 
     if (!(s->cr0 & CR0_PG))
         return vaddr;
 
-    tlb_idx = (vaddr >> PAGE_SHIFT) & TLB_MASK;
-    tlb = is_write ? &s->tlb_write[tlb_idx] : &s->tlb_read[tlb_idx];
+    tlb = is_write
+        ? &s->tlb_write[(vaddr >> PAGE_SHIFT) & TLB_MASK]
+        : &s->tlb_read [(vaddr >> PAGE_SHIFT) & TLB_MASK];
     if (tlb->vaddr == (vaddr & ~(uint64_t)PAGE_MASK))
         return tlb->paddr | (vaddr & PAGE_MASK);
 
@@ -375,57 +393,129 @@ static uint64_t virt_to_phys(X86CPUState *s, uint64_t vaddr, BOOL is_write)
 }
 
 /* ------------------------------------------------------------------
- * Virtual memory read/write
+ * Virtual memory read/write — hot paths inline TLB host-pointer lookup,
+ * eliminating the second phys_mem_get_ram_ptr call on every RAM access.
  * ------------------------------------------------------------------ */
 
 #define LIN_ADDR(seg_idx, offset) ((uint64_t)s->segs[seg_idx].base + (uint64_t)(offset))
 
-static uint8_t vmem_read8(X86CPUState *s, uint64_t laddr)
+/* Helper: resolve a virtual address to a physical address, using TLB.
+ * Returns the physical address; also fills *tlb_ptr_out with the TLB's
+ * cached host pointer (NULL for I/O-mapped pages). */
+ALWAYS_INLINE uint64_t vmem_paddr_r(X86CPUState *s, uint64_t laddr,
+                                     uint8_t **tlb_ptr_out)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, FALSE) : laddr;
-    return phys_read8(s, paddr);
+    if (likely(s->cr0 & CR0_PG)) {
+        TLBEntry *tlb = &s->tlb_read[(laddr >> PAGE_SHIFT) & TLB_MASK];
+        if (likely(tlb->vaddr == (laddr & ~(uint64_t)PAGE_MASK))) {
+            *tlb_ptr_out = tlb->ptr;
+            return tlb->paddr | (laddr & PAGE_MASK);
+        }
+        /* TLB miss: walk page tables; virt_to_phys fills tlb->ptr in place. */
+        uint64_t pa = virt_to_phys(s, laddr, FALSE);
+        *tlb_ptr_out = tlb->ptr;
+        return pa;
+    }
+    *tlb_ptr_out = NULL;
+    return laddr;
 }
 
-static uint16_t vmem_read16(X86CPUState *s, uint64_t laddr)
+ALWAYS_INLINE uint64_t vmem_paddr_w(X86CPUState *s, uint64_t laddr,
+                                     uint8_t **tlb_ptr_out)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, FALSE) : laddr;
-    return phys_read16(s, paddr);
+    if (likely(s->cr0 & CR0_PG)) {
+        TLBEntry *tlb = &s->tlb_write[(laddr >> PAGE_SHIFT) & TLB_MASK];
+        if (likely(tlb->vaddr == (laddr & ~(uint64_t)PAGE_MASK))) {
+            *tlb_ptr_out = tlb->ptr;
+            return tlb->paddr | (laddr & PAGE_MASK);
+        }
+        /* TLB miss: walk page tables; virt_to_phys fills tlb->ptr in place. */
+        uint64_t pa = virt_to_phys(s, laddr, TRUE);
+        *tlb_ptr_out = tlb->ptr;
+        return pa;
+    }
+    *tlb_ptr_out = NULL;
+    return laddr;
 }
 
-static uint32_t vmem_read32(X86CPUState *s, uint64_t laddr)
+ALWAYS_INLINE uint8_t vmem_read8(X86CPUState *s, uint64_t laddr)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, FALSE) : laddr;
-    return phys_read32(s, paddr);
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_r(s, laddr, &hp);
+    if (likely(hp))
+        return hp[pa & PAGE_MASK];
+    return phys_read8(s, pa);
 }
 
-static uint64_t vmem_read64(X86CPUState *s, uint64_t laddr)
+ALWAYS_INLINE uint16_t vmem_read16(X86CPUState *s, uint64_t laddr)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, FALSE) : laddr;
-    return phys_read64(s, paddr);
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_r(s, laddr, &hp);
+    if (likely(hp) && likely((pa & PAGE_MASK) <= PAGE_SIZE - 2))
+        return get_le16(hp + (pa & PAGE_MASK));
+    return phys_read16(s, pa);
 }
 
-static void vmem_write8(X86CPUState *s, uint64_t laddr, uint8_t val)
+ALWAYS_INLINE uint32_t vmem_read32(X86CPUState *s, uint64_t laddr)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, TRUE) : laddr;
-    phys_write8(s, paddr, val);
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_r(s, laddr, &hp);
+    if (likely(hp) && likely((pa & PAGE_MASK) <= PAGE_SIZE - 4))
+        return get_le32(hp + (pa & PAGE_MASK));
+    return phys_read32(s, pa);
 }
 
-static void vmem_write16(X86CPUState *s, uint64_t laddr, uint16_t val)
+ALWAYS_INLINE uint64_t vmem_read64(X86CPUState *s, uint64_t laddr)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, TRUE) : laddr;
-    phys_write16(s, paddr, val);
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_r(s, laddr, &hp);
+    if (likely(hp) && likely((pa & PAGE_MASK) <= PAGE_SIZE - 8))
+        return get_le64(hp + (pa & PAGE_MASK));
+    return phys_read64(s, pa);
 }
 
-static void vmem_write32(X86CPUState *s, uint64_t laddr, uint32_t val)
+ALWAYS_INLINE void vmem_write8(X86CPUState *s, uint64_t laddr, uint8_t val)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, TRUE) : laddr;
-    phys_write32(s, paddr, val);
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_w(s, laddr, &hp);
+    if (likely(hp)) {
+        hp[pa & PAGE_MASK] = val;
+        return;
+    }
+    phys_write8(s, pa, val);
 }
 
-static void vmem_write64(X86CPUState *s, uint64_t laddr, uint64_t val)
+ALWAYS_INLINE void vmem_write16(X86CPUState *s, uint64_t laddr, uint16_t val)
 {
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, TRUE) : laddr;
-    phys_write64(s, paddr, val);
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_w(s, laddr, &hp);
+    if (likely(hp) && likely((pa & PAGE_MASK) <= PAGE_SIZE - 2)) {
+        put_le16(hp + (pa & PAGE_MASK), val);
+        return;
+    }
+    phys_write16(s, pa, val);
+}
+
+ALWAYS_INLINE void vmem_write32(X86CPUState *s, uint64_t laddr, uint32_t val)
+{
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_w(s, laddr, &hp);
+    if (likely(hp) && likely((pa & PAGE_MASK) <= PAGE_SIZE - 4)) {
+        put_le32(hp + (pa & PAGE_MASK), val);
+        return;
+    }
+    phys_write32(s, pa, val);
+}
+
+ALWAYS_INLINE void vmem_write64(X86CPUState *s, uint64_t laddr, uint64_t val)
+{
+    uint8_t *hp;
+    uint64_t pa = vmem_paddr_w(s, laddr, &hp);
+    if (likely(hp) && likely((pa & PAGE_MASK) <= PAGE_SIZE - 8)) {
+        put_le64(hp + (pa & PAGE_MASK), val);
+        return;
+    }
+    phys_write64(s, pa, val);
 }
 /* ------------------------------------------------------------------
  * Segment descriptor helpers
@@ -464,17 +554,25 @@ static void load_seg_desc(X86CPUState *s, int seg_idx, uint16_t sel)
  * EFLAGS helpers
  * ------------------------------------------------------------------ */
 
-static uint32_t parity_tab[256];
-
-static void init_parity_table(void)
-{
-    int i, p, v;
-    for (i = 0; i < 256; i++) {
-        p = 0; v = i;
-        while (v) { p ^= (v & 1); v >>= 1; }
-        parity_tab[i] = p ? 0 : EF_PF;
-    }
-}
+/* Pre-computed parity table: EF_PF (=4) when popcount is even, 0 when odd. */
+static const uint32_t parity_tab[256] = {
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0x00-0x0F */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0x10-0x1F */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0x20-0x2F */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0x30-0x3F */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0x40-0x4F */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0x50-0x5F */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0x60-0x6F */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0x70-0x7F */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0x80-0x8F */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0x90-0x9F */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0xA0-0xAF */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0xB0-0xBF */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0xC0-0xCF */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0xD0-0xDF */
+    0,4,4,0,4,0,0,4,4,0,0,4,0,4,4,0,  /* 0xE0-0xEF */
+    4,0,0,4,0,4,4,0,0,4,4,0,4,0,0,4,  /* 0xF0-0xFF */
+};
 
 static uint32_t compute_flags_pzsb8(uint8_t r)
 {
@@ -747,15 +845,46 @@ typedef struct {
     int          rex_x;    /* REX.X: extends SIB.index */
     int          rex_b;    /* REX.B: extends ModRM.rm / SIB.base / opcode reg */
     BOOL         has_rex;  /* REX prefix was seen */
+
+    /*
+     * Instruction-fetch cache: avoids a TLB lookup for every byte of an
+     * instruction.  Invalidated at the start of each instruction dispatch
+     * (see do_interp).  fetch_page == ~0ULL means invalid.
+     */
+    uint64_t     fetch_page;   /* vaddr & ~PAGE_MASK of the cached code page */
+    uint64_t     fetch_paddr;  /* physical page base address */
+    uint8_t     *fetch_ptr;    /* host pointer to fetch_paddr (NULL = I/O region) */
 } DecodeState;
 
-static uint8_t fetch_byte(DecodeState *ds)
+/* Slow path: cross-page or cold fetch — fills the fetch cache then returns byte. */
+static NOINLINE uint8_t fetch_byte_slow(DecodeState *ds, uint64_t vaddr)
 {
     X86CPUState *s = ds->cpu;
-    uint64_t laddr = ds->pc;
-    uint64_t paddr = (s->cr0 & CR0_PG) ? virt_to_phys(s, laddr, FALSE) : laddr;
-    ds->pc++;
+    uint64_t paddr;
+    if (likely(s->cr0 & CR0_PG))
+        paddr = virt_to_phys(s, vaddr, FALSE);
+    else
+        paddr = vaddr;
+
+    uint64_t phys_page = paddr & ~(uint64_t)PAGE_MASK;
+    uint8_t *hp = phys_mem_get_ram_ptr(s->mem_map, phys_page, FALSE);
+    ds->fetch_page  = vaddr & ~(uint64_t)PAGE_MASK;
+    ds->fetch_paddr = phys_page;
+    ds->fetch_ptr   = hp;
+    if (likely(hp))
+        return hp[paddr & PAGE_MASK];
+    /* I/O-mapped code page (extremely unusual) */
     return phys_read8(s, paddr);
+}
+
+/* Hot path: return the byte at ds->pc and advance it by one. */
+ALWAYS_INLINE uint8_t fetch_byte(DecodeState *ds)
+{
+    uint64_t vaddr = ds->pc++;
+    uint64_t page  = vaddr & ~(uint64_t)PAGE_MASK;
+    if (likely(page == ds->fetch_page) && likely(ds->fetch_ptr))
+        return ds->fetch_ptr[vaddr & PAGE_MASK];
+    return fetch_byte_slow(ds, vaddr);
 }
 
 static uint16_t fetch_word(DecodeState *ds)
@@ -4559,11 +4688,41 @@ void x86_cpu_flush_tlb_write_range_ram(X86CPUState *s, uint8_t *ram_ptr, size_t 
 static void do_interp(X86CPUState *s, int max_cycles)
 {
     DecodeState ds;
-    ds.cpu = s;
+    ds.cpu        = s;
+    ds.fetch_page = ~0ULL;   /* invalid — force refill on first fetch */
+    ds.fetch_ptr  = NULL;
+
+    /*
+     * setjmp called ONCE per do_interp invocation rather than once per
+     * instruction.  On a longjmp (exception), we handle the exception
+     * below and fall through to resume the main loop.
+     *
+     * exc_depth is volatile so its value survives the longjmp stack
+     * restoration; it guards against triple-fault infinite loops.
+     */
+    volatile int exc_depth = 0;
+    if (setjmp(s->jmp_env) != 0) {
+        if (++exc_depth > MAX_EXCEPTION_DEPTH) {
+            /* Triple fault: halt the CPU */
+            s->power_down = TRUE;
+            return;
+        }
+        if (s->exception_num >= 0) {
+            int n = s->exception_num;
+            s->exception_num = -1;
+            x86_do_interrupt(s, n,
+                             s->exception_has_error_code,
+                             s->exception_error_code);
+            s->exception_has_error_code = FALSE;
+        }
+        s->cycle_count++;
+        exc_depth = 0;
+        /* Fall through to the main loop below */
+    }
 
     while (s->cycle_count < (int64_t)max_cycles) {
         /* Check for halted state */
-        if (s->power_down) {
+        if (unlikely(s->power_down)) {
             if (s->irq_level && (s->eflags & EF_IF)) {
                 s->power_down = FALSE;
             } else {
@@ -4573,34 +4732,26 @@ static void do_interp(X86CPUState *s, int max_cycles)
         }
 
         /* Pending hardware interrupt */
-        if (s->irq_level && (s->eflags & EF_IF) && s->get_hard_intno) {
+        if (unlikely(s->irq_level && (s->eflags & EF_IF) && s->get_hard_intno)) {
             int intno = s->get_hard_intno(s->get_hard_intno_opaque);
-            if (intno >= 0) {
+            if (intno >= 0)
                 x86_do_interrupt(s, intno, FALSE, 0);
-            }
         }
 
-        /* Set up decode state from current CPU mode */
-        if (is_long_mode(s)) {
+        /* Set up decode PC from CPU mode */
+        if (is_long_mode(s))
             ds.pc = s->rip;
-        } else {
+        else
             ds.pc = (uint64_t)(uint32_t)(s->segs[X86_CPU_SEG_CS].base + (uint32_t)s->rip);
-        }
 
-        s->exception_num = -1;
-        if (setjmp(s->jmp_env) == 0) {
-            exec_one(&ds);
-        } else {
-            /* Exception delivery */
-            if (s->exception_num >= 0) {
-                int n = s->exception_num;
-                s->exception_num = -1;
-                x86_do_interrupt(s, n,
-                                 s->exception_has_error_code,
-                                 s->exception_error_code);
-                s->exception_has_error_code = FALSE;
-            }
-        }
+        /*
+         * Invalidate the fetch cache at every instruction boundary.
+         * This ensures coherency after any instruction that modifies
+         * paging (MOV CR3, INVLPG, etc.) within the previous exec_one.
+         */
+        ds.fetch_page = ~0ULL;
+
+        exec_one(&ds);
         s->cycle_count++;
     }
 }
@@ -4623,7 +4774,6 @@ X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
     s->mem_map = mem_map;
     s->eflags = EF_FIXED;
     s->exception_num = -1;
-    init_parity_table();
     tlb_flush_all(s);
     return s;
 }
