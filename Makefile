@@ -125,11 +125,17 @@ install: $(PROGS)
 	$(STRIP) $(PROGS)
 	$(INSTALL) -m755 $(PROGS) "$(DESTDIR)$(bindir)"
 
+test_x86cpu: tests/test_x86cpu.c x86_cpu.o iomem.o cutils.o
+	$(CC) -O0 -g -I. -o $@ $^ $(EMU_LIBS)
+
+test: test_x86cpu
+	./test_x86cpu
+
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	rm -f *.o *.d *~ $(PROGS) slirp/*.o slirp/*.d slirp/*~
+	rm -f *.o *.d *~ $(PROGS) slirp/*.o slirp/*.d slirp/*~ test_x86cpu
 
 -include $(wildcard *.d)
 -include $(wildcard slirp/*.d)

@@ -271,13 +271,16 @@ static void tlb_flush_for_ram(X86CPUState *s, uint8_t *ram_ptr, size_t ram_size)
     }
 }
 
-/* Raise page fault via longjmp */
+/* Raise page fault via longjmp.
+ * error_code bits: bit 0 = P (page present), bit 1 = W (write), bit 2 = U (user).
+ * Non-present fault: 0 (read) or 2 (write).
+ * Protection fault (WP violation on present page): 3 (present+write). */
 static void __attribute__((noreturn))
-raise_page_fault(X86CPUState *s, uint64_t vaddr, BOOL is_write)
+raise_page_fault(X86CPUState *s, uint64_t vaddr, int error_code)
 {
     s->cr2 = (uint32_t)vaddr; /* CR2 stores faulting address (lower 32 for compat) */
     s->exception_num = EXCP_PF;
-    s->exception_error_code = (is_write ? 2 : 0);
+    s->exception_error_code = error_code;
     s->exception_has_error_code = TRUE;
     longjmp(s->jmp_env, 1);
 }
@@ -289,7 +292,7 @@ static uint64_t walk_32bit_paging(X86CPUState *s, uint32_t vaddr, BOOL is_write)
 
     pde_addr = (s->cr3 & ~0xFFFULL) + (((vaddr >> 22) & 0x3FF) << 2);
     pde = phys_read32(s, pde_addr);
-    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write);
+    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
 
     if (pde & (1 << 7)) {
         /* 4 MB page */
@@ -298,11 +301,9 @@ static uint64_t walk_32bit_paging(X86CPUState *s, uint32_t vaddr, BOOL is_write)
 
     pte_addr = (pde & ~0xFFFU) + (((vaddr >> 12) & 0x3FF) << 2);
     pte = phys_read32(s, pte_addr);
-    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write);
-    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP)) {
-        s->exception_error_code = 3;
-        raise_page_fault(s, vaddr, is_write);
-    }
+    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
+    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP))
+        raise_page_fault(s, vaddr, 3); /* P=1, W=1: protection violation */
     if (!(pde & (1 << 5))) phys_write32(s, pde_addr, pde | (1 << 5));
     if (is_write && !(pte & (1 << 6)))
         phys_write32(s, pte_addr, pte | (1 << 6) | (1 << 5));
@@ -327,19 +328,17 @@ static uint64_t walk_pae_paging(X86CPUState *s, uint32_t vaddr, BOOL is_write)
     /* PDPTE table: CR3[31:5], 32-byte aligned */
     pdpte_addr = (s->cr3 & ~0x1FULL) + (((vaddr >> 30) & 3) << 3);
     pdpte = phys_read64(s, pdpte_addr);
-    if (!(pdpte & 1)) raise_page_fault(s, vaddr, is_write);
+    if (!(pdpte & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
 
     /* PDE: bits 51:12 of PDPTE = PDE table base; index = vaddr[29:21] */
     pde_addr = (pdpte & PAE_PTE_PHYS_MASK) + (((vaddr >> 21) & 0x1FF) << 3);
     pde = phys_read64(s, pde_addr);
-    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write);
+    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
 
     if (pde & (1ULL << 7)) {
         /* 2 MB large page */
-        if (is_write && !(pde & 2) && (s->cr0 & CR0_WP)) {
-            s->exception_error_code = 3;
-            raise_page_fault(s, vaddr, is_write);
-        }
+        if (is_write && !(pde & 2) && (s->cr0 & CR0_WP))
+            raise_page_fault(s, vaddr, 3); /* P=1, W=1 */
         if (!(pde & (1 << 5))) phys_write64(s, pde_addr, pde | (1 << 5));
         if (is_write && !(pde & (1 << 6)))
             phys_write64(s, pde_addr, pde | (1 << 6) | (1 << 5));
@@ -352,11 +351,9 @@ static uint64_t walk_pae_paging(X86CPUState *s, uint32_t vaddr, BOOL is_write)
     /* PTE: bits 51:12 of PDE = PTE table base; index = vaddr[20:12] */
     pte_addr = (pde & PAE_PTE_PHYS_MASK) + (((vaddr >> 12) & 0x1FF) << 3);
     pte = phys_read64(s, pte_addr);
-    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write);
-    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP)) {
-        s->exception_error_code = 3;
-        raise_page_fault(s, vaddr, is_write);
-    }
+    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
+    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP))
+        raise_page_fault(s, vaddr, 3); /* P=1, W=1 */
     if (is_write && !(pte & (1 << 6)))
         phys_write64(s, pte_addr, pte | (1 << 6) | (1 << 5));
     else if (!(pte & (1 << 5)))
@@ -373,12 +370,12 @@ static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
     /* PML4 index: bits 47:39 */
     pml4e_addr = (s->cr3 & PAE_PTE_PHYS_MASK) + (((vaddr >> 39) & 0x1FF) << 3);
     pml4e = phys_read64(s, pml4e_addr);
-    if (!(pml4e & 1)) raise_page_fault(s, vaddr, is_write);
+    if (!(pml4e & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
 
     /* PDPT index: bits 38:30 */
     pdpte_addr = (pml4e & PAE_PTE_PHYS_MASK) + (((vaddr >> 30) & 0x1FF) << 3);
     pdpte = phys_read64(s, pdpte_addr);
-    if (!(pdpte & 1)) raise_page_fault(s, vaddr, is_write);
+    if (!(pdpte & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
 
     /* 1 GB page? (PDPTE.PS=1) */
     if (pdpte & (1ULL << 7)) {
@@ -388,7 +385,7 @@ static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
     /* PD index: bits 29:21 */
     pde_addr = (pdpte & PAE_PTE_PHYS_MASK) + (((vaddr >> 21) & 0x1FF) << 3);
     pde = phys_read64(s, pde_addr);
-    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write);
+    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
 
     /* 2 MB page? (PDE.PS=1) */
     if (pde & (1ULL << 7)) {
@@ -398,11 +395,9 @@ static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
     /* PT index: bits 20:12 */
     pte_addr = (pde & PAE_PTE_PHYS_MASK) + (((vaddr >> 12) & 0x1FF) << 3);
     pte = phys_read64(s, pte_addr);
-    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write);
-    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP)) {
-        s->exception_error_code = 3;
-        raise_page_fault(s, vaddr, is_write);
-    }
+    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write ? 2 : 0);
+    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP))
+        raise_page_fault(s, vaddr, 3); /* P=1, W=1 */
     /* Set accessed/dirty bits */
     if (!(pml4e & (1 << 5))) phys_write64(s, pml4e_addr, pml4e | (1 << 5));
     if (!(pdpte & (1 << 5))) phys_write64(s, pdpte_addr, pdpte | (1 << 5));
@@ -656,7 +651,7 @@ static void flags_add8(X86CPUState *s, uint8_t a, uint8_t b, uint8_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzsb8(r);
     if (r < a)                              s->eflags |= EF_CF;
-    if ((a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if ((uint8_t)(~(a ^ b) & (a ^ r)) >> 7) s->eflags |= EF_OF;
 }
 
@@ -665,7 +660,7 @@ static void flags_add16(X86CPUState *s, uint16_t a, uint16_t b, uint16_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzs16(r);
     if (r < a)                              s->eflags |= EF_CF;
-    if ((uint32_t)(a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((uint32_t)(a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if ((uint16_t)(~(a ^ b) & (a ^ r)) >> 15) s->eflags |= EF_OF;
 }
 
@@ -674,7 +669,7 @@ static void flags_add32(X86CPUState *s, uint32_t a, uint32_t b, uint32_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzs32(r);
     if (r < a)                              s->eflags |= EF_CF;
-    if ((a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if ((~(a ^ b) & (a ^ r)) >> 31)         s->eflags |= EF_OF;
 }
 
@@ -683,7 +678,7 @@ static void flags_add64(X86CPUState *s, uint64_t a, uint64_t b, uint64_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzs64(r);
     if (r < a)                              s->eflags |= EF_CF;
-    if ((a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if ((~(a ^ b) & (a ^ r)) >> 63)         s->eflags |= EF_OF;
 }
 
@@ -692,7 +687,7 @@ static void flags_sub8(X86CPUState *s, uint8_t a, uint8_t b, uint8_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzsb8(r);
     if (a < b)                              s->eflags |= EF_CF;
-    if ((a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if ((uint8_t)((a ^ b) & (a ^ r)) >> 7) s->eflags |= EF_OF;
 }
 
@@ -701,7 +696,7 @@ static void flags_sub16(X86CPUState *s, uint16_t a, uint16_t b, uint16_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzs16(r);
     if (a < b)                              s->eflags |= EF_CF;
-    if ((uint32_t)(a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((uint32_t)(a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if ((uint16_t)((a ^ b) & (a ^ r)) >> 15) s->eflags |= EF_OF;
 }
 
@@ -710,7 +705,7 @@ static void flags_sub32(X86CPUState *s, uint32_t a, uint32_t b, uint32_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzs32(r);
     if (a < b)                              s->eflags |= EF_CF;
-    if ((a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if (((a ^ b) & (a ^ r)) >> 31)          s->eflags |= EF_OF;
 }
 
@@ -719,7 +714,7 @@ static void flags_sub64(X86CPUState *s, uint64_t a, uint64_t b, uint64_t r)
     s->eflags &= ~FLAGS_MASK_ARITH;
     s->eflags |= compute_flags_pzs64(r);
     if (a < b)                              s->eflags |= EF_CF;
-    if ((a ^ b ^ r ^ ((a ^ b ^ 0x10) & 0x10)) & 0x10) s->eflags |= EF_AF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
     if (((a ^ b) & (a ^ r)) >> 63)          s->eflags |= EF_OF;
 }
 
@@ -1532,16 +1527,16 @@ static void do_cpuid(X86CPUState *s)
     switch (eax) {
     case 0:
         s->regs[0] = 7;           /* max basic leaf */
-        s->regs[3] = 0x756e6547; /* 'Genu' in EBX */
-        s->regs[2] = 0x6c65746e; /* 'ntel' in ECX */
-        s->regs[1] = 0x49656e69; /* 'ineI' in EDX */
+        s->regs[3] = 0x756e6547; /* EBX: 'Genu' */
+        s->regs[2] = 0x49656e69; /* EDX: 'ineI' */
+        s->regs[1] = 0x6c65746e; /* ECX: 'ntel' */
         break;
     case 1:
-        s->regs[0] = 0x00000663; /* family 6, model 6, stepping 3 */
-        s->regs[3] = 0;
-        s->regs[2] = 0; /* ECX: no SSE4/AVX here */
+        s->regs[0] = 0x00000663; /* EAX: family 6, model 6, stepping 3 */
+        s->regs[3] = 0;           /* EBX: brand/CLFLUSH/LogIDs (not used) */
+        s->regs[1] = 0;           /* ECX: no SSE4/AVX here */
         /* EDX: FPU PSE TSC MSR PAE CX8 APIC SEP CMOV */
-        s->regs[1] = (1<<0)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<8)|(1<<9)|(1<<11)|(1<<15);
+        s->regs[2] = (1<<0)|(1<<3)|(1<<4)|(1<<5)|(1<<6)|(1<<8)|(1<<9)|(1<<11)|(1<<15);
         break;
     case 0x80000000:
         s->regs[0] = 0x80000004;
@@ -1549,10 +1544,10 @@ static void do_cpuid(X86CPUState *s)
         break;
     case 0x80000001:
         s->regs[0] = 0;
-        s->regs[1] = 0;
-        s->regs[2] = 0;
+        s->regs[3] = 0;           /* EBX: reserved */
+        s->regs[1] = 0;           /* ECX: no LAHF/etc. */
         /* EDX: LM (64-bit) | NX | SYSCALL */
-        s->regs[3] = (1<<29) | (1<<20) | (1<<11);
+        s->regs[2] = (1<<29) | (1<<20) | (1<<11);
         break;
     case 0x80000002:
         /* 'TinyEMU x86-64 CP' */
@@ -4095,7 +4090,8 @@ prefix_loop:
     case 0xA6: { /* CMPS m8, m8 */
         uint64_t cnt = ds->rep || ds->repne ? (ds->op32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -1 : 1;
-        while (cnt--) {
+        while (cnt > 0) {
+            cnt--;
             uint8_t a = vmem_read8(s, seg_ea(s, ds->addr32 ? (uint32_t)s->regs[6] : (uint16_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS));
             uint8_t b = vmem_read8(s, seg_ea(s, ds->addr32 ? (uint32_t)s->regs[7] : (uint16_t)s->regs[7], X86_CPU_SEG_ES));
             (void)alu_op8(s, 7, a, b);
@@ -4110,7 +4106,8 @@ prefix_loop:
         int sz = ds->op64 ? 8 : ds->op32 ? 4 : 2;
         uint64_t cnt = ds->rep || ds->repne ? (ds->op32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -sz : sz;
-        while (cnt--) {
+        while (cnt > 0) {
+            cnt--;
             uint64_t src_lin = seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS);
             uint64_t dst_lin = seg_ea(s, ds->addr64 ? s->regs[7] : (uint32_t)s->regs[7], X86_CPU_SEG_ES);
             if (sz == 8) { uint64_t a = vmem_read64(s, src_lin), b = vmem_read64(s, dst_lin); (void)alu_op64(s, 7, a, b); }
@@ -4173,7 +4170,8 @@ prefix_loop:
     case 0xAE: { /* SCAS AL */
         uint64_t cnt = ds->rep || ds->repne ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -1 : 1;
-        while (cnt--) {
+        while (cnt > 0) {
+            cnt--;
             uint8_t v = vmem_read8(s, seg_ea(s, ds->addr64 ? s->regs[7] : (uint32_t)s->regs[7], X86_CPU_SEG_ES));
             (void)alu_op8(s, 7, (uint8_t)s->regs[0], v);
             s->regs[7] += di_inc;
@@ -4187,7 +4185,8 @@ prefix_loop:
         int sz = ds->op64 ? 8 : ds->op32 ? 4 : 2;
         uint64_t cnt = ds->rep || ds->repne ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -sz : sz;
-        while (cnt--) {
+        while (cnt > 0) {
+            cnt--;
             uint64_t lin = seg_ea(s, ds->addr64 ? s->regs[7] : (uint32_t)s->regs[7], X86_CPU_SEG_ES);
             if (sz == 8) { (void)alu_op64(s, 7, s->regs[0], vmem_read64(s, lin)); }
             else if (sz == 4) { (void)alu_op32(s, 7, (uint32_t)s->regs[0], vmem_read32(s, lin)); }
