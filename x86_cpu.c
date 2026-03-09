@@ -1433,18 +1433,21 @@ static uint64_t pop64(X86CPUState *s)
 static int test_cc(X86CPUState *s, int cc)
 {
     uint32_t ef = s->eflags;
+    int res;
+    /* cc & 0xE selects the base condition; bit 0 inverts it (e.g. JZ vs JNZ) */
     switch (cc & 0xE) {
-    case 0x0: return !!(ef & EF_OF);                           /* O/NO */
-    case 0x2: return !!(ef & EF_CF);                           /* B/NB */
-    case 0x4: return !!(ef & EF_ZF);                           /* E/NE */
-    case 0x6: return !!(ef & (EF_CF|EF_ZF));                   /* BE/A */
-    case 0x8: return !!(ef & EF_SF);                           /* S/NS */
-    case 0xA: return !!(ef & EF_PF);                           /* P/NP */
-    case 0xC: return !!((ef & EF_SF) ^ ((ef & EF_OF) >> 4));  /* L/GE (SF!=OF) */
-    case 0xE: return !!(ef & EF_ZF) ||                         /* LE/G */
-                     !!((ef & EF_SF) ^ ((ef & EF_OF) >> 4));
-    default:  return 0;
+    case 0x0: res = !!(ef & EF_OF); break;                          /* O/NO */
+    case 0x2: res = !!(ef & EF_CF); break;                          /* B/NB */
+    case 0x4: res = !!(ef & EF_ZF); break;                          /* E/NE */
+    case 0x6: res = !!(ef & (EF_CF|EF_ZF)); break;                  /* BE/A */
+    case 0x8: res = !!(ef & EF_SF); break;                          /* S/NS */
+    case 0xA: res = !!(ef & EF_PF); break;                          /* P/NP */
+    case 0xC: res = !!((ef & EF_SF) ^ ((ef & EF_OF) >> 4)); break; /* L/GE */
+    case 0xE: res = !!(ef & EF_ZF) ||                               /* LE/G */
+                    !!((ef & EF_SF) ^ ((ef & EF_OF) >> 4)); break;
+    default:  res = 0; break;
     }
+    return res ^ (cc & 1);  /* odd cc = inverted condition (JNZ, JNC, JNS, ...) */
 }
 
 /* ------------------------------------------------------------------
