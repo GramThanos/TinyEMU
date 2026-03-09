@@ -311,6 +311,59 @@ static uint64_t walk_32bit_paging(X86CPUState *s, uint32_t vaddr, BOOL is_write)
     return (uint64_t)(pte & ~0xFFFU) | (vaddr & PAGE_MASK);
 }
 
+/* 32-bit PAE 3-level page table walk (CR4.PAE=1, not long mode).
+ * PDPTE table is at CR3[31:5] (32-byte aligned, 4 x 8-byte entries).
+ * PDE and PTE tables have 512 x 8-byte entries each.
+ * 2 MB large pages are supported (PDE.PS=1). */
+
+/* Mask for physical address bits in a PAE/long-mode page table entry:
+ * clears the low 12 control bits and the high NX bit (bit 63). */
+#define PAE_PTE_PHYS_MASK  UINT64_C(0x7FFFFFFFFFFFF000)
+
+static uint64_t walk_pae_paging(X86CPUState *s, uint32_t vaddr, BOOL is_write)
+{
+    uint64_t pdpte_addr, pde_addr, pte_addr;
+    uint64_t pdpte, pde, pte;
+    /* PDPTE table: CR3[31:5], 32-byte aligned */
+    pdpte_addr = (s->cr3 & ~0x1FULL) + (((vaddr >> 30) & 3) << 3);
+    pdpte = phys_read64(s, pdpte_addr);
+    if (!(pdpte & 1)) raise_page_fault(s, vaddr, is_write);
+
+    /* PDE: bits 51:12 of PDPTE = PDE table base; index = vaddr[29:21] */
+    pde_addr = (pdpte & PAE_PTE_PHYS_MASK) + (((vaddr >> 21) & 0x1FF) << 3);
+    pde = phys_read64(s, pde_addr);
+    if (!(pde & 1)) raise_page_fault(s, vaddr, is_write);
+
+    if (pde & (1ULL << 7)) {
+        /* 2 MB large page */
+        if (is_write && !(pde & 2) && (s->cr0 & CR0_WP)) {
+            s->exception_error_code = 3;
+            raise_page_fault(s, vaddr, is_write);
+        }
+        if (!(pde & (1 << 5))) phys_write64(s, pde_addr, pde | (1 << 5));
+        if (is_write && !(pde & (1 << 6)))
+            phys_write64(s, pde_addr, pde | (1 << 6) | (1 << 5));
+        return (pde & ~UINT64_C(0x1FFFFF) & ~(UINT64_C(1) << 63)) | (vaddr & 0x1FFFFFU);
+    }
+
+    /* Set PDE accessed bit after validating PDE, before walking PTE */
+    if (!(pde & (1 << 5))) phys_write64(s, pde_addr, pde | (1 << 5));
+
+    /* PTE: bits 51:12 of PDE = PTE table base; index = vaddr[20:12] */
+    pte_addr = (pde & PAE_PTE_PHYS_MASK) + (((vaddr >> 12) & 0x1FF) << 3);
+    pte = phys_read64(s, pte_addr);
+    if (!(pte & 1)) raise_page_fault(s, vaddr, is_write);
+    if (is_write && !(pte & 2) && (s->cr0 & CR0_WP)) {
+        s->exception_error_code = 3;
+        raise_page_fault(s, vaddr, is_write);
+    }
+    if (is_write && !(pte & (1 << 6)))
+        phys_write64(s, pte_addr, pte | (1 << 6) | (1 << 5));
+    else if (!(pte & (1 << 5)))
+        phys_write64(s, pte_addr, pte | (1 << 5));
+    return (pte & PAE_PTE_PHYS_MASK) | (vaddr & PAGE_MASK);
+}
+
 /* 4-level (PML4) page table walk for 64-bit long mode */
 static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
 {
@@ -318,32 +371,32 @@ static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
     uint64_t pml4e, pdpte, pde, pte;
 
     /* PML4 index: bits 47:39 */
-    pml4e_addr = (s->cr3 & ~0xFFFULL) + (((vaddr >> 39) & 0x1FF) << 3);
+    pml4e_addr = (s->cr3 & PAE_PTE_PHYS_MASK) + (((vaddr >> 39) & 0x1FF) << 3);
     pml4e = phys_read64(s, pml4e_addr);
     if (!(pml4e & 1)) raise_page_fault(s, vaddr, is_write);
 
     /* PDPT index: bits 38:30 */
-    pdpte_addr = (pml4e & ~0xFFFULL & ~(1ULL << 63)) + (((vaddr >> 30) & 0x1FF) << 3);
+    pdpte_addr = (pml4e & PAE_PTE_PHYS_MASK) + (((vaddr >> 30) & 0x1FF) << 3);
     pdpte = phys_read64(s, pdpte_addr);
     if (!(pdpte & 1)) raise_page_fault(s, vaddr, is_write);
 
     /* 1 GB page? (PDPTE.PS=1) */
     if (pdpte & (1ULL << 7)) {
-        return (pdpte & ~0x3FFFFFFFULL & ~(1ULL << 63)) | (vaddr & 0x3FFFFFFFU);
+        return (pdpte & ~UINT64_C(0x3FFFFFFF) & ~(UINT64_C(1) << 63)) | (vaddr & 0x3FFFFFFFU);
     }
 
     /* PD index: bits 29:21 */
-    pde_addr = (pdpte & ~0xFFFULL & ~(1ULL << 63)) + (((vaddr >> 21) & 0x1FF) << 3);
+    pde_addr = (pdpte & PAE_PTE_PHYS_MASK) + (((vaddr >> 21) & 0x1FF) << 3);
     pde = phys_read64(s, pde_addr);
     if (!(pde & 1)) raise_page_fault(s, vaddr, is_write);
 
     /* 2 MB page? (PDE.PS=1) */
     if (pde & (1ULL << 7)) {
-        return (pde & ~0x1FFFFFULL & ~(1ULL << 63)) | (vaddr & 0x1FFFFFU);
+        return (pde & ~UINT64_C(0x1FFFFF) & ~(UINT64_C(1) << 63)) | (vaddr & 0x1FFFFFU);
     }
 
     /* PT index: bits 20:12 */
-    pte_addr = (pde & ~0xFFFULL & ~(1ULL << 63)) + (((vaddr >> 12) & 0x1FF) << 3);
+    pte_addr = (pde & PAE_PTE_PHYS_MASK) + (((vaddr >> 12) & 0x1FF) << 3);
     pte = phys_read64(s, pte_addr);
     if (!(pte & 1)) raise_page_fault(s, vaddr, is_write);
     if (is_write && !(pte & 2) && (s->cr0 & CR0_WP)) {
@@ -358,7 +411,7 @@ static uint64_t walk_64bit_paging(X86CPUState *s, uint64_t vaddr, BOOL is_write)
         phys_write64(s, pte_addr, pte | (1 << 6) | (1 << 5));
     else if (!(pte & (1 << 5)))
         phys_write64(s, pte_addr, pte | (1 << 5));
-    return (pte & ~0xFFFULL & ~(1ULL << 63)) | (vaddr & PAGE_MASK);
+    return (pte & PAE_PTE_PHYS_MASK) | (vaddr & PAGE_MASK);
 }
 
 /* Translate virtual → physical address; update TLB */
@@ -379,6 +432,8 @@ static uint64_t virt_to_phys(X86CPUState *s, uint64_t vaddr, BOOL is_write)
     /* Walk page tables based on mode */
     if (is_long_mode(s))
         paddr = walk_64bit_paging(s, vaddr, is_write);
+    else if (s->cr4 & CR4_PAE)
+        paddr = walk_pae_paging(s, (uint32_t)vaddr, is_write);
     else
         paddr = walk_32bit_paging(s, (uint32_t)vaddr, is_write);
 
@@ -4280,16 +4335,31 @@ prefix_loop:
         break; }
 
     case 0xCC: /* INT 3 */
+        /* Trap: push address of *next* instruction (INT3 is 1 byte, already consumed) */
+        if (is_long_mode(s))
+            s->rip = ds->pc;
+        else
+            s->rip = (uint32_t)(ds->pc - s->segs[X86_CPU_SEG_CS].base);
         x86_do_interrupt(s, 3, FALSE, 0);
         ds->rip_set = TRUE;
         break;
     case 0xCD: { /* INT imm8 */
         uint8_t n = fetch_byte(ds);
+        /* Trap: push address of *next* instruction (INT n is 2 bytes, both consumed) */
+        if (is_long_mode(s))
+            s->rip = ds->pc;
+        else
+            s->rip = (uint32_t)(ds->pc - s->segs[X86_CPU_SEG_CS].base);
         x86_do_interrupt(s, n, FALSE, 0);
         ds->rip_set = TRUE;
         break; }
     case 0xCE: /* INTO */
         if (s->eflags & EF_OF) {
+            /* Trap: push address of *next* instruction */
+            if (is_long_mode(s))
+                s->rip = ds->pc;
+            else
+                s->rip = (uint32_t)(ds->pc - s->segs[X86_CPU_SEG_CS].base);
             x86_do_interrupt(s, 4, FALSE, 0);
             ds->rip_set = TRUE;
         }
