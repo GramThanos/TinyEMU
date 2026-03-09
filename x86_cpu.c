@@ -4501,7 +4501,7 @@ prefix_loop:
 
     case 0x0F:
         exec_0f(ds);
-        return;
+        break;
 
     case 0xF4: /* HLT */ s->power_down = TRUE; break;
     case 0xF5: /* CMC */ s->eflags ^= EF_CF; break;
