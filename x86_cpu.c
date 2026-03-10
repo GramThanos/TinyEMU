@@ -1589,6 +1589,57 @@ static void exec_0f(DecodeState *ds)
     int ea_seg;
 
     switch (op2) {
+    case 0x00: { /* GROUP 6: SLDT/STR/LLDT/LTR/VERR/VERW */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        switch (reg) {
+        case 0: { /* SLDT r/m16 */
+            uint16_t v = s->segs[X86_CPU_SEG_LDT].sel;
+            if (rm_reg >= 0) set_reg16(s, rm_reg, v);
+            else vmem_write16(s, seg_ea(s, ea, ea_seg), v);
+            break; }
+        case 1: { /* STR r/m16 */
+            uint16_t v = s->segs[X86_CPU_SEG_TR].sel;
+            if (rm_reg >= 0) set_reg16(s, rm_reg, v);
+            else vmem_write16(s, seg_ea(s, ea, ea_seg), v);
+            break; }
+        case 2: { /* LLDT r/m16 */
+            uint16_t sel = (rm_reg >= 0) ? get_reg16(s, rm_reg)
+                                         : vmem_read16(s, seg_ea(s, ea, ea_seg));
+            load_seg_desc(s, X86_CPU_SEG_LDT, sel);
+            break; }
+        case 3: { /* LTR r/m16 */
+            uint16_t sel = (rm_reg >= 0) ? get_reg16(s, rm_reg)
+                                         : vmem_read16(s, seg_ea(s, ea, ea_seg));
+            load_seg_desc(s, X86_CPU_SEG_TR, sel);
+            /* Mark TSS descriptor as busy (set type bit 1 in GDT entry) */
+            if (sel & ~7) {
+                uint64_t gdt_base = s->segs[X86_CPU_SEG_GDT].base;
+                uint32_t hi = vmem_read32(s, gdt_base + (sel & ~7) + 4);
+                hi |= (1U << 9); /* set "busy" bit in type field */
+                vmem_write32(s, gdt_base + (sel & ~7) + 4, hi);
+            }
+            break; }
+        case 4: { /* VERR r/m16 - verify segment readable; sets ZF if ok */
+            uint16_t sel = (rm_reg >= 0) ? get_reg16(s, rm_reg)
+                                         : vmem_read16(s, seg_ea(s, ea, ea_seg));
+            /* Simplified: set ZF=1 for any non-null, non-LDT selector */
+            if (sel != 0 && !(sel & 4))
+                s->eflags |= EF_ZF;
+            else
+                s->eflags &= ~EF_ZF;
+            break; }
+        case 5: { /* VERW r/m16 - verify segment writable; sets ZF if ok */
+            uint16_t sel = (rm_reg >= 0) ? get_reg16(s, rm_reg)
+                                         : vmem_read16(s, seg_ea(s, ea, ea_seg));
+            if (sel != 0 && !(sel & 4))
+                s->eflags |= EF_ZF;
+            else
+                s->eflags &= ~EF_ZF;
+            break; }
+        default: raise_exception(s, EXCP_UD);
+        }
+        break; }
+
     case 0x01: { /* GROUP 7: SGDT/SIDT/LGDT/LIDT/SMSW/LMSW/INVLPG */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         uint64_t laddr = (rm_reg < 0) ? seg_ea(s, ea, ea_seg) : 0;

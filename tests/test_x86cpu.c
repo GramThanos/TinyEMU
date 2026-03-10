@@ -2799,6 +2799,67 @@ static void test_idt_at_virtual_addr(void)
 }
 
 
+/* =====================================================================
+ * Test: LLDT/LTR/SLDT/STR — GROUP 6 opcodes (0F 00)
+ *
+ * Sets up a GDT with a TSS descriptor at entry 3 (selector 0x18).
+ * Code executes LLDT (null selector), LTR (0x18), then STR into EAX.
+ * Verifies EAX == 0x18 after STR.
+ * ===================================================================== */
+static void test_lldt_ltr(void)
+{
+    /*
+     * Code at 0x1000:
+     *   B8 00 00 00 00   MOV EAX, 0
+     *   0F 00 D0         LLDT EAX           (loads null LDT, sel=0)
+     *   B8 18 00 00 00   MOV EAX, 0x18
+     *   0F 00 D8         LTR EAX            (loads TR from GDT[3])
+     *   0F 00 C8         STR EAX            (stores TR sel into EAX)
+     *   F4               HLT
+     */
+    static const uint8_t code1000[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x00,  /* MOV EAX, 0 */
+        0x0F, 0x00, 0xD0,              /* LLDT EAX (reg=2) */
+        0xB8, 0x18, 0x00, 0x00, 0x00,  /* MOV EAX, 0x18 */
+        0x0F, 0x00, 0xD8,              /* LTR EAX (reg=3) */
+        0x0F, 0x00, 0xC8,              /* STR EAX (reg=1) */
+        0xF4,                          /* HLT */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000, sizeof(code1000));
+
+    /*
+     * GDT at 0x2000: null / code(0x08) / data(0x10) / tss(0x18)
+     * TSS descriptor for selector 0x18:
+     *   base=0x5000, limit=0x67, type=0x89 (32-bit available TSS, P=1)
+     *   lo32 = 0x50000067, hi32 = 0x00008900
+     */
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    /* Extend GDT limit to include entry 3 (0x18) */
+    X86CPUSeg gdt = {0};
+    gdt.base  = 0x2000;
+    gdt.limit = 32 - 1;  /* 4 entries × 8 bytes = 32 */
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_GDT, &gdt);
+
+    /* Write 32-bit TSS descriptor at GDT entry 3 (offset 0x18) */
+    uint32_t tss_lo = 0x50000067U;  /* base[15:0]=0x5000, limit[15:0]=0x0067 */
+    uint32_t tss_hi = 0x00008900U;  /* base[31:24]=0, G=0, limit[19:16]=0, P=1, DPL=0, type=9 */
+    memcpy(m->ram + 0x2018, &tss_lo, 4);
+    memcpy(m->ram + 0x201C, &tss_hi, 4);
+
+    /* Minimal TSS at 0x5000 (just needs to exist in RAM) */
+    memset(m->ram + 0x5000, 0, 0x68);
+
+    run_cpu(m, 200000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    /* STR stores the TR selector (0x18) into EAX */
+    CHECK_EQ(eax & 0xFFFF, 0x18U);
+    machine_free(m);
+}
+
 int main(void)
 {
     fprintf(stderr, "Running x86 CPU emulator tests...\n\n");
@@ -2893,7 +2954,7 @@ int main(void)
     test_fs_segment_override();
     test_rep_movsd();
     test_idt_at_virtual_addr();
-
+    test_lldt_ltr();
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
     if (tests_fail)
