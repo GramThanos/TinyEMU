@@ -982,7 +982,9 @@ static uint64_t fetch_qword(DecodeState *ds)
     return lo | (hi << 32);
 }
 
-static int32_t fetch_imm8s(DecodeState *ds)
+/* Sign-extends a single immediate byte from the instruction stream to 32 bits.
+ * Kept for potential future use; suppressing the unused-function warning. */
+static __attribute__((unused)) int32_t fetch_imm8s(DecodeState *ds)
 {
     return (int32_t)(int8_t)fetch_byte(ds);
 }
@@ -4854,6 +4856,12 @@ static void do_interp(X86CPUState *s, int max_cycles)
     ds.fetch_page = ~0ULL;   /* invalid — force refill on first fetch */
     ds.fetch_ptr  = NULL;
 
+    /* Check once per do_interp invocation whether instruction tracing is on.
+     * Activated by setting X86_TRACE in the environment before execution. */
+    static int trace_enabled = -1;
+    if (unlikely(trace_enabled < 0))
+        trace_enabled = getenv("X86_TRACE") != NULL;
+
     /*
      * Compute the absolute cycle target for this invocation BEFORE setjmp
      * so it is visible after any longjmp.  max_cycles is a per-call delta,
@@ -4928,7 +4936,16 @@ static void do_interp(X86CPUState *s, int max_cycles)
          */
         ds.fetch_page = ~0ULL;
 
+        uint64_t eip_before = s->rip;
         exec_one(&ds);
+        if (unlikely(trace_enabled)) {
+            fprintf(stderr,
+                    "TRACE %08x  eax=%08x ebx=%08x ecx=%08x edx=%08x esp=%08x\n",
+                    (uint32_t)eip_before,
+                    (uint32_t)s->regs[0], (uint32_t)s->regs[3],
+                    (uint32_t)s->regs[1], (uint32_t)s->regs[2],
+                    (uint32_t)s->regs[4]);
+        }
         s->cycle_count++;
     }
 }

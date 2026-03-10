@@ -2202,7 +2202,478 @@ static void test_mem_word_write(void)
     machine_free(m);
 }
 
-/* ---------- main ---------- */
+/* ---------- helpers for interrupt / IDT tests ---------- */
+
+/*
+ * Install a 32-bit interrupt gate into an in-RAM IDT.
+ * The gate has DPL=0, P=1, type=0xE (interrupt gate, clears IF on entry).
+ *   idt_base:    physical address of IDT base in ram[]
+ *   vector:      interrupt vector number (0–255)
+ *   cs_sel:      code segment selector for the handler
+ *   handler_off: flat EIP of the handler
+ */
+static void setup_idt_entry(uint8_t *ram, uint32_t idt_base, int vector,
+                             uint16_t cs_sel, uint32_t handler_off)
+{
+    uint32_t lo = ((uint32_t)cs_sel << 16) | (handler_off & 0xFFFFU);
+    uint32_t hi = (handler_off & 0xFFFF0000U) | (0x8EU << 8); /* P=1, type=0xE */
+    memcpy(ram + idt_base + vector * 8,     &lo, 4);
+    memcpy(ram + idt_base + vector * 8 + 4, &hi, 4);
+}
+
+/* One-shot hardware IRQ callback: fires vector 0x20 exactly once. */
+static int irq_once(void *opaque)
+{
+    int *fired = (int *)opaque;
+    if (!*fired) { *fired = 1; return 0x20; }
+    return -1;
+}
+
+/* =====================================================================
+ * Test 79: Software INT 0x80 + IRET, with EFLAGS.IF preservation check
+ *
+ * Sets IF=1 via STI, issues INT 0x80.  The interrupt gate (type=0xE) clears
+ * IF on entry; IRET restores it.  Verifies:
+ *   EAX = 0xDEAD (handler ran)
+ *   EBX = eflags captured inside handler  -> IF=0
+ *   ECX = eflags captured after IRET      -> IF=1 (restored)
+ * ===================================================================== */
+static void test_int80_iret(void)
+{
+    /*
+     * Main code at 0x1000:
+     *   FB          STI
+     *   CD 80       INT 0x80
+     *   9C          PUSHF         (captures restored eflags after IRET)
+     *   59          POP ECX
+     *   F4          HLT
+     *
+     * Handler at 0x1010:
+     *   B8 AD DE 00 00   MOV EAX, 0xDEAD
+     *   9C               PUSHF    (captures handler eflags, IF should be 0)
+     *   5B               POP EBX
+     *   CF               IRET
+     */
+    static const uint8_t main_code[] = {
+        0xFB,                            /* STI */
+        0xCD, 0x80,                      /* INT 0x80 */
+        0x9C,                            /* PUSHF */
+        0x59,                            /* POP ECX */
+        0xF4,                            /* HLT */
+    };
+    static const uint8_t handler_code[] = {
+        0xB8, 0xAD, 0xDE, 0x00, 0x00,   /* MOV EAX, 0xDEAD */
+        0x9C,                            /* PUSHF */
+        0x5B,                            /* POP EBX */
+        0xCF,                            /* IRET */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, main_code,    sizeof(main_code));
+    memcpy(m->ram + 0x1010, handler_code, sizeof(handler_code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    /* IDT at 0x4000, entry for vector 0x80 (offset 0x80*8=0x400 from base) */
+    setup_idt_entry(m->ram, 0x4000, 0x80, 0x08, 0x1010);
+    X86CPUSeg idt = {0};
+    idt.base  = 0x4000;
+    idt.limit = 0x80 * 8 + 7; /* covers vectors 0..128 */
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_IDT, &idt);
+
+    run_cpu(m, 200000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0); /* 0xDEAD */
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3); /* handler eflags (IF=0) */
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1); /* restored eflags (IF=1) */
+
+    CHECK_EQ(eax, 0xDEADU);
+    CHECK(!(ebx & (1U << 9)));    /* IF=0 inside handler (gate cleared it) */
+    CHECK( (ecx & (1U << 9)));    /* IF=1 after IRET (restored from pushed flags) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 80: Hardware IRQ delivery (vector 0x20) via get_hard_intno callback
+ *
+ * Sets irq_level, enables IF via STI.  The one-shot callback fires vector 0x20
+ * once; the handler sets EAX=0xABCD and IRETs back.
+ * ===================================================================== */
+static void test_hardware_irq(void)
+{
+    /*
+     * Main code at 0x1000:
+     *   FB    STI   (sets IF; hardware IRQ fires before next instruction)
+     *   90    NOP   (resumed after IRET)
+     *   F4    HLT
+     *
+     * Handler at 0x1010:
+     *   B8 CD AB 00 00   MOV EAX, 0xABCD
+     *   CF               IRET
+     */
+    static const uint8_t main_code[] = {
+        0xFB, 0x90, 0xF4,
+    };
+    static const uint8_t handler_code[] = {
+        0xB8, 0xCD, 0xAB, 0x00, 0x00,   /* MOV EAX, 0xABCD */
+        0xCF,                            /* IRET */
+    };
+    int fired = 0;
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, main_code,    sizeof(main_code));
+    memcpy(m->ram + 0x1010, handler_code, sizeof(handler_code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    /* IDT at 0x4000, entry for vector 0x20 */
+    setup_idt_entry(m->ram, 0x4000, 0x20, 0x08, 0x1010);
+    X86CPUSeg idt = {0};
+    idt.base  = 0x4000;
+    idt.limit = 0x20 * 8 + 7;
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_IDT, &idt);
+
+    /* Wire up one-shot IRQ */
+    x86_cpu_set_get_hard_intno(m->cpu, irq_once, &fired);
+    x86_cpu_set_irq(m->cpu, TRUE);
+
+    run_cpu(m, 200000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xABCDU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 81: PUSHF / POPF round-trip — CF preserved across push/pop
+ * ===================================================================== */
+static void test_pushf_popf(void)
+{
+    /*
+     *   F9    STC       ; CF=1
+     *   9C    PUSHF     ; push eflags with CF=1
+     *   F8    CLC       ; CF=0
+     *   9D    POPF      ; restore eflags -> CF=1 again
+     *   9C    PUSHF
+     *   58    POP EAX   ; EAX = restored eflags
+     *   F4    HLT
+     */
+    static const uint8_t code[] = {
+        0xF9, 0x9C, 0xF8, 0x9D, 0x9C, 0x58, 0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((eflags >> 0) & 1);  /* CF=1 restored by POPF */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 82: GDT reload via LGDT + JMP FAR
+ *
+ * Loads a new GDT at 0x6000, then executes a direct far jump to
+ * 0x08:0x7000 which reloads CS from the new GDT and jumps to the
+ * target code.
+ * ===================================================================== */
+static void test_gdt_reload_far_jmp(void)
+{
+    /*
+     * Code at 0x1000:
+     *   0F 01 15 00 50 00 00   LGDT [0x5000]          (load new GDT)
+     *   EA 00 70 00 00 08 00   JMP FAR 0x0008:0x7000  (reload CS + jump)
+     *
+     * Code at 0x7000:
+     *   B8 78 56 34 12         MOV EAX, 0x12345678
+     *   F4                     HLT
+     */
+    static const uint8_t code1000[] = {
+        /* LGDT [0x5000]: 0F 01 /2 + disp32 */
+        0x0F, 0x01, 0x15, 0x00, 0x50, 0x00, 0x00,
+        /* JMP FAR 0x0008:0x7000: EA + off32 + sel16 */
+        0xEA, 0x00, 0x70, 0x00, 0x00, 0x08, 0x00,
+    };
+    static const uint8_t code7000[] = {
+        0xB8, 0x78, 0x56, 0x34, 0x12,   /* MOV EAX, 0x12345678 */
+        0xF4,                            /* HLT */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000, sizeof(code1000));
+    memcpy(m->ram + 0x7000, code7000, sizeof(code7000));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    /* New GDT at 0x6000:
+     *   [0x6000..0x6007]: null descriptor
+     *   [0x6008..0x600F]: code descriptor (flat 32-bit, base=0)
+     *   [0x6010..0x6017]: data descriptor (flat 32-bit, base=0)
+     */
+    uint64_t code_d = 0x00CF9A000000FFFFULL;
+    uint64_t data_d = 0x00CF92000000FFFFULL;
+    memset(m->ram + 0x6000, 0, 8);            /* null */
+    memcpy(m->ram + 0x6008, &code_d, 8);      /* CS selector 0x08 */
+    memcpy(m->ram + 0x6010, &data_d, 8);      /* DS selector 0x10 */
+
+    /* LGDT pseudo-descriptor at 0x5000: { limit=23, base=0x6000 } */
+    uint16_t lim  = 23;
+    uint32_t base = 0x6000;
+    memcpy(m->ram + 0x5000, &lim,  2);
+    memcpy(m->ram + 0x5002, &base, 4);
+
+    run_cpu(m, 200000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x12345678U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 83: Page fault delivery — fault on unmapped page, handler fixes EIP
+ *
+ * Sets up 32-bit paging (identity-map first 256 pages / 1 MB only).
+ * Accessing virtual 0x200000 (page 512, not mapped) triggers #PF.
+ * The handler pops the error code, advances the return EIP past the
+ * faulting instruction, then IRETs back to HLT.
+ * ===================================================================== */
+static void test_page_fault_delivery(void)
+{
+    /*
+     * Code at 0x1000:
+     *   0F 20 C0              MOV EAX, CR0
+     *   0D 00 00 00 80        OR  EAX, 0x80000000
+     *   B9 00 00 10 00        MOV ECX, 0x100000      (page directory phys addr)
+     *   0F 22 D9              MOV CR3, ECX
+     *   0F 22 C0              MOV CR0, EAX            (enable paging)
+     *   8B 1D 00 00 20 00     MOV EBX, [0x200000]    <- PAGE FAULT (EIP=0x1013)
+     *   F4                    HLT                    <- return target (0x1019)
+     *
+     * Handler at 0x1020 (IDT vector 0x0E):
+     *   B8 AD DE 00 00        MOV EAX, 0xDEAD
+     *   5B                    POP EBX                (discard error_code)
+     *   59                    POP ECX                (faulting EIP = 0x1013)
+     *   83 C1 06              ADD ECX, 6             (advance past 6-byte instr)
+     *   51                    PUSH ECX               (push fixed return EIP = 0x1019)
+     *   CF                    IRET
+     */
+    static const uint8_t code1000[] = {
+        0x0F, 0x20, 0xC0,               /* MOV EAX, CR0 */
+        0x0D, 0x00, 0x00, 0x00, 0x80,   /* OR  EAX, 0x80000000 */
+        0xB9, 0x00, 0x00, 0x10, 0x00,   /* MOV ECX, 0x100000 */
+        0x0F, 0x22, 0xD9,               /* MOV CR3, ECX */
+        0x0F, 0x22, 0xC0,               /* MOV CR0, EAX  (paging on) */
+        0x8B, 0x1D, 0x00, 0x00, 0x20, 0x00, /* MOV EBX, [0x200000]  (PF here) */
+        0xF4,                           /* HLT */
+    };
+    static const uint8_t handler1020[] = {
+        0xB8, 0xAD, 0xDE, 0x00, 0x00,   /* MOV EAX, 0xDEAD */
+        0x5B,                            /* POP EBX  (error_code) */
+        0x59,                            /* POP ECX  (faulting EIP) */
+        0x83, 0xC1, 0x06,               /* ADD ECX, 6 */
+        0x51,                            /* PUSH ECX */
+        0xCF,                            /* IRET */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000,    sizeof(code1000));
+    memcpy(m->ram + 0x1020, handler1020, sizeof(handler1020));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    /* Page directory at phys 0x100000: one entry covering first 4 MB */
+    memset(m->ram + 0x100000, 0, 0x1000);
+    uint32_t pde = 0x101000U | 3U;  /* PT at 0x101000, P=1, RW=1 */
+    memcpy(m->ram + 0x100000, &pde, 4);
+
+    /* Page table at phys 0x101000: identity-map first 256 pages (1 MB only) */
+    memset(m->ram + 0x101000, 0, 0x1000);
+    for (int i = 0; i < 256; i++) {
+        uint32_t pte = (uint32_t)(i << 12) | 3U;  /* P=1, RW=1, identity */
+        memcpy(m->ram + 0x101000 + i * 4, &pte, 4);
+    }
+    /* Entries 256..1023 remain 0 (not present); page 0x200 = index 512 → fault */
+
+    /* IDT at 0x4000, entry for vector 0x0E (#PF) */
+    setup_idt_entry(m->ram, 0x4000, 0x0E, 0x08, 0x1020);
+    X86CPUSeg idt = {0};
+    idt.base  = 0x4000;
+    idt.limit = 0x0E * 8 + 7;
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_IDT, &idt);
+
+    run_cpu(m, 500000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xDEADU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 84: PUSHF / POPF preserves CF, PF, ZF, SF, OF simultaneously
+ * ===================================================================== */
+static void test_pushf_popf_all_flags(void)
+{
+    /*
+     * Load a hand-crafted flags value (CF+PF+ZF+SF+OF+FIXED = 0x8C7),
+     * round-trip it through PUSH / POPF / PUSHF / POP, then verify.
+     *
+     *   68 C7 08 00 00   PUSH 0x000008C7
+     *   9D               POPF
+     *   9C               PUSHF
+     *   58               POP EAX
+     *   F4               HLT
+     */
+    static const uint8_t code[] = {
+        0x68, 0xC7, 0x08, 0x00, 0x00,   /* PUSH imm32 = 0x8C7 */
+        0x9D,                            /* POPF */
+        0x9C,                            /* PUSHF */
+        0x58,                            /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ef = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((ef >> 0) & 1);   /* CF */
+    CHECK((ef >> 2) & 1);   /* PF */
+    CHECK((ef >> 6) & 1);   /* ZF */
+    CHECK((ef >> 7) & 1);   /* SF */
+    CHECK((ef >> 11) & 1);  /* OF */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 85: PUSHAD / POPAD stack pivot — all registers preserved
+ * ===================================================================== */
+static void test_pushad_popad(void)
+{
+    /*
+     *   B8 01 00 00 00   MOV EAX, 1
+     *   BB 02 00 00 00   MOV EBX, 2
+     *   B9 03 00 00 00   MOV ECX, 3
+     *   BA 04 00 00 00   MOV EDX, 4
+     *   60               PUSHAD
+     *   31 C0            XOR EAX, EAX
+     *   31 DB            XOR EBX, EBX
+     *   31 C9            XOR ECX, ECX
+     *   31 D2            XOR EDX, EDX
+     *   61               POPAD
+     *   F4               HLT
+     */
+    static const uint8_t code[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00,
+        0xBB, 0x02, 0x00, 0x00, 0x00,
+        0xB9, 0x03, 0x00, 0x00, 0x00,
+        0xBA, 0x04, 0x00, 0x00, 0x00,
+        0x60,
+        0x31, 0xC0, 0x31, 0xDB, 0x31, 0xC9, 0x31, 0xD2,
+        0x61,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 0), 1U); /* EAX */
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 3), 2U); /* EBX */
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 1), 3U); /* ECX */
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 2), 4U); /* EDX */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 86: FS segment override — reads from FS.base + offset, not DS.base
+ *
+ * FS is loaded with base=0x7000 via the API.  The instruction
+ *   64 A0 00 00 00 00   MOV AL, [FS:0]
+ * should read from physical 0x7000, not from physical 0 (DS:0).
+ * ===================================================================== */
+static void test_fs_segment_override(void)
+{
+    /*
+     *   64 A0 00 00 00 00   MOV AL, [FS:disp32=0]
+     *   F4                  HLT
+     */
+    static const uint8_t code[] = {
+        0x64, 0xA0, 0x00, 0x00, 0x00, 0x00,  /* FS: MOV AL, [0] */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    /* Place sentinel at ram[0x7000]; ram[0] stays 0 so a DS read would differ */
+    m->ram[0x7000] = 0xAB;
+
+    /* Configure FS with base=0x7000.  Flags match DS from enter_protected_mode:
+     * bit 9=accessed, bit 11=writable, bit 14=DB(32-bit), bit 15=granularity. */
+    X86CPUSeg fsd = {0};
+    fsd.sel   = 0x10;
+    fsd.base  = 0x7000;
+    fsd.limit = 0xFFFFFFFF;
+    fsd.flags = (1 << 9) | (1 << 11) | (1 << 14) | (1 << 15);
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_FS, &fsd);
+
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax & 0xFFU, 0xABU); /* AL = 0xAB from FS:0 = 0x7000 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 87: REP MOVSD with ES:EDI as destination
+ *
+ * Copies 4 dwords from DS:ESI (0x5000) to ES:EDI (0x6000).
+ * Verifies copied data, ECX=0, ESI/EDI advanced by 16.
+ * ===================================================================== */
+static void test_rep_movsd(void)
+{
+    /*
+     *   BE 00 50 00 00   MOV ESI, 0x5000
+     *   BF 00 60 00 00   MOV EDI, 0x6000
+     *   B9 04 00 00 00   MOV ECX, 4
+     *   F3 A5            REP MOVSD
+     *   F4               HLT
+     */
+    static const uint8_t code[] = {
+        0xBE, 0x00, 0x50, 0x00, 0x00,
+        0xBF, 0x00, 0x60, 0x00, 0x00,
+        0xB9, 0x04, 0x00, 0x00, 0x00,
+        0xF3, 0xA5,
+        0xF4,
+    };
+
+    /* Source data: four distinct dwords */
+    static const uint32_t src[4] = {
+        0x11223344U, 0x55667788U, 0x99AABBCCU, 0xDDEEFF00U,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x5000, src, sizeof(src));
+    memset(m->ram + 0x6000, 0,   sizeof(src));
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    /* Verify all four dwords were copied */
+    uint32_t v;
+    memcpy(&v, m->ram + 0x6000,  4); CHECK_EQ(v, 0x11223344U);
+    memcpy(&v, m->ram + 0x6004,  4); CHECK_EQ(v, 0x55667788U);
+    memcpy(&v, m->ram + 0x6008,  4); CHECK_EQ(v, 0x99AABBCCU);
+    memcpy(&v, m->ram + 0x600C,  4); CHECK_EQ(v, 0xDDEEFF00U);
+
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 1),  0U);       /* ECX = 0 */
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 6),  0x5010U);  /* ESI advanced by 16 */
+    CHECK_EQ(x86_cpu_get_reg(m->cpu, 7),  0x6010U);  /* EDI advanced by 16 */
+    machine_free(m);
+}
+
+
 
 int main(void)
 {
@@ -2286,6 +2757,17 @@ int main(void)
     test_scasb_match();
     test_mem_byte_write();
     test_mem_word_write();
+
+    /* New tests: interrupt delivery, paging, stack, segments */
+    test_int80_iret();
+    test_hardware_irq();
+    test_pushf_popf();
+    test_gdt_reload_far_jmp();
+    test_page_fault_delivery();
+    test_pushf_popf_all_flags();
+    test_pushad_popad();
+    test_fs_segment_override();
+    test_rep_movsd();
 
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
