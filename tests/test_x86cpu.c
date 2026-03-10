@@ -998,6 +998,1210 @@ static void test_af_inc(void)
     machine_free(m);
 }
 
+
+/* =====================================================================
+ * Test 31: JO taken — overflow flag set
+ * ===================================================================== */
+static void test_jo_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0xFF, 0xFF, 0xFF, 0x7F, /* MOV EAX, 0x7FFFFFFF */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1  ; OF=1 */
+        0x70, 0x05,                   /* JO +5 (taken) */
+        0xBB, 0xAD, 0xDE, 0x00, 0x00, /* MOV EBX, 0xDEAD (skipped) */
+        0xBB, 0x01, 0x00, 0x00, 0x00, /* MOV EBX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    CHECK_EQ(ebx, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 32: JO not taken — overflow flag clear
+ * ===================================================================== */
+static void test_jo_not_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1  ; OF=0 */
+        0x70, 0x05,                   /* JO +5 (not taken) */
+        0xBB, 0x02, 0x00, 0x00, 0x00, /* MOV EBX, 2 (executed) */
+        0xEB, 0x05,                   /* JMP +5 */
+        0xBB, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EBX, bad (skipped) */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    CHECK_EQ(ebx, 2U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 33: JB taken — carry flag set
+ * ===================================================================== */
+static void test_jb_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EAX, 0xFFFFFFFF */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1  ; CF=1 */
+        0x72, 0x05,                   /* JB +5 (taken) */
+        0xBB, 0xAD, 0xDE, 0x00, 0x00, /* MOV EBX, 0xDEAD (skipped) */
+        0xBB, 0x01, 0x00, 0x00, 0x00, /* MOV EBX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    CHECK_EQ(ebx, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 34: JB not taken — carry flag clear
+ * ===================================================================== */
+static void test_jb_not_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1  ; CF=0 */
+        0x72, 0x05,                   /* JB +5 (not taken) */
+        0xBB, 0x02, 0x00, 0x00, 0x00, /* MOV EBX, 2 (executed) */
+        0xEB, 0x05,                   /* JMP +5 */
+        0xBB, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EBX, bad (skipped) */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    CHECK_EQ(ebx, 2U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 35: JBE taken — ZF=1 (equal comparison)
+ * ===================================================================== */
+static void test_jbe_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0x03, 0x00, 0x00, 0x00, /* MOV EAX, 3 */
+        0x3D, 0x03, 0x00, 0x00, 0x00, /* CMP EAX, 3  ; ZF=1 */
+        0x76, 0x05,                   /* JBE +5 (taken) */
+        0xB8, 0xAD, 0xDE, 0x00, 0x00, /* MOV EAX, 0xDEAD (skipped) */
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 36: JBE not taken — CF=0, ZF=0 (strictly above)
+ * ===================================================================== */
+static void test_jbe_not_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0x05, 0x00, 0x00, 0x00, /* MOV EAX, 5 */
+        0x3D, 0x03, 0x00, 0x00, 0x00, /* CMP EAX, 3  ; CF=0, ZF=0 */
+        0x76, 0x05,                   /* JBE +5 (not taken) */
+        0xB8, 0x02, 0x00, 0x00, 0x00, /* MOV EAX, 2 (executed) */
+        0xEB, 0x05,                   /* JMP +5 */
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EAX, bad (skipped) */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 2U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 37: JS taken — sign flag set
+ * ===================================================================== */
+static void test_js_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EAX, 0xFFFFFFFF (-1) */
+        0x3D, 0x00, 0x00, 0x00, 0x00, /* CMP EAX, 0  ; SF=1 */
+        0x78, 0x05,                   /* JS +5 (taken) */
+        0xB9, 0xAD, 0xDE, 0x00, 0x00, /* MOV ECX, 0xDEAD (skipped) */
+        0xB9, 0x01, 0x00, 0x00, 0x00, /* MOV ECX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 38: JS not taken — sign flag clear
+ * ===================================================================== */
+static void test_js_not_taken(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1  ; SF=0 */
+        0x78, 0x05,                   /* JS +5 (not taken) */
+        0xB9, 0x02, 0x00, 0x00, 0x00, /* MOV ECX, 2 (executed) */
+        0xEB, 0x05,                   /* JMP +5 */
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV ECX, bad (skipped) */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 2U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 39: JP taken — parity flag set (even number of 1-bits)
+ * ===================================================================== */
+static void test_jp_taken(void)
+{
+    /* 3 = 0b00000011: two set bits -> even parity -> PF=1 */
+    static const uint8_t code[] = {
+        0x31, 0xC0,                   /* XOR EAX, EAX */
+        0x83, 0xC0, 0x03,             /* ADD EAX, 3  ; result=3, PF=1 */
+        0x7A, 0x05,                   /* JP +5 (taken) */
+        0xB9, 0xAD, 0xDE, 0x00, 0x00, /* MOV ECX, 0xDEAD (skipped) */
+        0xB9, 0x01, 0x00, 0x00, 0x00, /* MOV ECX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 40: JP not taken — parity flag clear (odd number of 1-bits)
+ * ===================================================================== */
+static void test_jp_not_taken(void)
+{
+    /* 1 = 0b00000001: one set bit -> odd parity -> PF=0 */
+    static const uint8_t code[] = {
+        0x31, 0xC0,                   /* XOR EAX, EAX */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1  ; result=1, PF=0 */
+        0x7A, 0x05,                   /* JP +5 (not taken) */
+        0xB9, 0x02, 0x00, 0x00, 0x00, /* MOV ECX, 2 (executed) */
+        0xEB, 0x05,                   /* JMP +5 */
+        0xB9, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV ECX, bad (skipped) */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 2U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 41: JL taken — signed less: SF != OF
+ * ===================================================================== */
+static void test_jl_taken(void)
+{
+    /* CMP -1, 0: result=-1, SF=1, OF=0 -> SF!=OF -> JL taken */
+    static const uint8_t code[] = {
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EAX, 0xFFFFFFFF (-1) */
+        0x3D, 0x00, 0x00, 0x00, 0x00, /* CMP EAX, 0  ; SF=1, OF=0 */
+        0x7C, 0x05,                   /* JL +5 (taken) */
+        0xB8, 0xAD, 0xDE, 0x00, 0x00, /* MOV EAX, 0xDEAD (skipped) */
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 42: JLE taken — signed less-or-equal: SF != OF
+ * ===================================================================== */
+static void test_jle_taken(void)
+{
+    /* CMP 2, 3: 2-3=-1, ZF=0, SF=1, OF=0 -> ZF=0 but SF!=OF -> JLE taken */
+    static const uint8_t code[] = {
+        0xB8, 0x02, 0x00, 0x00, 0x00, /* MOV EAX, 2 */
+        0x3D, 0x03, 0x00, 0x00, 0x00, /* CMP EAX, 3  ; SF=1, OF=0 */
+        0x7E, 0x05,                   /* JLE +5 (taken) */
+        0xB8, 0xAD, 0xDE, 0x00, 0x00, /* MOV EAX, 0xDEAD (skipped) */
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 43: JG taken — signed greater: ZF=0 and SF==OF
+ * ===================================================================== */
+static void test_jg_taken(void)
+{
+    /* CMP 5, 3: 5-3=2, ZF=0, SF=0, OF=0 -> ZF=0 && SF==OF -> JG taken */
+    static const uint8_t code[] = {
+        0xB8, 0x05, 0x00, 0x00, 0x00, /* MOV EAX, 5 */
+        0x3D, 0x03, 0x00, 0x00, 0x00, /* CMP EAX, 3  ; ZF=0, SF=0, OF=0 */
+        0x7F, 0x05,                   /* JG +5 (taken) */
+        0xB8, 0xAD, 0xDE, 0x00, 0x00, /* MOV EAX, 0xDEAD (skipped) */
+        0xB8, 0x01, 0x00, 0x00, 0x00, /* MOV EAX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 44: ADC — add with carry
+ * ===================================================================== */
+static void test_adc(void)
+{
+    /* STC; ADC EAX, 1 with EAX=5 -> EAX = 5+1+CF(1) = 7 */
+    static const uint8_t code[] = {
+        0xB8, 0x05, 0x00, 0x00, 0x00, /* MOV EAX, 5 */
+        0xF9,                         /* STC  ; CF=1 */
+        0x83, 0xD0, 0x01,             /* ADC EAX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 7U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 45: SBB — subtract with borrow
+ * ===================================================================== */
+static void test_sbb(void)
+{
+    /* STC; SBB EAX, 1 with EAX=10 -> EAX = 10-1-CF(1) = 8 */
+    static const uint8_t code[] = {
+        0xB8, 0x0A, 0x00, 0x00, 0x00, /* MOV EAX, 10 */
+        0xF9,                         /* STC  ; CF=1 */
+        0x83, 0xD8, 0x01,             /* SBB EAX, 1 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 8U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 46: ROL — rotate left by 1
+ * ===================================================================== */
+static void test_rol(void)
+{
+    /* ROL EAX, 1: 0x80000001 -> 0x00000003, CF=1 (old bit 31) */
+    static const uint8_t code[] = {
+        0xB8, 0x01, 0x00, 0x00, 0x80, /* MOV EAX, 0x80000001 */
+        0xD1, 0xC0,                   /* ROL EAX, 1 */
+        0x89, 0xC3,                   /* MOV EBX, EAX  ; save result */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX  ; flags */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(ebx, 0x00000003U);
+    CHECK((eflags >> 0) & 1); /* CF=1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 47: ROR — rotate right by 1
+ * ===================================================================== */
+static void test_ror(void)
+{
+    /* ROR EAX, 1: 0x00000003 -> 0x80000001, CF=1 (old bit 0) */
+    static const uint8_t code[] = {
+        0xB8, 0x03, 0x00, 0x00, 0x00, /* MOV EAX, 0x00000003 */
+        0xD1, 0xC8,                   /* ROR EAX, 1 */
+        0x89, 0xC3,                   /* MOV EBX, EAX  ; save result */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX  ; flags */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(ebx, 0x80000001U);
+    CHECK((eflags >> 0) & 1); /* CF=1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 48: IMUL two-operand form (0F AF)
+ * ===================================================================== */
+static void test_imul_2op(void)
+{
+    /* IMUL ECX, EDX: ECX=3, EDX=7 -> ECX=21 */
+    static const uint8_t code[] = {
+        0xB9, 0x03, 0x00, 0x00, 0x00, /* MOV ECX, 3 */
+        0xBA, 0x07, 0x00, 0x00, 0x00, /* MOV EDX, 7 */
+        0x0F, 0xAF, 0xCA,             /* IMUL ECX, EDX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 21U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 49: IMUL three-operand imm8 form (6B)
+ * ===================================================================== */
+static void test_imul_3op_imm8(void)
+{
+    /* IMUL ECX, EDX, 5: EDX=4 -> ECX=20 */
+    static const uint8_t code[] = {
+        0xBA, 0x04, 0x00, 0x00, 0x00, /* MOV EDX, 4 */
+        0x6B, 0xCA, 0x05,             /* IMUL ECX, EDX, 5 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 20U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 50: IMUL with negative operand
+ * ===================================================================== */
+static void test_imul_neg(void)
+{
+    /* IMUL EAX, ECX: EAX=4, ECX=-3 -> EAX=-12 (0xFFFFFFF4) */
+    static const uint8_t code[] = {
+        0xB8, 0x04, 0x00, 0x00, 0x00, /* MOV EAX, 4 */
+        0xB9, 0xFD, 0xFF, 0xFF, 0xFF, /* MOV ECX, 0xFFFFFFFD (-3) */
+        0x0F, 0xAF, 0xC1,             /* IMUL EAX, ECX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xFFFFFFF4U); /* -12 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 51: DIV — unsigned division
+ * ===================================================================== */
+static void test_div(void)
+{
+    /* DIV ECX: EDX:EAX=100, ECX=7 -> EAX=14 (quotient), EDX=2 (remainder) */
+    static const uint8_t code[] = {
+        0xB8, 0x64, 0x00, 0x00, 0x00, /* MOV EAX, 100 */
+        0xBA, 0x00, 0x00, 0x00, 0x00, /* MOV EDX, 0 */
+        0xB9, 0x07, 0x00, 0x00, 0x00, /* MOV ECX, 7 */
+        0xF7, 0xF1,                   /* DIV ECX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ(eax, 14U); /* quotient */
+    CHECK_EQ(edx, 2U);  /* remainder */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 52: IDIV — signed division
+ * ===================================================================== */
+static void test_idiv(void)
+{
+    /* IDIV ECX: EDX:EAX=-13, ECX=4 -> EAX=-3 (0xFFFFFFFD), EDX=-1 (0xFFFFFFFF) */
+    static const uint8_t code[] = {
+        0xB8, 0xF3, 0xFF, 0xFF, 0xFF, /* MOV EAX, 0xFFFFFFF3 (-13) */
+        0xBA, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EDX, 0xFFFFFFFF (high dword of sign-extended -13) */
+        0xB9, 0x04, 0x00, 0x00, 0x00, /* MOV ECX, 4 */
+        0xF7, 0xF9,                   /* IDIV ECX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ(eax, 0xFFFFFFFDU); /* quotient -3 */
+    CHECK_EQ(edx, 0xFFFFFFFFU); /* remainder -1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 53: CLC / STC / CMC — flag control instructions
+ * ===================================================================== */
+static void test_clc_stc_cmc(void)
+{
+    /* CLC (CF=0) -> STC (CF=1) -> CMC (CF=0); verify CF=0 */
+    static const uint8_t code[] = {
+        0xF8,  /* CLC */
+        0xF9,  /* STC */
+        0xF5,  /* CMC  ; CF: 1 -> 0 */
+        0x9C,  /* PUSHF */
+        0x58,  /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK(!((eflags >> 0) & 1)); /* CF=0 after CMC on CF=1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 54: CWDE — sign-extend AX to EAX
+ * ===================================================================== */
+static void test_cwde(void)
+{
+    /* AX=0xFF80 (negative 16-bit), CWDE -> EAX=0xFFFFFF80 */
+    static const uint8_t code[] = {
+        0xB8, 0x80, 0xFF, 0x00, 0x00, /* MOV EAX, 0x0000FF80 */
+        0x98,                         /* CWDE */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xFFFFFF80U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 55: CDQ — sign-extend EAX to EDX:EAX
+ * ===================================================================== */
+static void test_cdq(void)
+{
+    /* EAX=0x80000000 (negative), CDQ -> EDX=0xFFFFFFFF */
+    static const uint8_t code[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x80, /* MOV EAX, 0x80000000 */
+        0x99,                         /* CDQ */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ(edx, 0xFFFFFFFFU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 56: ENTER / LEAVE — stack frame setup and teardown
+ * ===================================================================== */
+static void test_enter_leave(void)
+{
+    /*
+     * ESP starts at 0x3000, EBP starts at 0.
+     * ENTER 8, 0: push EBP -> ESP=0x2FFC; EBP=0x2FFC; ESP=0x2FF4.
+     * LEAVE: ESP=EBP=0x2FFC; pop EBP=0; ESP=0x3000.
+     */
+    static const uint8_t code[] = {
+        0xC8, 0x08, 0x00, 0x00, /* ENTER 8, 0 */
+        0x89, 0xE9,              /* MOV ECX, EBP  ; ECX=0x2FFC */
+        0x89, 0xE2,              /* MOV EDX, ESP  ; EDX=0x2FF4 */
+        0xC9,                    /* LEAVE */
+        0x89, 0xE3,              /* MOV EBX, ESP  ; EBX=0x3000 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    CHECK_EQ(ecx, 0x2FFCU); /* EBP after ENTER */
+    CHECK_EQ(edx, 0x2FF4U); /* ESP after ENTER */
+    CHECK_EQ(ebx, 0x3000U); /* ESP after LEAVE */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 57: LEA with SIB addressing
+ * ===================================================================== */
+static void test_lea_sib(void)
+{
+    /* LEA EAX, [EBX+ECX*4+8]: EBX=0x100, ECX=4 -> EAX=0x100+16+8=0x118 */
+    static const uint8_t code[] = {
+        0xBB, 0x00, 0x01, 0x00, 0x00, /* MOV EBX, 0x100 */
+        0xB9, 0x04, 0x00, 0x00, 0x00, /* MOV ECX, 4 */
+        0x8D, 0x44, 0x8B, 0x08,       /* LEA EAX, [EBX+ECX*4+8] */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x118U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 58: BT — bit test sets CF
+ * ===================================================================== */
+static void test_bt(void)
+{
+    /* BT EAX, 3: EAX=0x08 -> CF=1; EAX=0x04 -> CF=0 */
+    static const uint8_t code[] = {
+        0xB8, 0x08, 0x00, 0x00, 0x00, /* MOV EAX, 0x08 */
+        0x0F, 0xBA, 0xE0, 0x03,       /* BT EAX, 3  ; CF=1 */
+        0x9C,                         /* PUSHF */
+        0x5B,                         /* POP EBX  ; flags1 -> EBX */
+        0xB8, 0x04, 0x00, 0x00, 0x00, /* MOV EAX, 0x04 */
+        0x0F, 0xBA, 0xE0, 0x03,       /* BT EAX, 3  ; CF=0 */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX  ; flags2 -> EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((ebx >> 0) & 1);    /* CF=1: bit 3 of 0x08 is set */
+    CHECK(!((eax >> 0) & 1)); /* CF=0: bit 3 of 0x04 is clear */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 59: BTS — bit test and set
+ * ===================================================================== */
+static void test_bts(void)
+{
+    /* BTS EAX, 2: EAX=0 -> set bit 2 -> EAX=4, CF=0 (bit was clear) */
+    static const uint8_t code[] = {
+        0x31, 0xC0,             /* XOR EAX, EAX */
+        0x0F, 0xBA, 0xE8, 0x02, /* BTS EAX, 2 */
+        0x89, 0xC3,             /* MOV EBX, EAX  ; EBX=4 */
+        0x9C,                   /* PUSHF */
+        0x58,                   /* POP EAX  ; flags */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(ebx, 4U);
+    CHECK(!((eflags >> 0) & 1)); /* CF=0 (bit was not set before BTS) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 60: BTR — bit test and reset
+ * ===================================================================== */
+static void test_btr(void)
+{
+    /* BTR EAX, 2: EAX=7 -> clear bit 2 -> EAX=3, CF=1 (bit was set) */
+    static const uint8_t code[] = {
+        0xB8, 0x07, 0x00, 0x00, 0x00, /* MOV EAX, 7 */
+        0x0F, 0xBA, 0xF0, 0x02,       /* BTR EAX, 2 */
+        0x89, 0xC3,                   /* MOV EBX, EAX  ; EBX=3 */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX  ; flags */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(ebx, 3U);
+    CHECK((eflags >> 0) & 1); /* CF=1 (bit was set before BTR) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 61: BTC — bit test and complement
+ * ===================================================================== */
+static void test_btc(void)
+{
+    /* BTC EAX, 1: EAX=0 -> toggle bit 1 -> EAX=2, CF=0 (bit was clear) */
+    static const uint8_t code[] = {
+        0x31, 0xC0,             /* XOR EAX, EAX */
+        0x0F, 0xBA, 0xF8, 0x01, /* BTC EAX, 1 */
+        0x89, 0xC3,             /* MOV EBX, EAX  ; EBX=2 */
+        0x9C,                   /* PUSHF */
+        0x58,                   /* POP EAX  ; flags */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(ebx, 2U);
+    CHECK(!((eflags >> 0) & 1)); /* CF=0 (bit was not set before BTC) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 62: SHLD — double-precision shift left
+ * ===================================================================== */
+static void test_shld(void)
+{
+    /*
+     * SHLD EAX, ECX, 4: EAX=0x12340000, ECX=0xABCDEFFF
+     * Result: (EAX<<4) | (ECX>>28) = 0x23400000 | 0xA = 0x2340000A
+     */
+    static const uint8_t code[] = {
+        0xB8, 0x00, 0x00, 0x34, 0x12, /* MOV EAX, 0x12340000 */
+        0xB9, 0xFF, 0xEF, 0xCD, 0xAB, /* MOV ECX, 0xABCDEFFF */
+        0x0F, 0xA4, 0xC8, 0x04,       /* SHLD EAX, ECX, 4 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x2340000AU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 63: SHRD — double-precision shift right
+ * ===================================================================== */
+static void test_shrd(void)
+{
+    /*
+     * SHRD EAX, ECX, 4: EAX=0x0000ABCD, ECX=0x12340000
+     * Result: (EAX>>4) | (ECX[3:0]<<28) = 0xABC | (0<<28) = 0x00000ABC
+     * (ECX low nibble = 0, so upper 4 bits of result are 0)
+     */
+    static const uint8_t code[] = {
+        0xB8, 0xCD, 0xAB, 0x00, 0x00, /* MOV EAX, 0x0000ABCD */
+        0xB9, 0x00, 0x00, 0x34, 0x12, /* MOV ECX, 0x12340000 */
+        0x0F, 0xAC, 0xC8, 0x04,       /* SHRD EAX, ECX, 4 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x00000ABCU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 64: XADD — exchange and add
+ * ===================================================================== */
+static void test_xadd(void)
+{
+    /* XADD EBX, ECX: EBX=10, ECX=5 -> EBX=15, ECX=10 (old EBX) */
+    static const uint8_t code[] = {
+        0xBB, 0x0A, 0x00, 0x00, 0x00, /* MOV EBX, 10 */
+        0xB9, 0x05, 0x00, 0x00, 0x00, /* MOV ECX, 5 */
+        0x0F, 0xC1, 0xCB,             /* XADD EBX, ECX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ebx, 15U);
+    CHECK_EQ(ecx, 10U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 65: CMOVZ — conditional move if zero flag set
+ * ===================================================================== */
+static void test_cmovz(void)
+{
+    /* CMP EBX, EBX -> ZF=1; CMOVZ EAX, ECX -> EAX=ECX=42 */
+    static const uint8_t code[] = {
+        0xB9, 0x2A, 0x00, 0x00, 0x00, /* MOV ECX, 42 */
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EAX, 0xFFFFFFFF */
+        0x39, 0xDB,                   /* CMP EBX, EBX  ; ZF=1 */
+        0x0F, 0x44, 0xC1,             /* CMOVZ EAX, ECX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 42U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 66: CMOVNZ — conditional move if zero flag clear
+ * ===================================================================== */
+static void test_cmovnz(void)
+{
+    /* CMP EBX, 2 with EBX=1 -> ZF=0; CMOVNZ EAX, ECX -> EAX=42 */
+    static const uint8_t code[] = {
+        0xB9, 0x2A, 0x00, 0x00, 0x00, /* MOV ECX, 42 */
+        0xB8, 0xFF, 0xFF, 0xFF, 0xFF, /* MOV EAX, 0xFFFFFFFF */
+        0xBB, 0x01, 0x00, 0x00, 0x00, /* MOV EBX, 1 */
+        0x83, 0xFB, 0x02,             /* CMP EBX, 2  ; ZF=0 */
+        0x0F, 0x45, 0xC1,             /* CMOVNZ EAX, ECX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 42U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 67: INC / DEC — increment and decrement; ZF on DEC-to-zero
+ * ===================================================================== */
+static void test_inc_dec(void)
+{
+    static const uint8_t code[] = {
+        0x31, 0xC0,                   /* XOR EAX, EAX  ; EAX=0 */
+        0x40,                         /* INC EAX  ; EAX=1 */
+        0xB9, 0x05, 0x00, 0x00, 0x00, /* MOV ECX, 5 */
+        0x49,                         /* DEC ECX  ; ECX=4 */
+        0x89, 0xCB,                   /* MOV EBX, ECX  ; EBX=4 */
+        0xB9, 0x01, 0x00, 0x00, 0x00, /* MOV ECX, 1 */
+        0x49,                         /* DEC ECX  ; ECX=0, ZF=1 */
+        0x9C,                         /* PUSHF */
+        0x5A,                         /* POP EDX  ; flags */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ(eax, 1U);
+    CHECK_EQ(ebx, 4U);
+    CHECK((edx >> 6) & 1); /* ZF=1 after DEC to 0 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 68: NOT — bitwise complement
+ * ===================================================================== */
+static void test_not(void)
+{
+    static const uint8_t code[] = {
+        0xB8, 0xF0, 0xF0, 0xF0, 0xF0, /* MOV EAX, 0xF0F0F0F0 */
+        0xF7, 0xD0,                   /* NOT EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x0F0F0F0FU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 69: 16-bit operand prefix (0x66) ADD AX, AX
+ * ===================================================================== */
+static void test_16bit_add(void)
+{
+    /* AX=0x1234; 0x66 ADD AX, AX -> AX=0x2468, high word unchanged */
+    static const uint8_t code[] = {
+        0xB8, 0x34, 0x12, 0x00, 0x00, /* MOV EAX, 0x00001234 */
+        0x66, 0x01, 0xC0,             /* ADD AX, AX  ; AX=0x2468 */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x2468U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 70: Parity flag — even number of set bits -> PF=1
+ * ===================================================================== */
+static void test_pf(void)
+{
+    /* 0x81 = 0b10000001: 2 set bits (even) -> PF=1 */
+    static const uint8_t code[] = {
+        0x31, 0xC0,       /* XOR EAX, EAX */
+        0xB0, 0x81,       /* MOV AL, 0x81 */
+        0x85, 0xC0,       /* TEST EAX, EAX  ; PF from result 0x81 */
+        0x9C,             /* PUSHF */
+        0x58,             /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((eflags >> 2) & 1); /* PF=1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 71: OF set by ADD overflow (positive -> negative)
+ * ===================================================================== */
+static void test_of_add(void)
+{
+    /* ADD 0x7FFFFFFF + 1 -> 0x80000000, OF=1 */
+    static const uint8_t code[] = {
+        0xB8, 0xFF, 0xFF, 0xFF, 0x7F, /* MOV EAX, 0x7FFFFFFF */
+        0x83, 0xC0, 0x01,             /* ADD EAX, 1 */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((eflags >> 11) & 1); /* OF=1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 72: OF set by SUB overflow (negative -> positive)
+ * ===================================================================== */
+static void test_of_sub(void)
+{
+    /* SUB 0x80000000 - 1 -> 0x7FFFFFFF, OF=1 */
+    static const uint8_t code[] = {
+        0xB8, 0x00, 0x00, 0x00, 0x80, /* MOV EAX, 0x80000000 */
+        0x83, 0xE8, 0x01,             /* SUB EAX, 1 */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((eflags >> 11) & 1); /* OF=1 */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 73: LAHF / SAHF — load/store AH from/to flags
+ * ===================================================================== */
+static void test_lahf_sahf(void)
+{
+    /* STC -> LAHF captures CF=1 in AH; CLC; SAHF restores CF=1 */
+    static const uint8_t code[] = {
+        0xF9,  /* STC  ; CF=1 */
+        0x9F,  /* LAHF ; AH = flags with CF=1 */
+        0xF8,  /* CLC  ; CF=0 */
+        0x9E,  /* SAHF ; restore flags from AH -> CF=1 */
+        0x9C,  /* PUSHF */
+        0x58,  /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((eflags >> 0) & 1); /* CF=1 restored by SAHF */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 74: LODSB — load string byte
+ * ===================================================================== */
+static void test_lodsb(void)
+{
+    /* [0x5000]=0x42; LODSB -> AL=0x42, ESI=0x5001 */
+    static const uint8_t code[] = {
+        0x31, 0xC0,                   /* XOR EAX, EAX */
+        0xBE, 0x00, 0x50, 0x00, 0x00, /* MOV ESI, 0x5000 */
+        0xAC,                         /* LODSB  ; AL=[ESI], ESI++ */
+        0x89, 0xC3,                   /* MOV EBX, EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    m->ram[0x5000] = 0x42;
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t esi = x86_cpu_get_reg(m->cpu, 6);
+    CHECK_EQ(ebx & 0xFF, 0x42U);
+    CHECK_EQ(esi, 0x5001U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 75: STOSB — store string byte
+ * ===================================================================== */
+static void test_stosb(void)
+{
+    /* AL=0x42, EDI=0x5000; STOSB -> [0x5000]=0x42, EDI=0x5001 */
+    static const uint8_t code[] = {
+        0xB0, 0x42,                   /* MOV AL, 0x42 */
+        0xBF, 0x00, 0x50, 0x00, 0x00, /* MOV EDI, 0x5000 */
+        0xAA,                         /* STOSB  ; [EDI]=AL, EDI++ */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memset(m->ram + 0x5000, 0, 4);
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t edi = x86_cpu_get_reg(m->cpu, 7);
+    CHECK_EQ(m->ram[0x5000], 0x42U);
+    CHECK_EQ(edi, 0x5001U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 76: SCASB match — ZF=1 when AL == [EDI]
+ * ===================================================================== */
+static void test_scasb_match(void)
+{
+    /* AL=5, [0x5000]=5 -> SCASB -> ZF=1 */
+    static const uint8_t code[] = {
+        0xB0, 0x05,                   /* MOV AL, 5 */
+        0xBF, 0x00, 0x50, 0x00, 0x00, /* MOV EDI, 0x5000 */
+        0xAE,                         /* SCASB  ; cmp AL,[EDI], EDI++ */
+        0x9C,                         /* PUSHF */
+        0x58,                         /* POP EAX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    m->ram[0x5000] = 5;
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, 0);
+    CHECK((eflags >> 6) & 1); /* ZF=1 (match) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 77: MOV BYTE [mem], imm8 — byte memory write and read-back
+ * ===================================================================== */
+static void test_mem_byte_write(void)
+{
+    static const uint8_t code[] = {
+        /* MOV BYTE [0x5000], 0xAB */
+        0xC6, 0x05, 0x00, 0x50, 0x00, 0x00, 0xAB,
+        /* MOVZX EAX, BYTE [0x5000] */
+        0x0F, 0xB6, 0x05, 0x00, 0x50, 0x00, 0x00,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xABU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test 78: MOV WORD [mem], imm16 — word memory write and read-back
+ * ===================================================================== */
+static void test_mem_word_write(void)
+{
+    static const uint8_t code[] = {
+        /* MOV WORD [0x5000], 0x1234 (0x66 prefix) */
+        0x66, 0xC7, 0x05, 0x00, 0x50, 0x00, 0x00, 0x34, 0x12,
+        /* MOVZX EAX, WORD [0x5000] */
+        0x0F, 0xB7, 0x05, 0x00, 0x50, 0x00, 0x00,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x1234U);
+    machine_free(m);
+}
+
 /* ---------- main ---------- */
 
 int main(void)
@@ -1034,6 +2238,55 @@ int main(void)
     test_cmpxchg();
     test_loop();
     test_af_inc();
+    test_jo_taken();
+    test_jo_not_taken();
+    test_jb_taken();
+    test_jb_not_taken();
+    test_jbe_taken();
+    test_jbe_not_taken();
+    test_js_taken();
+    test_js_not_taken();
+    test_jp_taken();
+    test_jp_not_taken();
+    test_jl_taken();
+    test_jle_taken();
+    test_jg_taken();
+    test_adc();
+    test_sbb();
+    test_rol();
+    test_ror();
+    test_imul_2op();
+    test_imul_3op_imm8();
+    test_imul_neg();
+    test_div();
+    test_idiv();
+    test_clc_stc_cmc();
+    test_cwde();
+    test_cdq();
+    test_enter_leave();
+    test_lea_sib();
+    test_bt();
+    test_bts();
+    test_btr();
+    test_btc();
+    test_shld();
+    test_shrd();
+    test_xadd();
+    test_cmovz();
+    test_cmovnz();
+    test_inc_dec();
+    test_not();
+    test_16bit_add();
+    test_pf();
+    test_of_add();
+    test_of_sub();
+    test_lahf_sahf();
+    test_lodsb();
+    test_stosb();
+    test_scasb_match();
+    test_mem_byte_write();
+    test_mem_word_write();
+
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
     if (tests_fail)
