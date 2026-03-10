@@ -593,8 +593,11 @@ static void load_seg_desc(X86CPUState *s, int seg_idx, uint16_t sel)
     else
         dt_base = s->segs[X86_CPU_SEG_GDT].base;
 
-    lo = phys_read32(s, dt_base + (sel & ~7));
-    hi = phys_read32(s, dt_base + (sel & ~7) + 4);
+    /* GDT/LDT base is a linear address (set by LGDT/LLDT).  When paging is
+     * active it must be translated through the page tables, just as real
+     * hardware does.  vmem_read32 handles both paged and non-paged modes. */
+    lo = vmem_read32(s, dt_base + (sel & ~7));
+    hi = vmem_read32(s, dt_base + (sel & ~7) + 4);
 
     seg->base  = ((lo >> 16) & 0xFFFF) | ((hi & 0xFF) << 16) | ((hi >> 24) << 24);
     uint32_t lim = (lo & 0xFFFF) | (hi & 0x000F0000U);
@@ -795,9 +798,10 @@ static void x86_do_interrupt(X86CPUState *s, int intno,
         if ((uint32_t)(intno * 16 + 15) > idt_limit)
             raise_exception_err(s, EXCP_GP, (intno << 3) | 2);
 
+        /* IDT base is a linear address (set by LIDT); translate via paging. */
         idt_addr = idt_base + intno * 16;
-        lo = phys_read64(s, idt_addr);
-        hi = phys_read64(s, idt_addr + 8);
+        lo = vmem_read64(s, idt_addr);
+        hi = vmem_read64(s, idt_addr + 8);
 
         gate_offset = (lo & 0xFFFFULL) |
                       ((lo >> 32) & 0xFFFF0000ULL) |
@@ -847,9 +851,10 @@ static void x86_do_interrupt(X86CPUState *s, int intno,
         if ((uint32_t)(intno * 8 + 7) > idt_limit)
             raise_exception_err(s, EXCP_GP, (intno << 3) | 2);
 
+        /* IDT base is a linear address (set by LIDT); translate via paging. */
         idt_addr = idt_base + intno * 8;
-        lo = phys_read32(s, idt_addr);
-        hi = phys_read32(s, idt_addr + 4);
+        lo = vmem_read32(s, idt_addr);
+        hi = vmem_read32(s, idt_addr + 4);
 
         gate_offset = (lo & 0xFFFF) | (hi & 0xFFFF0000U);
         gate_sel    = (uint16_t)(lo >> 16);
@@ -4937,11 +4942,14 @@ static void do_interp(X86CPUState *s, int max_cycles)
         exec_one(&ds);
         if (unlikely(s->trace_insns)) {
             fprintf(stderr,
-                    "TRACE %08x  eax=%08x ebx=%08x ecx=%08x edx=%08x esp=%08x\n",
+                    "TRACE %08x  eax=%08x ebx=%08x ecx=%08x edx=%08x"
+                    " esi=%08x edi=%08x ebp=%08x esp=%08x efl=%08x\n",
                     (uint32_t)eip_before,
                     (uint32_t)s->regs[0], (uint32_t)s->regs[3],
                     (uint32_t)s->regs[1], (uint32_t)s->regs[2],
-                    (uint32_t)s->regs[4]);
+                    (uint32_t)s->regs[6], (uint32_t)s->regs[7],
+                    (uint32_t)s->regs[5], (uint32_t)s->regs[4],
+                    s->eflags);
         }
         s->cycle_count++;
     }

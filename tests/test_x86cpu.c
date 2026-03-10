@@ -2673,6 +2673,130 @@ static void test_rep_movsd(void)
     machine_free(m);
 }
 
+/* =====================================================================
+ * Test 90: IDT at a virtual (paged) address — interrupt delivery bug
+ *
+ * This test specifically catches the bug where x86_do_interrupt used
+ * phys_read32(idt_addr) treating the IDT base as a physical address.
+ * When the kernel uses LIDT with a virtual address (e.g. after paging is
+ * enabled and the identity mapping is gone), the IDT must be read via
+ * vmem_read32 so that virtual→physical paging translation is applied.
+ *
+ * Setup:
+ *   - Code at virtual/physical 0x1000 (identity-mapped).
+ *   - Page directory at 0x100000: covers first 4 MB identity + maps virtual
+ *     0x80004000 → physical 0x4000 (where the IDT lives).
+ *   - The code enables paging, then sets IDTR base to 0x80004000 (virtual),
+ *     then executes STI + INT 0x20 to fire the software interrupt.
+ *   - Handler at virtual/physical 0x1020: sets EAX=0xDEAD, IRET.
+ *   - If the bug is present, phys_read32(0x80004100) returns garbage and the
+ *     interrupt is mis-delivered (likely triple-fault); EAX stays 0.
+ *   - If fixed, vmem_read32 translates 0x80004100 → 0x4100 (physical) and
+ *     the handler fires correctly; EAX = 0xDEAD.
+ * ===================================================================== */
+static void test_idt_at_virtual_addr(void)
+{
+    /*
+     * Code at phys 0x1000 (virtual 0x1000, identity-mapped):
+     *   0F 20 C0              MOV EAX, CR0
+     *   0D 00 00 00 80        OR  EAX, 0x80000000
+     *   B9 00 00 10 00        MOV ECX, 0x100000     <- PD physical base
+     *   0F 22 D9              MOV CR3, ECX
+     *   0F 22 C0              MOV CR0, EAX           (enable paging)
+     *   0F 01 1D xx xx xx xx  LIDT [idt_desc_ptr]   <- IDT at virtual 0x80004000
+     *   FB                    STI
+     *   CD 20                 INT 0x20              <- fires via virtual IDT
+     *   F4                    HLT
+     *
+     * IDT descriptor (at phys 0x1030, identity-mapped):
+     *   DW  0x7FF              <- limit: 256*8 - 1 = 0x7FF
+     *   DD  0x80004000         <- base: virtual 0x80004000
+     *
+     * Handler at phys 0x1020 (virtual 0x1020, identity-mapped):
+     *   B8 AD DE 00 00        MOV EAX, 0xDEAD
+     *   CF                    IRET
+     *
+     * IDT at phys 0x4000 (virtual 0x80004000 via page table):
+     *   entry for vector 0x20 at offset 0x100.
+     */
+    static const uint8_t code1000[] = {
+        0x0F, 0x20, 0xC0,               /* MOV EAX, CR0 */
+        0x0D, 0x00, 0x00, 0x00, 0x80,   /* OR  EAX, 0x80000000 */
+        0xB9, 0x00, 0x00, 0x10, 0x00,   /* MOV ECX, 0x100000 */
+        0x0F, 0x22, 0xD9,               /* MOV CR3, ECX */
+        0x0F, 0x22, 0xC0,               /* MOV CR0, EAX (paging on) */
+        /* LIDT [0x1030]: opcode 0F 01 /3 disp32 */
+        0x0F, 0x01, 0x1D, 0x30, 0x10, 0x00, 0x00, /* LIDT [0x1030] */
+        0xFB,                           /* STI */
+        0xCD, 0x20,                     /* INT 0x20 */
+        0xF4,                           /* HLT */
+    };
+    /* IDT descriptor stored at phys/virt 0x1030 */
+    static const uint8_t idt_desc[] = {
+        0xFF, 0x07,                     /* limit = 0x7FF (256 entries) */
+        0x00, 0x40, 0x00, 0x80,         /* base = 0x80004000 (little-endian) */
+    };
+    /* Handler at phys 0x1020 */
+    static const uint8_t handler1020[] = {
+        0xB8, 0xAD, 0xDE, 0x00, 0x00,   /* MOV EAX, 0xDEAD */
+        0xCF,                            /* IRET */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000,    sizeof(code1000));
+    memcpy(m->ram + 0x1020, handler1020, sizeof(handler1020));
+    memcpy(m->ram + 0x1030, idt_desc,    sizeof(idt_desc));
+
+    /*
+     * Page directory at phys 0x100000.
+     * Entry 0 (virtual 0x00000000-0x003FFFFF):
+     *   PT at 0x101000, P=1, RW=1 — identity map first 4 MB.
+     * Entry 0x200 (virtual 0x80000000-0x803FFFFF, index = 0x80000000>>22 = 512):
+     *   PT at 0x102000, P=1, RW=1 — maps virtual 0x80000000+ to phys 0x0000.
+     *
+     * Entry 0 covers virtual 0x0000_0000 – 0x003F_FFFF (first 4 MB).
+     * Entry 512 covers virtual 0x8000_0000 – 0x803F_FFFF (2 GB mark, 4 MB).
+     */
+    memset(m->ram + 0x100000, 0, 0x3000);  /* clear PD + 2 PTs */
+
+    /* PD entry 0: PT at 0x101000 */
+    uint32_t pde0 = 0x101000U | 3U;
+    memcpy(m->ram + 0x100000, &pde0, 4);
+
+    /* PD entry 512 (0x80000000): PT at 0x102000 */
+    uint32_t pde512 = 0x102000U | 3U;
+    memcpy(m->ram + 0x100000 + 512 * 4, &pde512, 4);
+
+    /* PT at 0x101000: identity-map 4 MB (1024 pages) */
+    for (int i = 0; i < 1024; i++) {
+        uint32_t pte = (uint32_t)(i << 12) | 3U;
+        memcpy(m->ram + 0x101000 + i * 4, &pte, 4);
+    }
+
+    /* PT at 0x102000: virtual 0x80000000 → physical 0x00000000 (4 MB) */
+    for (int i = 0; i < 1024; i++) {
+        uint32_t pte = (uint32_t)(i << 12) | 3U;
+        memcpy(m->ram + 0x102000 + i * 4, &pte, 4);
+    }
+
+    /*
+     * IDT at phys 0x4000.  The kernel will load this with base=0x80004000
+     * (virtual).  Via the 0x80000000 mapping, virt 0x80004000 → phys 0x4000.
+     * Vector 0x20 entry: offset within IDT = 0x20 * 8 = 0x100.
+     * Handler at virtual/physical 0x1020.
+     */
+    memset(m->ram + 0x4000, 0, 0x1000);
+    setup_idt_entry(m->ram, 0x4000, 0x20, 0x08, 0x1020);
+
+    /* Start in protected mode (no paging yet) — code will enable paging */
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+
+    run_cpu(m, 2000000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xDEADU);
+    machine_free(m);
+}
 
 
 int main(void)
@@ -2768,6 +2892,7 @@ int main(void)
     test_pushad_popad();
     test_fs_segment_override();
     test_rep_movsd();
+    test_idt_at_virtual_addr();
 
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
