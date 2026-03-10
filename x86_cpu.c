@@ -174,6 +174,9 @@ struct X86CPUState {
 
     /* Cycle counter */
     int64_t cycle_count;
+
+    /* Instruction trace flag: set to 1 if X86_TRACE env var is set at init */
+    int trace_insns;
 };
 
 /* Convenience: test long mode active */
@@ -4856,12 +4859,6 @@ static void do_interp(X86CPUState *s, int max_cycles)
     ds.fetch_page = ~0ULL;   /* invalid — force refill on first fetch */
     ds.fetch_ptr  = NULL;
 
-    /* Check once per do_interp invocation whether instruction tracing is on.
-     * Activated by setting X86_TRACE in the environment before execution. */
-    static int trace_enabled = -1;
-    if (unlikely(trace_enabled < 0))
-        trace_enabled = getenv("X86_TRACE") != NULL;
-
     /*
      * Compute the absolute cycle target for this invocation BEFORE setjmp
      * so it is visible after any longjmp.  max_cycles is a per-call delta,
@@ -4938,7 +4935,7 @@ static void do_interp(X86CPUState *s, int max_cycles)
 
         uint64_t eip_before = s->rip;
         exec_one(&ds);
-        if (unlikely(trace_enabled)) {
+        if (unlikely(s->trace_insns)) {
             fprintf(stderr,
                     "TRACE %08x  eax=%08x ebx=%08x ecx=%08x edx=%08x esp=%08x\n",
                     (uint32_t)eip_before,
@@ -4981,6 +4978,7 @@ X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
     s->mem_map = mem_map;
     s->eflags = EF_FIXED;
     s->exception_num = -1;
+    s->trace_insns = (getenv("X86_TRACE") != NULL) ? 1 : 0;
     tlb_flush_all(s);
     return s;
 }
