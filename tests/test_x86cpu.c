@@ -2806,6 +2806,105 @@ static void test_idt_at_virtual_addr(void)
  * Code executes LLDT (null selector), LTR (0x18), then STR into EAX.
  * Verifies EAX == 0x18 after STR.
  * ===================================================================== */
+/* CMPXCHG8B m64 — equal case (ZF=1, write ECX:EBX to mem) */
+static void test_cmpxchg8b_equal(void)
+{
+    /*
+     * Code at 0x1000:
+     *   B8 78 56 34 12   MOV EAX, 0x12345678   (acc lo)
+     *   BA 90 AB CD EF   MOV EDX, 0xEFCDAB90   (acc hi)
+     *   BB 11 11 11 11   MOV EBX, 0x11111111   (new lo)
+     *   B9 22 22 22 22   MOV ECX, 0x22222222   (new hi)
+     *   0F C7 0D 00 20 00 00  CMPXCHG8B [0x2000] (reg=1, disp32)
+     *   F4               HLT
+     */
+    static const uint8_t code1000[] = {
+        0xB8, 0x78, 0x56, 0x34, 0x12,          /* MOV EAX, 0x12345678 */
+        0xBA, 0x90, 0xAB, 0xCD, 0xEF,          /* MOV EDX, 0xEFCDAB90 */
+        0xBB, 0x11, 0x11, 0x11, 0x11,          /* MOV EBX, 0x11111111 */
+        0xB9, 0x22, 0x22, 0x22, 0x22,          /* MOV ECX, 0x22222222 */
+        0x0F, 0xC7, 0x0D,                      /* CMPXCHG8B [disp32] */
+        0x00, 0x20, 0x00, 0x00,                /* disp32 = 0x2000 */
+        0xF4,                                  /* HLT */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000, sizeof(code1000));
+
+    /* Pre-load memory at 0x2000 with EDX:EAX value so comparison succeeds */
+    uint32_t mem_lo = 0x12345678U;
+    uint32_t mem_hi = 0xEFCDAB90U;
+    memcpy(m->ram + 0x2000, &mem_lo, 4);
+    memcpy(m->ram + 0x2004, &mem_hi, 4);
+
+    enter_protected_mode(m, 0x3000, 0x1000, 0x4000);
+    run_cpu(m, 200000);
+
+    /* Equal: ZF=1, memory should now contain ECX:EBX = 0x22222222:0x11111111 */
+    uint32_t out_lo, out_hi;
+    memcpy(&out_lo, m->ram + 0x2000, 4);
+    memcpy(&out_hi, m->ram + 0x2004, 4);
+    CHECK_EQ(out_lo, 0x11111111U); /* EBX */
+    CHECK_EQ(out_hi, 0x22222222U); /* ECX */
+
+    /* ZF should be set — bit 6 of EFLAGS */
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, X86_CPU_REG_EFLAGS);
+    CHECK_EQ(!!(eflags & (1U << 6)), 1U); /* ZF=1: comparison matched */
+    machine_free(m);
+}
+
+/* CMPXCHG8B m64 — not-equal case (ZF=0, load mem into EDX:EAX) */
+static void test_cmpxchg8b_notequal(void)
+{
+    /*
+     * Code at 0x1000:
+     *   B8 AA BB CC DD   MOV EAX, 0xDDCCBBAA   (wrong acc lo)
+     *   BA EE FF 00 11   MOV EDX, 0x1100FFEE   (wrong acc hi)
+     *   BB 11 11 11 11   MOV EBX, 0x11111111
+     *   B9 22 22 22 22   MOV ECX, 0x22222222
+     *   0F C7 0D 00 20 00 00  CMPXCHG8B [0x2000]
+     *   F4               HLT
+     */
+    static const uint8_t code1000[] = {
+        0xB8, 0xAA, 0xBB, 0xCC, 0xDD,
+        0xBA, 0xEE, 0xFF, 0x00, 0x11,
+        0xBB, 0x11, 0x11, 0x11, 0x11,
+        0xB9, 0x22, 0x22, 0x22, 0x22,
+        0x0F, 0xC7, 0x0D,
+        0x00, 0x20, 0x00, 0x00,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000, sizeof(code1000));
+
+    /* Memory at 0x2000 has different value */
+    uint32_t mem_lo = 0x12345678U;
+    uint32_t mem_hi = 0xEFCDAB90U;
+    memcpy(m->ram + 0x2000, &mem_lo, 4);
+    memcpy(m->ram + 0x2004, &mem_hi, 4);
+
+    enter_protected_mode(m, 0x3000, 0x1000, 0x4000);
+    run_cpu(m, 200000);
+
+    /* Not equal: ZF=0, EAX/EDX should be loaded from memory */
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0); /* EAX */
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2); /* EDX (index 2) */
+    CHECK_EQ(eax, 0x12345678U); /* mem_lo */
+    CHECK_EQ(edx, 0xEFCDAB90U); /* mem_hi */
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, X86_CPU_REG_EFLAGS);
+    CHECK_EQ(!!(eflags & (1U << 6)), 0U); /* ZF=0: comparison did not match */
+
+    /* Memory unchanged */
+    uint32_t out_lo, out_hi;
+    memcpy(&out_lo, m->ram + 0x2000, 4);
+    memcpy(&out_hi, m->ram + 0x2004, 4);
+    CHECK_EQ(out_lo, 0x12345678U);
+    CHECK_EQ(out_hi, 0xEFCDAB90U);
+    machine_free(m);
+}
+
 static void test_lldt_ltr(void)
 {
     /*
@@ -2955,6 +3054,8 @@ int main(void)
     test_rep_movsd();
     test_idt_at_virtual_addr();
     test_lldt_ltr();
+    test_cmpxchg8b_equal();
+    test_cmpxchg8b_notequal();
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
     if (tests_fail)

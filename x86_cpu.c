@@ -2841,6 +2841,63 @@ static void exec_0f(DecodeState *ds)
 #undef FXSAVE_AREA_SIZE
         break; }
 
+    case 0xC7: { /* GROUP 9 */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        switch (reg) {
+        case 1: { /* CMPXCHG8B m64 / CMPXCHG16B m128 (REX.W) */
+            uint64_t maddr = seg_ea(s, ea, ea_seg);
+            if (ds->op64) {
+                /* CMPXCHG16B m128: compare RDX:RAX with [maddr+8]:[maddr] */
+                uint64_t mem_lo = vmem_read64(s, maddr);
+                uint64_t mem_hi = vmem_read64(s, maddr + 8);
+                uint64_t acc_lo = s->regs[0]; /* RAX */
+                uint64_t acc_hi = s->regs[2]; /* RDX */
+                if (acc_lo == mem_lo && acc_hi == mem_hi) {
+                    s->eflags |= EF_ZF;
+                    vmem_write64(s, maddr,     s->regs[3]); /* RBX */
+                    vmem_write64(s, maddr + 8, s->regs[1]); /* RCX */
+                } else {
+                    s->eflags &= ~EF_ZF;
+                    s->regs[0] = mem_lo; /* RAX */
+                    s->regs[2] = mem_hi; /* RDX */
+                }
+            } else {
+                /* CMPXCHG8B m64: compare EDX:EAX with [maddr+4]:[maddr] */
+                uint32_t mem_lo = vmem_read32(s, maddr);
+                uint32_t mem_hi = vmem_read32(s, maddr + 4);
+                uint32_t acc_lo = (uint32_t)s->regs[0]; /* EAX */
+                uint32_t acc_hi = (uint32_t)s->regs[2]; /* EDX */
+                if (acc_lo == mem_lo && acc_hi == mem_hi) {
+                    s->eflags |= EF_ZF;
+                    vmem_write32(s, maddr,     (uint32_t)s->regs[3]); /* EBX */
+                    vmem_write32(s, maddr + 4, (uint32_t)s->regs[1]); /* ECX */
+                } else {
+                    s->eflags &= ~EF_ZF;
+                    s->regs[0] = (s->regs[0] & ~0xFFFFFFFFULL) | mem_lo; /* EAX */
+                    s->regs[2] = (s->regs[2] & ~0xFFFFFFFFULL) | mem_hi; /* EDX */
+                }
+            }
+            break; }
+        case 6: { /* RDRAND r — placeholder; real HW returns a true random value */
+            int dst_r = rm_reg >= 0 ? rm_reg : reg;
+            if (ds->op64)      set_reg64(s, dst_r, 0xDEADBEEFCAFEBABEULL);
+            else if (ds->op32) set_reg32(s, dst_r, 0xDEADBEEFU);
+            else               set_reg16(s, dst_r, 0xBEEF);
+            s->eflags |= EF_CF; /* CF=1: value is valid */
+            break; }
+        case 7: { /* RDSEED r — placeholder; real HW returns a true seed value */
+            int dst_r = rm_reg >= 0 ? rm_reg : reg;
+            if (ds->op64)      set_reg64(s, dst_r, 0xDEADBEEFCAFEBABEULL);
+            else if (ds->op32) set_reg32(s, dst_r, 0xDEADBEEFU);
+            else               set_reg16(s, dst_r, 0xBEEF);
+            s->eflags |= EF_CF; /* CF=1: seed is valid */
+            break; }
+        default:
+            raise_exception(s, EXCP_UD);
+            break;
+        }
+        break; }
+
     default:
         fprintf(stderr, "x86: unhandled 0F opcode 0x%02X at RIP=%llx\n",
                 op2, (unsigned long long)s->rip);
@@ -5050,8 +5107,9 @@ void x86_cpu_end(X86CPUState *s)
 uint32_t x86_cpu_get_reg(X86CPUState *s, int reg)
 {
     switch (reg) {
-    case X86_CPU_REG_EIP:  return (uint32_t)s->rip;
-    case X86_CPU_REG_CR0:  return s->cr0;
+    case X86_CPU_REG_EIP:    return (uint32_t)s->rip;
+    case X86_CPU_REG_CR0:    return s->cr0;
+    case X86_CPU_REG_EFLAGS: return s->eflags;
     default:
         if (reg >= 0 && reg < 16) return (uint32_t)s->regs[reg];
         return 0;
@@ -5061,8 +5119,9 @@ uint32_t x86_cpu_get_reg(X86CPUState *s, int reg)
 void x86_cpu_set_reg(X86CPUState *s, int reg, uint32_t val)
 {
     switch (reg) {
-    case X86_CPU_REG_EIP:  s->rip = val; break;
-    case X86_CPU_REG_CR0:  s->cr0 = val; break;
+    case X86_CPU_REG_EIP:    s->rip = val; break;
+    case X86_CPU_REG_CR0:    s->cr0 = val; break;
+    case X86_CPU_REG_EFLAGS: s->eflags = val; break;
     default:
         if (reg >= 0 && reg < 16) s->regs[reg] = val; /* zero-extend */
         break;

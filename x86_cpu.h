@@ -26,9 +26,10 @@
 typedef struct X86CPUState X86CPUState;
 
 /* get_reg/set_reg additional constants */
-#define X86_CPU_REG_EIP 8
-#define X86_CPU_REG_CR0 9
-#define X86_CPU_REG_CR2 10
+#define X86_CPU_REG_EIP    8
+#define X86_CPU_REG_CR0    9
+#define X86_CPU_REG_CR2    10
+#define X86_CPU_REG_EFLAGS 11
 
 #define X86_CPU_SEG_ES 0
 #define X86_CPU_SEG_CS 1
