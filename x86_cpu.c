@@ -767,6 +767,28 @@ static void flags_adc64(X86CPUState *s, uint64_t a, uint64_t b, uint64_t cin, ui
     if ((~(a ^ b) & (a ^ (a + b + cin))) >> 63) s->eflags |= EF_OF;
 }
 
+/* SBB flags: a - b - cin.  CF is set when (uint64_t)b + cin > (uint64_t)a
+ * (i.e., when there is a borrow).  Using 64-bit arithmetic avoids the edge
+ * case where b = 0xFFFFFFFF and cin = 1 causes b+cin to silently wrap to 0
+ * in 32-bit, producing a wrong CF=0 when CF should be 1. */
+static void flags_sbb32(X86CPUState *s, uint32_t a, uint32_t b, uint32_t cin, uint32_t r)
+{
+    s->eflags &= ~FLAGS_MASK_ARITH;
+    s->eflags |= compute_flags_pzs32(r);
+    if ((uint64_t)b + cin > (uint64_t)a) s->eflags |= EF_CF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
+    if (((a ^ b) & (a ^ r)) >> 31) s->eflags |= EF_OF;
+}
+
+static void flags_sbb64(X86CPUState *s, uint64_t a, uint64_t b, uint64_t cin, uint64_t r)
+{
+    s->eflags &= ~FLAGS_MASK_ARITH;
+    s->eflags |= compute_flags_pzs64(r);
+    if ((__uint128_t)b + cin > (__uint128_t)a) s->eflags |= EF_CF;
+    if ((a ^ b ^ r) & 0x10) s->eflags |= EF_AF;
+    if (((a ^ b) & (a ^ r)) >> 63) s->eflags |= EF_OF;
+}
+
 /* ------------------------------------------------------------------
  * Exception / interrupt delivery
  * ------------------------------------------------------------------ */
@@ -1373,7 +1395,17 @@ static uint8_t alu_op8(X86CPUState *s, int op, uint8_t a, uint8_t b)
     case 0: r = a + b;       flags_add8(s, a, b, r);   break;
     case 1: r = a | b;       flags_logic8(s, r);        break;
     case 2: { uint32_t rr = (uint32_t)a + b + cf; r = (uint8_t)rr; flags_add8(s, a, b+cf, r); } break;
-    case 3: { uint8_t tmp = b + (uint8_t)cf; r = a - tmp; flags_sub8(s, a, tmp, r); } break;
+    case 3: { /* SBB r/m8, r8: a - b - CF */
+              uint8_t r8 = a - b - (uint8_t)cf;
+              r = r8;
+              s->eflags &= ~FLAGS_MASK_ARITH;
+              s->eflags |= compute_flags_pzsb8(r8);
+              /* CF via 32-bit comparison avoids b+CF overflow at b=0xFF,CF=1 */
+              if ((uint32_t)b + cf > (uint32_t)a) s->eflags |= EF_CF;
+              uint8_t tmp8 = b + (uint8_t)cf;
+              if ((a ^ tmp8 ^ r8) & 0x10) s->eflags |= EF_AF;
+              if ((uint8_t)((a ^ tmp8) & (a ^ r8)) >> 7) s->eflags |= EF_OF;
+              break; }
     case 4: r = a & b;       flags_logic8(s, r);        break;
     case 5: r = a - b;       flags_sub8(s, a, b, r);    break;
     case 6: r = a ^ b;       flags_logic8(s, r);        break;
@@ -1391,7 +1423,17 @@ static uint16_t alu_op16(X86CPUState *s, int op, uint16_t a, uint16_t b)
     case 0: r = a + b;       flags_add16(s, a, b, r);   break;
     case 1: r = a | b;       flags_logic16(s, r);        break;
     case 2: { uint32_t rr = (uint32_t)a + b + cf; r = (uint16_t)rr; flags_add16(s, a, b+cf, r); } break;
-    case 3: { uint16_t tmp = b + (uint16_t)cf; r = a - tmp; flags_sub16(s, a, tmp, r); } break;
+    case 3: { /* SBB r/m16, r16: a - b - CF */
+              uint16_t r16 = a - b - (uint16_t)cf;
+              r = r16;
+              s->eflags &= ~FLAGS_MASK_ARITH;
+              s->eflags |= compute_flags_pzs16(r16);
+              /* CF via 32-bit comparison avoids b+CF overflow at b=0xFFFF,CF=1 */
+              if ((uint32_t)b + cf > (uint32_t)a) s->eflags |= EF_CF;
+              uint16_t tmp16 = b + (uint16_t)cf;
+              if ((uint32_t)(a ^ tmp16 ^ r16) & 0x10) s->eflags |= EF_AF;
+              if ((uint16_t)((a ^ tmp16) & (a ^ r16)) >> 15) s->eflags |= EF_OF;
+              break; }
     case 4: r = a & b;       flags_logic16(s, r);        break;
     case 5: r = a - b;       flags_sub16(s, a, b, r);    break;
     case 6: r = a ^ b;       flags_logic16(s, r);        break;
@@ -1409,7 +1451,7 @@ static uint32_t alu_op32(X86CPUState *s, int op, uint32_t a, uint32_t b)
     case 0: r = a + b;       flags_add32(s, a, b, r);   break;
     case 1: r = a | b;       flags_logic32(s, r);        break;
     case 2: r = a + b + (uint32_t)cf; flags_adc32(s, a, b, cf, r); break;
-    case 3: { uint32_t tmp = b + (uint32_t)cf; r = a - tmp; flags_sub32(s, a, tmp, r); } break;
+    case 3: { r = a - b - (uint32_t)cf; flags_sbb32(s, a, b, cf, r); } break;
     case 4: r = a & b;       flags_logic32(s, r);        break;
     case 5: r = a - b;       flags_sub32(s, a, b, r);    break;
     case 6: r = a ^ b;       flags_logic32(s, r);        break;
@@ -1427,7 +1469,7 @@ static uint64_t alu_op64(X86CPUState *s, int op, uint64_t a, uint64_t b)
     case 0: r = a + b;       flags_add64(s, a, b, r);   break;
     case 1: r = a | b;       flags_logic64(s, r);        break;
     case 2: r = a + b + (uint64_t)cf; flags_adc64(s, a, b, cf, r); break;
-    case 3: { uint64_t tmp = b + (uint64_t)cf; r = a - tmp; flags_sub64(s, a, tmp, r); } break;
+    case 3: { r = a - b - (uint64_t)cf; flags_sbb64(s, a, b, cf, r); } break;
     case 4: r = a & b;       flags_logic64(s, r);        break;
     case 5: r = a - b;       flags_sub64(s, a, b, r);    break;
     case 6: r = a ^ b;       flags_logic64(s, r);        break;
@@ -1645,44 +1687,134 @@ static void exec_0f(DecodeState *ds)
         uint64_t laddr = (rm_reg < 0) ? seg_ea(s, ea, ea_seg) : 0;
         BOOL lm = is_long_mode(s);
         switch (reg) {
-        case 0: { /* SGDT */
-            if (rm_reg >= 0) raise_exception(s, EXCP_UD);
+        case 0: { /* SGDT (mem) / special register-form (VMCALL etc.) */
+            if (rm_reg >= 0) { /* VMCALL/VMLAUNCH etc.: all no-ops */ break; }
             vmem_write16(s, laddr, (uint16_t)s->segs[X86_CPU_SEG_GDT].limit);
             if (lm) vmem_write64(s, laddr + 2, s->segs[X86_CPU_SEG_GDT].base);
             else    vmem_write32(s, laddr + 2, (uint32_t)s->segs[X86_CPU_SEG_GDT].base);
             break; }
-        case 1: { /* SIDT */
-            if (rm_reg >= 0) raise_exception(s, EXCP_UD);
+        case 1: { /* SIDT (mem) / MONITOR/MWAIT/CLAC/STAC (reg-form) */
+            if (rm_reg >= 0) {
+                switch (rm_reg) {
+                case 0: /* MONITOR: no-op (not advertised) */ break;
+                case 1: /* MWAIT:   no-op */ break;
+                case 2: /* CLAC:    clear AC flag */ s->eflags &= ~EF_AC; break;
+                case 3: /* STAC:    set AC flag */   s->eflags |=  EF_AC; break;
+                default: break; /* other encodings: no-op */
+                }
+                break;
+            }
             vmem_write16(s, laddr, (uint16_t)s->segs[X86_CPU_SEG_IDT].limit);
             if (lm) vmem_write64(s, laddr + 2, s->segs[X86_CPU_SEG_IDT].base);
             else    vmem_write32(s, laddr + 2, (uint32_t)s->segs[X86_CPU_SEG_IDT].base);
             break; }
-        case 2: { /* LGDT */
-            if (rm_reg >= 0) raise_exception(s, EXCP_UD);
+        case 2: { /* LGDT (mem) / XGETBV/XSETBV (reg-form) */
+            if (rm_reg >= 0) {
+                if (rm_reg == 0) { /* XGETBV: read XCR[ECX] */
+                    uint32_t xcr = (uint32_t)s->regs[1];
+                    if (xcr == 0) {
+                        s->regs[0] = 1; /* EAX: XCR0 bit 0 (x87 state) */
+                        s->regs[2] = 0; /* EDX: XCR0 high = 0 */
+                    } else {
+                        raise_exception_err(s, EXCP_GP, 0);
+                    }
+                }
+                /* rm_reg==1: XSETBV — ignore */
+                break;
+            }
             s->segs[X86_CPU_SEG_GDT].limit = vmem_read16(s, laddr);
             if (lm) s->segs[X86_CPU_SEG_GDT].base = vmem_read64(s, laddr + 2);
             else    s->segs[X86_CPU_SEG_GDT].base = vmem_read32(s, laddr + 2);
             break; }
-        case 3: { /* LIDT */
-            if (rm_reg >= 0) raise_exception(s, EXCP_UD);
+        case 3: { /* LIDT (mem) / VMRUN etc. (reg-form, AMD SVM) */
+            if (rm_reg >= 0) { /* AMD SVM instructions: no-op */ break; }
             s->segs[X86_CPU_SEG_IDT].limit = vmem_read16(s, laddr);
             if (lm) s->segs[X86_CPU_SEG_IDT].base = vmem_read64(s, laddr + 2);
             else    s->segs[X86_CPU_SEG_IDT].base = vmem_read32(s, laddr + 2);
             break; }
-        case 4: { /* SMSW */
+        case 4: { /* SMSW r/m16 — valid with both register and memory form */
             uint16_t msw = (uint16_t)(s->cr0 & 0xFFFF);
             if (rm_reg >= 0) set_reg16(s, rm_reg, msw);
             else vmem_write16(s, laddr, msw);
             break; }
-        case 6: { /* LMSW */
+        case 5: { /* RSTORSSP (mem) / SERIALIZE/SETSSBSY etc. (reg-form) */
+            if (rm_reg >= 0) { /* no-op for all register-form encodings */ break; }
+            /* Memory form: no-op (shadow stack not supported) */
+            break; }
+        case 6: { /* LMSW r/m16 — valid with both register and memory form */
             uint16_t msw = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, laddr);
             s->cr0 = (s->cr0 & 0xFFFF0010U) | (msw & 0xF);
             break; }
-        case 7: { /* INVLPG */
-            if (rm_reg >= 0) raise_exception(s, EXCP_UD);
+        case 7: { /* INVLPG (mem) / SWAPGS/RDTSCP (reg-form) */
+            if (rm_reg >= 0) {
+                if (rm_reg == 0 && lm) { /* SWAPGS: swap GS.base ↔ KernelGSBase
+                                       * Note: CPL check not enforced (ring-0 only kernel) */
+                    uint64_t tmp = s->segs[X86_CPU_SEG_GS].base;
+                    s->segs[X86_CPU_SEG_GS].base = s->msr_kernel_gs_base;
+                    s->msr_kernel_gs_base = tmp;
+                } else if (rm_reg == 1) { /* RDTSCP: TSC + TSC_AUX */
+                    uint64_t tsc = s->get_tsc ? s->get_tsc(s->get_tsc_opaque)
+                                              : s->cycle_count;
+                    set_reg32(s, 0, (uint32_t)tsc);
+                    set_reg32(s, 2, (uint32_t)(tsc >> 32));
+                    set_reg32(s, 1, 0); /* ECX = IA32_TSC_AUX = 0 */
+                }
+                /* rm_reg==2: MONITORX, rm_reg==3: MWAITX, etc.: no-op */
+                break;
+            }
             tlb_flush_all(s);
             break; }
         default: raise_exception(s, EXCP_UD);
+        }
+        break; }
+
+    case 0x02: { /* LAR r, r/m16 — Load Access Rights from segment descriptor */
+        /* Reads the selector from the source, looks it up in GDT, and returns
+         * the access-rights field in the destination register.
+         * Per Intel SDM: result = hi_dword & 0x00FFFF00 (bits 23:8 in place).
+         * ZF=1 on success, ZF=0 if the selector is invalid/null. */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        uint16_t sel = (rm_reg >= 0) ? get_reg16(s, rm_reg)
+                                     : vmem_read16(s, seg_ea(s, ea, ea_seg));
+        uint16_t idx = sel & ~7;
+        uint64_t gdt_base  = s->segs[X86_CPU_SEG_GDT].base;
+        uint32_t gdt_limit = s->segs[X86_CPU_SEG_GDT].limit;
+        if (idx == 0 || idx + 7 > gdt_limit) {
+            s->eflags &= ~EF_ZF; /* ZF=0: invalid selector */
+        } else {
+            uint32_t hi = vmem_read32(s, gdt_base + idx + 4);
+            /* Access rights: bits 23:8 of the high descriptor dword, in place.
+             * The kernel checks P bit (bit 15), DPL (bits 14:13), type, etc. */
+            uint32_t ar = hi & 0x00FFFF00U;
+            if (ds->op64 || is_long_mode(s)) set_reg64(s, reg, ar);
+            else if (ds->op32) set_reg32(s, reg, ar);
+            else set_reg16(s, reg, (uint16_t)(ar >> 8)); /* 16-bit: return descriptor byte 5 in bits [7:0] */
+            s->eflags |= EF_ZF; /* ZF=1: success */
+        }
+        break; }
+
+    case 0x03: { /* LSL r, r/m16 — Load Segment Limit from descriptor */
+        /* Read the selector from r/m, look it up in GDT, and return the
+         * expanded segment limit in the destination register.
+         * ZF=1 on success, ZF=0 if the selector is invalid/null. */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        uint16_t sel = (rm_reg >= 0) ? get_reg16(s, rm_reg)
+                                     : vmem_read16(s, seg_ea(s, ea, ea_seg));
+        uint16_t idx = sel & ~7;
+        uint64_t gdt_base  = s->segs[X86_CPU_SEG_GDT].base;
+        uint32_t gdt_limit = s->segs[X86_CPU_SEG_GDT].limit;
+        if (idx == 0 || idx + 7 > gdt_limit) {
+            s->eflags &= ~EF_ZF;
+        } else {
+            uint32_t lo = vmem_read32(s, gdt_base + idx);
+            uint32_t hi = vmem_read32(s, gdt_base + idx + 4);
+            /* Expand limit: bits 15:0 from lo, bits 19:16 from hi[19:16] */
+            uint32_t lim = (lo & 0xFFFF) | (((hi >> 16) & 0xF) << 16);
+            if (hi & (1U << 23)) lim = (lim << 12) | 0xFFF; /* G=1: 4KB granularity */
+            if (ds->op64 || is_long_mode(s)) set_reg64(s, reg, lim);
+            else if (ds->op32) set_reg32(s, reg, lim);
+            else set_reg16(s, reg, (uint16_t)lim);
+            s->eflags |= EF_ZF;
         }
         break; }
 
@@ -1756,6 +1888,13 @@ static void exec_0f(DecodeState *ds)
         }
         if (ds->op64 || is_long_mode(s)) set_reg64(s, rm_reg, crval);
         else set_reg32(s, rm_reg, (uint32_t)crval);
+        break; }
+
+    case 0x21: { /* MOV r, DRn — read debug register (return 0, DR not implemented) */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        if (rm_reg < 0) rm_reg = reg;
+        if (is_long_mode(s)) set_reg64(s, rm_reg, 0);
+        else set_reg32(s, rm_reg, 0);
         break; }
 
     case 0x22: { /* MOV CRn, r */
@@ -1842,6 +1981,12 @@ static void exec_0f(DecodeState *ds)
         }
         set_reg32(s, 0, (uint32_t)val);
         set_reg32(s, 2, (uint32_t)(val >> 32));
+        break; }
+
+    case 0x33: { /* RDPMC — read performance-monitoring counter */
+        /* Not fully implemented; return 0 so the kernel can boot without #GP. */
+        set_reg32(s, 0, 0); /* EAX = low 32 bits */
+        set_reg32(s, 2, 0); /* EDX = high 32 bits */
         break; }
 
     case 0x34: { /* SYSENTER */
@@ -2773,6 +2918,7 @@ static void exec_0f(DecodeState *ds)
         }
         break; }
 
+    case 0x08: /* INVD: invalidate caches; treated as no-op (same as WBINVD) */
     case 0x09: /* WBINVD: write-back and invalidate caches; no-op in emulation */
         break;
 
@@ -4998,7 +5144,13 @@ static void do_interp(X86CPUState *s, int max_cycles)
     volatile int exc_depth = 0;
     if (setjmp(s->jmp_env) != 0) {
         if (++exc_depth > MAX_EXCEPTION_DEPTH) {
-            /* Triple fault: halt the CPU */
+            /* Triple fault: halt the CPU and print a diagnostic */
+            fprintf(stderr, "x86: triple fault at RIP=%08x eflags=%08x "
+                    "eax=%08x ebx=%08x ecx=%08x edx=%08x esp=%08x\n",
+                    (uint32_t)s->rip, s->eflags,
+                    (uint32_t)s->regs[0], (uint32_t)s->regs[3],
+                    (uint32_t)s->regs[1], (uint32_t)s->regs[2],
+                    (uint32_t)s->regs[4]);
             s->power_down = TRUE;
             return;
         }

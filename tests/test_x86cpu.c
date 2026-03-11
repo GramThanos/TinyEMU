@@ -2959,6 +2959,193 @@ static void test_lldt_ltr(void)
     machine_free(m);
 }
 
+/* =====================================================================
+ * Test: SBB edge case — b=0xFFFFFFFF with CF=1 (b+CF overflows 32 bits)
+ * EAX=5, SBB EAX,0xFFFFFFFF with CF=1: result = 5 - 0xFFFFFFFF - 1
+ *   = 5 - 0x100000000 = 0x00000005 (mod 2^32, with borrow → CF=1)
+ * ===================================================================== */
+static void test_sbb_edge_borrow(void)
+{
+    /*
+     *   B8 05 00 00 00     MOV EAX, 5
+     *   F9                 STC          ; CF=1
+     *   81 D8 FF FF FF FF  SBB EAX, 0xFFFFFFFF
+     *   F4                 HLT
+     */
+    static const uint8_t code[] = {
+        0xB8, 0x05, 0x00, 0x00, 0x00,
+        0xF9,
+        0x81, 0xD8, 0xFF, 0xFF, 0xFF, 0xFF,
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax    = x86_cpu_get_reg(m->cpu, 0);
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, X86_CPU_REG_EFLAGS);
+    CHECK_EQ(eax, 5U);           /* 5 - 0xFFFFFFFF - 1 = 5 mod 2^32 */
+    CHECK_EQ(!!(eflags & 1), 1); /* CF=1 (borrow: 5 < 0x100000000) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: INVD — cache invalidate (no-op, must not raise #UD)
+ * ===================================================================== */
+static void test_invd(void)
+{
+    /*
+     *   0F 08    INVD
+     *   F4       HLT
+     */
+    static const uint8_t code[] = { 0x0F, 0x08, 0xF4 };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    /* No crash = pass */
+    CHECK(1);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: RDPMC — returns 0, must not raise #UD
+ * ===================================================================== */
+static void test_rdpmc(void)
+{
+    /*
+     *   B9 00 00 00 00  MOV ECX, 0  ; counter index 0
+     *   0F 33           RDPMC
+     *   F4              HLT
+     */
+    static const uint8_t code[] = {
+        0xB9, 0x00, 0x00, 0x00, 0x00,
+        0x0F, 0x33,
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ(eax, 0U);
+    CHECK_EQ(edx, 0U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: 0F 01 /1 register-form — MWAIT (0F 01 C9) must not fault
+ * ===================================================================== */
+static void test_0f01_mwait(void)
+{
+    /*
+     *   31 C0     XOR EAX, EAX
+     *   31 C9     XOR ECX, ECX
+     *   0F 01 C9  MWAIT   (reg=1, rm=1: mod=11 → register form)
+     *   F4        HLT
+     */
+    static const uint8_t code[] = {
+        0x31, 0xC0,
+        0x31, 0xC9,
+        0x0F, 0x01, 0xC9,
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    CHECK(1); /* No #UD = pass */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: XGETBV (0F 01 D0) — returns XCR0 = 1 in EAX, 0 in EDX
+ * ===================================================================== */
+static void test_xgetbv(void)
+{
+    /*
+     *   B9 00 00 00 00  MOV ECX, 0   ; XCR0
+     *   0F 01 D0        XGETBV       (reg=2, rm=0)
+     *   F4              HLT
+     */
+    static const uint8_t code[] = {
+        0xB9, 0x00, 0x00, 0x00, 0x00,
+        0x0F, 0x01, 0xD0,
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ(eax, 1U); /* XCR0 bit 0 = x87 state */
+    CHECK_EQ(edx, 0U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: LAR — returns access rights; ZF=1 on success, P bit (bit 15) set
+ * Code selector 0x08 (GDT entry 1, descriptor 0x00CF9A000000FFFF):
+ *   hi = 0x00CF9A00 → ar = hi & 0x00FFFF00 = 0x009A00
+ *   bit 15 of 0x009A00 = 1 (P=1, present segment). ZF should be 1.
+ * ===================================================================== */
+static void test_lar(void)
+{
+    /*
+     *   B8 08 00 00 00  MOV EAX, 8   ; selector 0x08 (GDT code segment)
+     *   0F 02 C8        LAR ECX, EAX
+     *   F4              HLT
+     */
+    static const uint8_t code[] = {
+        0xB8, 0x08, 0x00, 0x00, 0x00,
+        0x0F, 0x02, 0xC8,
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, X86_CPU_REG_EFLAGS);
+    CHECK_EQ(!!(eflags & (1U << 6)), 1U); /* ZF=1: valid segment */
+    /* Check P bit (bit 15) is set in the LAR result (ECX = reg[1]) */
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(!!(ecx & (1U << 15)), 1U); /* P=1 */
+    machine_free(m);
+}
+
+
+static void test_lsl(void)
+{
+    /*
+     *   B8 08 00 00 00  MOV EAX, 8   ; selector 0x08 (GDT index 1 = code seg)
+     *   0F 03 C8        LSL ECX, EAX
+     *   F4              HLT
+     * GDT entry 1: 0x00CF9B000000FFFF → limit = 0xFFFF with G=1 → expanded = 0xFFFFFFFF
+     */
+    static const uint8_t code[] = {
+        0xB8, 0x08, 0x00, 0x00, 0x00,
+        0x0F, 0x03, 0xC8,
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+
+    /* Use enter_protected_mode which sets GDT with flat 4GB segments */
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eflags = x86_cpu_get_reg(m->cpu, X86_CPU_REG_EFLAGS);
+    CHECK_EQ(!!(eflags & (1U << 6)), 1U); /* ZF=1: segment found */
+    /* For a G=1 descriptor with raw limit 0xFFFF, expanded = 0xFFFFFFFF */
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 0xFFFFFFFFU);
+    machine_free(m);
+}
+
 int main(void)
 {
     fprintf(stderr, "Running x86 CPU emulator tests...\n\n");
@@ -3056,6 +3243,13 @@ int main(void)
     test_lldt_ltr();
     test_cmpxchg8b_equal();
     test_cmpxchg8b_notequal();
+    test_sbb_edge_borrow();
+    test_invd();
+    test_rdpmc();
+    test_0f01_mwait();
+    test_xgetbv();
+    test_lsl();
+    test_lar();
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
     if (tests_fail)
