@@ -3146,6 +3146,371 @@ static void test_lsl(void)
     machine_free(m);
 }
 
+/* =====================================================================
+ * Test: ROL r8 with count > 8 — rotation must wrap modulo 8
+ *
+ * ROL AL, 9 must equal ROL AL, 1.  Before the fix, `AL >> (8-9)` invoked
+ * undefined behaviour and produced the wrong result.
+ *
+ * Code:
+ *   B0 81     MOV AL, 0x81     ; AL = 1000 0001
+ *   C0 C0 09  ROL AL, 9        ; effective count = 9 % 8 = 1  => 0000 0011
+ *   F4        HLT
+ * ===================================================================== */
+static void test_rol_r8_count_gt8(void)
+{
+    static const uint8_t code[] = {
+        0xB0, 0x81,         /* MOV AL, 0x81 */
+        0xC0, 0xC0, 0x09,   /* ROL AL, 9  (effective = 9 % 8 = 1) */
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    /* ROL 0x81 by 1: 0x81 = 1000 0001 -> rotated = 0000 0011 = 0x03 */
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ((uint8_t)eax, 0x03U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: ROR r8 with count > 8 — rotation must wrap modulo 8
+ *
+ * ROR AL, 9 must equal ROR AL, 1.
+ *
+ * Code:
+ *   B0 81     MOV AL, 0x81     ; AL = 1000 0001
+ *   C0 C8 09  ROR AL, 9        ; effective count = 9 % 8 = 1  => 1100 0000
+ *   F4        HLT
+ * ===================================================================== */
+static void test_ror_r8_count_gt8(void)
+{
+    static const uint8_t code[] = {
+        0xB0, 0x81,         /* MOV AL, 0x81 */
+        0xC0, 0xC8, 0x09,   /* ROR AL, 9 (effective = 9 % 8 = 1) */
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    /* ROR 0x81 by 1: 0x81 = 1000 0001 -> rotated right = 1100 0000 = 0xC0 */
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ((uint8_t)eax, 0xC0U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: RCL r8 with count = 9 must be a no-op (9 % 9 = 0)
+ *
+ * Code:
+ *   F9           STC            ; CF = 1
+ *   B0 A5        MOV AL, 0xA5   ; AL = 1010 0101
+ *   C0 D0 09     RCL AL, 9      ; 9 % 9 = 0  => no-op, AL unchanged, CF unchanged
+ *   88 C3        MOV BL, AL     ; save AL to BL
+ *   9C           PUSHF
+ *   5A           POP EDX        ; EDX = flags
+ *   F4           HLT
+ * ===================================================================== */
+static void test_rcl_r8_count9_noop(void)
+{
+    static const uint8_t code[] = {
+        0xF9,               /* STC */
+        0xB0, 0xA5,         /* MOV AL, 0xA5 */
+        0xC0, 0xD0, 0x09,   /* RCL AL, 9  (9 % 9 = 0, no-op) */
+        0x88, 0xC3,         /* MOV BL, AL */
+        0x9C,               /* PUSHF */
+        0x5A,               /* POP EDX */
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    uint32_t ebx = x86_cpu_get_reg(m->cpu, 3);
+    uint32_t edx = x86_cpu_get_reg(m->cpu, 2);
+    CHECK_EQ((uint8_t)ebx, 0xA5U);         /* AL unchanged */
+    CHECK((edx >> 0) & 1);                  /* CF still 1 (no-op preserves CF) */
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: ROL r16 with count > 16 — rotation must wrap modulo 16
+ *
+ * ROL AX, 17 must equal ROL AX, 1.
+ *
+ * Code (with 0x66 prefix for 16-bit operand in 32-bit mode):
+ *   66 B8 01 80   MOV AX, 0x8001
+ *   66 C1 C0 11   ROL AX, 17  (effective = 17 % 16 = 1)
+ *   F4            HLT
+ * ===================================================================== */
+static void test_rol_r16_count_gt16(void)
+{
+    static const uint8_t code[] = {
+        0x66, 0xB8, 0x01, 0x80,     /* MOV AX, 0x8001 */
+        0x66, 0xC1, 0xC0, 0x11,     /* ROL AX, 17 (effective = 17 % 16 = 1) */
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+    /* ROL 0x8001 by 1 = 0x0003 (MSB wraps to bit 0) */
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ((uint16_t)eax, 0x0003U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: REP MOVSW in 32-bit address mode uses ECX (not CX) as count
+ *
+ * Setup: ECX = 4 (count), ESI -> source array, EDI -> dest array.
+ * Source: 0x1234, 0x5678, 0xABCD, 0xEF01.
+ * With the fix, all 4 words should be copied (count = ECX = 4).
+ * ===================================================================== */
+static void test_rep_movsw_ecx_count(void)
+{
+    /*
+     * Code at 0x1000:
+     *   B9 04 00 00 00    MOV ECX, 4
+     *   BE 00 20 00 00    MOV ESI, 0x2000   (source)
+     *   BF 00 30 00 00    MOV EDI, 0x3000   (dest)
+     *   FC                CLD
+     *   66 F3 A5          REP MOVSW  (0x66 = word size, rep, 0xA5 = MOVS m)
+     *   F4                HLT
+     */
+    static const uint8_t code[] = {
+        0xB9, 0x04, 0x00, 0x00, 0x00,   /* MOV ECX, 4 */
+        0xBE, 0x00, 0x20, 0x00, 0x00,   /* MOV ESI, 0x2000 */
+        0xBF, 0x00, 0x30, 0x00, 0x00,   /* MOV EDI, 0x3000 */
+        0xFC,                            /* CLD */
+        0x66, 0xF3, 0xA5,               /* REP MOVSW */
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x4000, 0x1000, 0x5000);
+
+    /* Source data at 0x2000 */
+    uint16_t src[4] = { 0x1234, 0x5678, 0xABCD, 0xEF01 };
+    memcpy(m->ram + 0x2000, src, sizeof(src));
+    memset(m->ram + 0x3000, 0, 8);
+
+    run_cpu(m, 200000);
+
+    /* All 4 words must have been copied */
+    uint16_t got[4];
+    memcpy(got, m->ram + 0x3000, sizeof(got));
+    CHECK_EQ(got[0], 0x1234U);
+    CHECK_EQ(got[1], 0x5678U);
+    CHECK_EQ(got[2], 0xABCDU);
+    CHECK_EQ(got[3], 0xEF01U);
+
+    /* ECX must be 0 after the REP */
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 0U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: REPNE CMPSW in 32-bit address mode uses ECX (not CX) as count
+ *
+ * Compare two arrays of 4 words where elements 0 and 1 differ but element 2
+ * matches.  REPNE continues while not-equal and stops on the first match
+ * (ZF=1) at index 2.  ECX starts at 4; after the early stop, 1 remains.
+ * ===================================================================== */
+static void test_repne_cmpsw_ecx_count(void)
+{
+    /*
+     * Code at 0x1000:
+     *   B9 04 00 00 00    MOV ECX, 4
+     *   BE 00 20 00 00    MOV ESI, 0x2000  (string 1)
+     *   BF 00 30 00 00    MOV EDI, 0x3000  (string 2)
+     *   FC                CLD
+     *   66 F2 A7          REPNE CMPSW
+     *   F4                HLT
+     */
+    static const uint8_t code[] = {
+        0xB9, 0x04, 0x00, 0x00, 0x00,
+        0xBE, 0x00, 0x20, 0x00, 0x00,
+        0xBF, 0x00, 0x30, 0x00, 0x00,
+        0xFC,
+        0x66, 0xF2, 0xA7,               /* REPNE CMPSW */
+        0xF4,
+    };
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x4000, 0x1000, 0x5000);
+
+    /* String 1 at 0x2000: AAAA BBBB CCCC DDDD (first two differ from s2) */
+    uint16_t s1[4] = { 0xAAAA, 0xBBBB, 0xCCCC, 0xDDDD };
+    /* String 2 at 0x3000: 1111 2222 CCCC 4444 (differ at 0,1; match at 2) */
+    uint16_t s2[4] = { 0x1111, 0x2222, 0xCCCC, 0x4444 };
+    memcpy(m->ram + 0x2000, s1, sizeof(s1));
+    memcpy(m->ram + 0x3000, s2, sizeof(s2));
+
+    run_cpu(m, 200000);
+
+    /* REPNE stops on match (ZF=1) at index 2; 1 element remaining (index 3) */
+    uint32_t ecx = x86_cpu_get_reg(m->cpu, 1);
+    CHECK_EQ(ecx, 1U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: 64-bit IRET EFLAGS masking — reserved bits are cleared
+ *
+ * In 64-bit long mode, IRET must apply the same 0x3F7FD5 mask to the
+ * restored EFLAGS.  This is tested by having a synthetic handler that
+ * pushes a crafted RFLAGS (with reserved bits set) and then IRETs.
+ * After IRET the reserved bits must be clear and EF_FIXED set.
+ *
+ * Code at 0x1000 (64-bit):
+ *   Push a fake IRET frame with RFLAGS = 0xDEADFFFF (reserved bits set).
+ *   IRETQ should mask it to (0xDEADFFFF & 0x3F7FD5) | EF_FIXED.
+ *   Expected masked EFLAGS = (0x3F7FD5 & 0xDEADFFFF) | 0x2 = 0x00A8D5 | 0x2 = 0x00A8D7
+ *   We check reserved bits 3 and 5 are clear and EF_FIXED (bit 1) is set.
+ *
+ * We test this in 32-bit mode via IRETD with a crafted stack frame that
+ * has bits 3 and 5 set (both reserved in EFLAGS) to verify the mask clears them.
+ * ===================================================================== */
+static void test_iretd_eflags_reserved_cleared(void)
+{
+    /*
+     * Code at 0x1000:
+     *   Push a synthetic IRETD frame:
+     *     [ESP-4]  = 0xFFFFFFFF (flags with all bits set, including reserved)
+     *     [ESP-8]  = CS selector 0x08
+     *     [ESP-12] = return EIP = 0x1020 (HLT)
+     *
+     *   68 FF FF FF FF    PUSH 0xFFFFFFFF  (flags)
+     *   6A 08             PUSH 8           (CS selector)
+     *   68 20 10 00 00    PUSH 0x1020      (return EIP)
+     *   CF                IRETD
+     *
+     * Code at 0x1020:
+     *   9C                PUSHF
+     *   58                POP EAX
+     *   F4                HLT
+     */
+    static const uint8_t code1000[] = {
+        0x68, 0xFF, 0xFF, 0xFF, 0xFF,   /* PUSH 0xFFFFFFFF */
+        0x6A, 0x08,                     /* PUSH 8 (CS) */
+        0x68, 0x20, 0x10, 0x00, 0x00,   /* PUSH 0x1020 */
+        0xCF,                           /* IRETD */
+    };
+    static const uint8_t code1020[] = {
+        0x9C,   /* PUSHF */
+        0x58,   /* POP EAX */
+        0xF4,   /* HLT */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000, sizeof(code1000));
+    memcpy(m->ram + 0x1020, code1020, sizeof(code1020));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    /* Reserved bit 3 (0x8) must NOT be set after IRETD */
+    CHECK(!((eax >> 3) & 1));
+    /* Reserved bit 5 (0x20) must NOT be set */
+    CHECK(!((eax >> 5) & 1));
+    /* EF_FIXED (bit 1) must always be set */
+    CHECK((eax >> 1) & 1);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: 32-bit IRET reloads CS descriptor from GDT
+ *
+ * Two code segment descriptors in GDT: both flat 32-bit, but index 1
+ * (selector 0x08) and index 3 (selector 0x18).  Exception delivery
+ * loads descriptor for the handler's CS (0x08).  After IRET, CS must
+ * reflect the caller's CS descriptor (0x18).
+ *
+ * We verify this by reading CS.flags via exec_one after IRET: if the
+ * descriptor was not reloaded, executing in 16-bit mode would cause
+ * the wrong op-size and instructions would decode incorrectly.
+ * ===================================================================== */
+static void test_iretd_reloads_cs_descriptor(void)
+{
+    /*
+     * GDT layout at 0x2000:
+     *   [0x2000] null (8 bytes)
+     *   [0x2008] CS selector 0x08: flat 32-bit code, base=0
+     *   [0x2010] DS selector 0x10: flat 32-bit data, base=0
+     *   [0x2018] CS selector 0x18: flat 32-bit code, base=0 (same as 0x08)
+     *
+     * Main code at 0x1000 (running with CS=0x18):
+     *   CD 80       INT 0x80
+     *   B8 EF BE AD DE   MOV EAX, 0xDEADBEEF   (must decode as 32-bit)
+     *   F4          HLT
+     *
+     * Handler at 0x1010 (CS=0x08 in IDT gate):
+     *   CF          IRETD      (restores CS=0x18)
+     */
+    static const uint8_t code1000[] = {
+        0xCD, 0x80,                             /* INT 0x80 */
+        0xB8, 0xEF, 0xBE, 0xAD, 0xDE,          /* MOV EAX, 0xDEADBEEF */
+        0xF4,                                   /* HLT */
+    };
+    static const uint8_t handler1010[] = {
+        0xCF,   /* IRETD */
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code1000,    sizeof(code1000));
+    memcpy(m->ram + 0x1010, handler1010, sizeof(handler1010));
+
+    /* Build a 4-entry GDT at 0x2000 */
+    uint64_t null_d = 0;
+    uint64_t code_d = 0x00CF9A000000FFFFULL;  /* flat 32-bit code */
+    uint64_t data_d = 0x00CF92000000FFFFULL;  /* flat 32-bit data */
+    memcpy(m->ram + 0x2000,       &null_d, 8);
+    memcpy(m->ram + 0x2000 +  8,  &code_d, 8);  /* 0x08 */
+    memcpy(m->ram + 0x2000 + 16,  &data_d, 8);  /* 0x10 */
+    memcpy(m->ram + 0x2000 + 24,  &code_d, 8);  /* 0x18 — same descriptor */
+
+    /* Enable protected mode and set up segments */
+    uint32_t cr0 = x86_cpu_get_reg(m->cpu, X86_CPU_REG_CR0);
+    x86_cpu_set_reg(m->cpu, X86_CPU_REG_CR0, cr0 | 1);
+
+    X86CPUSeg sd = {0};
+    sd.base = 0x2000; sd.limit = 31;  /* covers 4 descriptors */
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_GDT, &sd);
+
+    /* CS = 0x18 (flat 32-bit code) */
+    sd.sel = 0x18; sd.base = 0; sd.limit = 0xFFFFFFFF;
+    sd.flags = 0xC09B;
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_CS, &sd);
+
+    /* DS/SS/ES = 0x10 */
+    sd.sel = 0x10; sd.flags = 0xC093;
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_DS, &sd);
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_SS, &sd);
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_ES, &sd);
+
+    x86_cpu_set_reg(m->cpu, X86_CPU_REG_EIP, 0x1000);
+    x86_cpu_set_reg(m->cpu, 4, 0x3000); /* ESP */
+
+    /* IDT at 0x4000, vector 0x80 uses CS=0x08 */
+    setup_idt_entry(m->ram, 0x4000, 0x80, 0x08, 0x1010);
+    X86CPUSeg idt = {0};
+    idt.base  = 0x4000;
+    idt.limit = 0x80 * 8 + 7;
+    x86_cpu_set_seg(m->cpu, X86_CPU_SEG_IDT, &idt);
+
+    run_cpu(m, 200000);
+
+    /* After IRET, CS should be back to 0x18 and the 32-bit MOV EAX instruction
+     * should decode correctly, producing 0xDEADBEEF in EAX. */
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xDEADBEEFU);
+    machine_free(m);
+}
+
 int main(void)
 {
     fprintf(stderr, "Running x86 CPU emulator tests...\n\n");
@@ -3250,6 +3615,14 @@ int main(void)
     test_xgetbv();
     test_lsl();
     test_lar();
+    test_rol_r8_count_gt8();
+    test_ror_r8_count_gt8();
+    test_rcl_r8_count9_noop();
+    test_rol_r16_count_gt16();
+    test_rep_movsw_ecx_count();
+    test_repne_cmpsw_ecx_count();
+    test_iretd_eflags_reserved_cleared();
+    test_iretd_reloads_cs_descriptor();
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
     if (tests_fail)

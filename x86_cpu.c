@@ -1188,6 +1188,18 @@ static uint8_t do_shift8(X86CPUState *s, int op, uint8_t a, int cnt)
     uint32_t cf = (s->eflags & EF_CF) ? 1 : 0;
     int c = cnt & 31;
     if (c == 0) return a;
+
+    /* For rotations, compute the effective count first.  If it reduces to
+     * zero (e.g. ROL r8, 8 or RCL r8, 9) the operation is a no-op: no
+     * flags are modified (Intel SDM: "if count is 0, flags are not affected"). */
+    if (op == 0 || op == 1) { /* ROL / ROR */
+        int c8 = c & 7;
+        if (c8 == 0) return a;  /* no-op, flags unchanged */
+    } else if (op == 2 || op == 3) { /* RCL / RCR */
+        int c9 = c % 9;
+        if (c9 == 0) return a;  /* no-op, flags unchanged */
+    }
+
     uint8_t r;
     s->eflags &= ~(EF_CF | EF_OF);
     switch (op) {
@@ -1205,27 +1217,29 @@ static uint8_t do_shift8(X86CPUState *s, int op, uint8_t a, int cnt)
         r = (uint8_t)((uint8_t)((int8_t)a) >> c);
         if (((uint64_t)a >> (c-1)) & 1) s->eflags |= EF_CF;
         break;
-    case 0: /* ROL */
-        r = (uint8_t)((a << c) | (a >> (8-c)));
-        if (r & 1) s->eflags |= EF_CF;
-        if (c == 1 && !!((r >> 7) & 1) != !!(s->eflags & EF_CF)) s->eflags |= EF_OF;
-        break;
-    case 1: /* ROR */
-        r = (uint8_t)((a >> c) | (a << (8-c)));
-        if ((r >> 7) & 1) s->eflags |= EF_CF;
-        if (c == 1 && !!(r >> 7 & 1) != !!((r >> 6) & 1)) s->eflags |= EF_OF;
-        break;
-    case 2: /* RCL */
-        { int fc = cf; r = (uint8_t)((a << c) | (fc << (c-1)));
-          for (int i = c; i < 8+1; i++) r |= (uint8_t)((a >> (8+1-i-1)) << (8+1-i-1)); }
-        /* simplified: approximate RCL/RCR for small counts */
-        r = (uint8_t)(((uint64_t)a << c) | (cf << (c-1)) | (a >> (8+1-c)));
-        if (((uint8_t)(a >> (8-c))) & 1) s->eflags |= EF_CF;
-        break;
-    case 3: /* RCR */
-        r = (uint8_t)((a >> c) | ((uint64_t)cf << (8-c)) | (a << (8+1-c)));
-        if ((a >> (c-1)) & 1) s->eflags |= EF_CF;
-        break;
+    case 0: /* ROL — effective count is (cnt & 31) % 8, already != 0 */
+        { int c8 = c & 7;
+          r = (uint8_t)((a << c8) | (a >> (8 - c8)));
+          if (r & 1) s->eflags |= EF_CF;
+          if (c8 == 1 && !!((r >> 7) & 1) != !!(s->eflags & EF_CF)) s->eflags |= EF_OF;
+        } break;
+    case 1: /* ROR — effective count is (cnt & 31) % 8, already != 0 */
+        { int c8 = c & 7;
+          r = (uint8_t)((a >> c8) | (a << (8 - c8)));
+          if ((r >> 7) & 1) s->eflags |= EF_CF;
+          if (c8 == 1 && !!(r >> 7 & 1) != !!((r >> 6) & 1)) s->eflags |= EF_OF;
+        } break;
+    case 2: /* RCL — 9-bit rotation, effective count is (cnt & 31) % 9, already != 0 */
+        { int c9 = c % 9;
+          /* Shift a 9-bit window {CF:a} left by c9 positions */
+          r = (uint8_t)(((uint64_t)a << c9) | ((uint64_t)cf << (c9 - 1)) | (a >> (9 - c9)));
+          if ((a >> (8 - c9)) & 1) s->eflags |= EF_CF;
+        } break;
+    case 3: /* RCR — 9-bit rotation, effective count is (cnt & 31) % 9, already != 0 */
+        { int c9 = c % 9;
+          r = (uint8_t)((a >> c9) | ((uint64_t)cf << (8 - c9)) | (a << (9 - c9)));
+          if ((a >> (c9 - 1)) & 1) s->eflags |= EF_CF;
+        } break;
     default: r = a; break;
     }
     s->eflags &= ~(EF_PF|EF_ZF|EF_SF);
@@ -1238,6 +1252,16 @@ static uint16_t do_shift16(X86CPUState *s, int op, uint16_t a, int cnt)
     uint32_t cf = (s->eflags & EF_CF) ? 1 : 0;
     int c = cnt & 31;
     if (c == 0) return a;
+
+    /* Rotations: compute effective count first; return immediately if no-op. */
+    if (op == 0 || op == 1) {
+        int c16 = c & 0xF;
+        if (c16 == 0) return a;
+    } else if (op == 2 || op == 3) {
+        int c17 = c % 17;
+        if (c17 == 0) return a;
+    }
+
     uint16_t r;
     s->eflags &= ~(EF_CF | EF_OF);
     switch (op) {
@@ -1255,27 +1279,28 @@ static uint16_t do_shift16(X86CPUState *s, int op, uint16_t a, int cnt)
         r = (uint16_t)((uint16_t)((int16_t)a) >> c);
         if (((uint64_t)a >> (c-1)) & 1) s->eflags |= EF_CF;
         break;
-    case 0: /* ROL */
-        r = (uint16_t)((a << c) | (a >> (16-c)));
-        if (r & 1) s->eflags |= EF_CF;
-        if (c == 1 && !!((r >> 15) & 1) != !!(s->eflags & EF_CF)) s->eflags |= EF_OF;
-        break;
-    case 1: /* ROR */
-        r = (uint16_t)((a >> c) | (a << (16-c)));
-        if ((r >> 15) & 1) s->eflags |= EF_CF;
-        if (c == 1 && !!(r >> 15 & 1) != !!((r >> 14) & 1)) s->eflags |= EF_OF;
-        break;
-    case 2: /* RCL */
-        { int fc = cf; r = (uint16_t)((a << c) | (fc << (c-1)));
-          for (int i = c; i < 16+1; i++) r |= (uint16_t)((a >> (16+1-i-1)) << (16+1-i-1)); }
-        /* simplified: approximate RCL/RCR for small counts */
-        r = (uint16_t)(((uint64_t)a << c) | (cf << (c-1)) | (a >> (16+1-c)));
-        if (((uint16_t)(a >> (16-c))) & 1) s->eflags |= EF_CF;
-        break;
-    case 3: /* RCR */
-        r = (uint16_t)((a >> c) | ((uint64_t)cf << (16-c)) | (a << (16+1-c)));
-        if ((a >> (c-1)) & 1) s->eflags |= EF_CF;
-        break;
+    case 0: /* ROL — effective count is (cnt & 31) % 16, already != 0 */
+        { int c16 = c & 0xF;
+          r = (uint16_t)((a << c16) | (a >> (16 - c16)));
+          if (r & 1) s->eflags |= EF_CF;
+          if (c16 == 1 && !!((r >> 15) & 1) != !!(s->eflags & EF_CF)) s->eflags |= EF_OF;
+        } break;
+    case 1: /* ROR — effective count is (cnt & 31) % 16, already != 0 */
+        { int c16 = c & 0xF;
+          r = (uint16_t)((a >> c16) | (a << (16 - c16)));
+          if ((r >> 15) & 1) s->eflags |= EF_CF;
+          if (c16 == 1 && !!(r >> 15 & 1) != !!((r >> 14) & 1)) s->eflags |= EF_OF;
+        } break;
+    case 2: /* RCL — 17-bit rotation, effective count is (cnt & 31) % 17, already != 0 */
+        { int c17 = c % 17;
+          r = (uint16_t)(((uint64_t)a << c17) | ((uint64_t)cf << (c17 - 1)) | (a >> (17 - c17)));
+          if ((a >> (16 - c17)) & 1) s->eflags |= EF_CF;
+        } break;
+    case 3: /* RCR — 17-bit rotation, effective count is (cnt & 31) % 17, already != 0 */
+        { int c17 = c % 17;
+          r = (uint16_t)((a >> c17) | ((uint64_t)cf << (16 - c17)) | (a << (17 - c17)));
+          if ((a >> (c17 - 1)) & 1) s->eflags |= EF_CF;
+        } break;
     default: r = a; break;
     }
     s->eflags &= ~(EF_PF|EF_ZF|EF_SF);
@@ -4326,7 +4351,7 @@ prefix_loop:
         break; }
 
     case 0xA4: { /* MOVS m8, m8 (with REP) */
-        uint64_t cnt = ds->rep ? (ds->op64 ? s->regs[1] : ds->op32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -1 : 1;
         while (cnt--) {
             uint8_t v = vmem_read8(s, seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS));
@@ -4334,11 +4359,11 @@ prefix_loop:
             s->regs[6] += di_inc; s->regs[7] += di_inc;
             if (!ds->addr64) { s->regs[6] &= 0xFFFFFFFF; s->regs[7] &= 0xFFFFFFFF; }
         }
-        if (ds->rep) { if (ds->op64) s->regs[1] = 0; else if (ds->op32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
+        if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
         break; }
     case 0xA5: { /* MOVS m, m */
         int sz = ds->op64 ? 8 : ds->op32 ? 4 : 2;
-        uint64_t cnt = ds->rep ? (ds->op64 ? s->regs[1] : ds->op32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = ((s->eflags & EF_DF) ? -sz : sz);
         while (cnt--) {
             uint64_t src_lin = seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS);
@@ -4349,10 +4374,10 @@ prefix_loop:
             s->regs[6] += di_inc; s->regs[7] += di_inc;
             if (!ds->addr64) { s->regs[6] &= 0xFFFFFFFF; s->regs[7] &= 0xFFFFFFFF; }
         }
-        if (ds->rep) { if (ds->op64) s->regs[1] = 0; else if (ds->op32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
+        if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
         break; }
     case 0xA6: { /* CMPS m8, m8 */
-        uint64_t cnt = ds->rep || ds->repne ? (ds->op32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        uint64_t cnt = ds->rep || ds->repne ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -1 : 1;
         while (cnt > 0) {
             cnt--;
@@ -4364,11 +4389,11 @@ prefix_loop:
             if (ds->rep && !(s->eflags & EF_ZF)) break;
             if (ds->repne && (s->eflags & EF_ZF)) break;
         }
-        if (ds->rep || ds->repne) { if (ds->op32) set_reg32(s, 1, (uint32_t)cnt); else set_reg16(s, 1, (uint16_t)cnt); }
+        if (ds->rep || ds->repne) { if (ds->addr64) s->regs[1] = cnt; else if (ds->addr32) set_reg32(s, 1, (uint32_t)cnt); else set_reg16(s, 1, (uint16_t)cnt); }
         break; }
     case 0xA7: { /* CMPS m, m */
         int sz = ds->op64 ? 8 : ds->op32 ? 4 : 2;
-        uint64_t cnt = ds->rep || ds->repne ? (ds->op32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        uint64_t cnt = ds->rep || ds->repne ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
         int di_inc = (s->eflags & EF_DF) ? -sz : sz;
         while (cnt > 0) {
             cnt--;
@@ -4382,7 +4407,7 @@ prefix_loop:
             if (ds->rep && !(s->eflags & EF_ZF)) break;
             if (ds->repne && (s->eflags & EF_ZF)) break;
         }
-        if (ds->rep || ds->repne) { if (ds->op32) set_reg32(s, 1, (uint32_t)cnt); else set_reg16(s, 1, (uint16_t)cnt); }
+        if (ds->rep || ds->repne) { if (ds->addr64) s->regs[1] = cnt; else if (ds->addr32) set_reg32(s, 1, (uint32_t)cnt); else set_reg16(s, 1, (uint16_t)cnt); }
         break; }
     case 0xA8: { /* TEST AL, imm8 */
         uint8_t imm = fetch_byte(ds);
@@ -4637,22 +4662,22 @@ prefix_loop:
             (void)new_ss;
             s->rip = new_rip;
             s->segs[X86_CPU_SEG_CS].sel = (uint16_t)new_cs;
-            s->eflags = (uint32_t)new_fl | EF_FIXED;
+            s->eflags = ((uint32_t)new_fl & 0x3F7FD5U) | EF_FIXED;
             s->regs[4] = new_rsp;
         } else if (ds->op32) {
             uint32_t new_ip = pop32(s);
             uint32_t new_cs = pop32(s);
             uint32_t new_fl = pop32(s);
             s->rip = new_ip;
-            s->segs[X86_CPU_SEG_CS].sel = (uint16_t)new_cs;
+            load_seg_desc(s, X86_CPU_SEG_CS, (uint16_t)new_cs);
             s->eflags = (new_fl & 0x3F7FD5U) | EF_FIXED;
         } else {
             uint16_t new_ip = pop16(s);
             uint16_t new_cs = pop16(s);
             uint16_t new_fl = pop16(s);
             s->rip = new_ip;
-            s->segs[X86_CPU_SEG_CS].sel = new_cs;
-            s->eflags = (s->eflags & ~0xFFFFU) | new_fl;
+            load_seg_desc(s, X86_CPU_SEG_CS, new_cs);
+            s->eflags = (s->eflags & ~0xFFFFU) | (new_fl & 0x7FD5U) | EF_FIXED;
         }
         ds->rip_set = TRUE;
         break; }
