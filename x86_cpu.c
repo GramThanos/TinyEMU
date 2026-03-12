@@ -2863,7 +2863,7 @@ static void exec_0f(DecodeState *ds)
             uint16_t src = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, seg_ea(s, ea, ea_seg));
             if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg16(s, reg, 16); } break; }
             s->eflags &= ~EF_ZF;
-            if (ds->rep) set_reg16(s, reg, (uint16_t)__builtin_clz((uint32_t)src) - 16);
+            if (ds->rep) set_reg16(s, reg, (uint16_t)(__builtin_clz((uint32_t)src) - 16));
             else set_reg16(s, reg, 15 - (uint16_t)(__builtin_clz((uint32_t)src) - 16));
         }
         break; }
@@ -4150,11 +4150,11 @@ prefix_loop:
         break; }
     case 0x6E: { /* OUTSB: I/O(DX) ← DS:[ESI], update ESI */
         uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
-        int di_inc = (s->eflags & EF_DF) ? -1 : 1;
+        int si_inc = (s->eflags & EF_DF) ? -1 : 1;
         while (cnt--) {
             uint8_t v = vmem_read8(s, seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS));
             port_write(s, (uint16_t)s->regs[2], v, 0);
-            s->regs[6] += di_inc;
+            s->regs[6] += si_inc;
             if (!ds->addr64) s->regs[6] &= 0xFFFFFFFF;
         }
         if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
@@ -4162,12 +4162,12 @@ prefix_loop:
     case 0x6F: { /* OUTSW/OUTSD: I/O(DX) ← DS:[ESI], update ESI */
         int sz = ds->op32 ? 4 : 2;
         uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
-        int di_inc = (s->eflags & EF_DF) ? -sz : sz;
+        int si_inc = (s->eflags & EF_DF) ? -sz : sz;
         while (cnt--) {
             uint64_t lin = seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS);
             if (sz == 4) port_write(s, (uint16_t)s->regs[2], vmem_read32(s, lin), 2);
             else port_write(s, (uint16_t)s->regs[2], vmem_read16(s, lin), 1);
-            s->regs[6] += di_inc;
+            s->regs[6] += si_inc;
             if (!ds->addr64) s->regs[6] &= 0xFFFFFFFF;
         }
         if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
