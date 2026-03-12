@@ -3511,6 +3511,224 @@ static void test_iretd_reloads_cs_descriptor(void)
     machine_free(m);
 }
 
+/* =====================================================================
+ * Test: OUTSB — output byte from DS:[ESI] to port DX
+ * ===================================================================== */
+static void test_outsb(void)
+{
+    /* Write 0x55 to [0x5000], then OUTSB from [0x5000]; port_write is no-op */
+    static const uint8_t code[] = {
+        0xBF, 0x00, 0x50, 0x00, 0x00, /* MOV EDI, 0x5000 */
+        0xBE, 0x00, 0x50, 0x00, 0x00, /* MOV ESI, 0x5000 */
+        0xBA, 0x34, 0x12, 0x00, 0x00, /* MOV EDX, 0x1234 */
+        0x6E,                         /* OUTSB */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    m->ram[0x5000] = 0x55;
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    /* After OUTSB, ESI should have advanced by 1 */
+    uint32_t esi = x86_cpu_get_reg(m->cpu, 6);
+    CHECK_EQ(esi, 0x5001U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: INSB — read byte from I/O port into ES:[EDI]
+ * ===================================================================== */
+static void test_insb(void)
+{
+    /* INSB: no port handler, so port_read returns 0; EDI should advance */
+    static const uint8_t code[] = {
+        0xBF, 0x00, 0x50, 0x00, 0x00, /* MOV EDI, 0x5000 */
+        0xBA, 0x34, 0x12, 0x00, 0x00, /* MOV EDX, 0x1234 */
+        0x6C,                         /* INSB */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memset(m->ram + 0x5000, 0xFF, 4);
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    /* After INSB, EDI should have advanced by 1 */
+    uint32_t edi = x86_cpu_get_reg(m->cpu, 7);
+    CHECK_EQ(edi, 0x5001U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: XLAT — AL ← [BX+AL]
+ * ===================================================================== */
+static void test_xlat(void)
+{
+    /* BX=0x5000, AL=3, [0x5003]=0x42 -> XLATB -> AL=0x42 */
+    static const uint8_t code[] = {
+        0xBB, 0x00, 0x50, 0x00, 0x00, /* MOV EBX, 0x5000 */
+        0xB0, 0x03,                   /* MOV AL, 3 */
+        0xD7,                         /* XLATB */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memset(m->ram + 0x5000, 0, 8);
+    m->ram[0x5003] = 0x42;
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax & 0xFF, 0x42U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: POPCNT — count set bits (F3 0F B8)
+ * ===================================================================== */
+static void test_popcnt(void)
+{
+    /* F3 0F B8 C3 = POPCNT EAX, EBX; EBX=0xFF -> EAX=8 */
+    static const uint8_t code[] = {
+        0xBB, 0xFF, 0x00, 0x00, 0x00, /* MOV EBX, 0xFF */
+        0xF3, 0x0F, 0xB8, 0xC3,       /* POPCNT EAX, EBX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 8U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: TZCNT — count trailing zeros (F3 0F BC)
+ * ===================================================================== */
+static void test_tzcnt(void)
+{
+    /* F3 0F BC C3 = TZCNT EAX, EBX; EBX=0x10 -> EAX=4 */
+    static const uint8_t code[] = {
+        0xBB, 0x10, 0x00, 0x00, 0x00, /* MOV EBX, 0x10 */
+        0xF3, 0x0F, 0xBC, 0xC3,       /* TZCNT EAX, EBX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 4U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: LZCNT — count leading zeros (F3 0F BD)
+ * ===================================================================== */
+static void test_lzcnt(void)
+{
+    /* F3 0F BD C3 = LZCNT EAX, EBX; EBX=0x00010000 -> EAX=15 */
+    static const uint8_t code[] = {
+        0xBB, 0x00, 0x00, 0x01, 0x00, /* MOV EBX, 0x00010000 */
+        0xF3, 0x0F, 0xBD, 0xC3,       /* LZCNT EAX, EBX */
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 15U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: LFS — load FS:reg from memory (0F B4)
+ * ===================================================================== */
+static void test_lfs(void)
+{
+    /* Build a far pointer at 0x5000: offset=0x12345678, selector=0x10 */
+    static const uint8_t code[] = {
+        /* LFS EAX, [0x5000]: 0F B4 05 00 50 00 00 */
+        0x0F, 0xB4, 0x05, 0x00, 0x50, 0x00, 0x00,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    /* Write far pointer: 4-byte offset then 2-byte selector */
+    m->ram[0x5000] = 0x78; m->ram[0x5001] = 0x56;
+    m->ram[0x5002] = 0x34; m->ram[0x5003] = 0x12;
+    m->ram[0x5004] = 0x10; m->ram[0x5005] = 0x00; /* sel=0x10 */
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0x12345678U);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: LGS — load GS:reg from memory (0F B5)
+ * ===================================================================== */
+static void test_lgs(void)
+{
+    /* Build a far pointer at 0x5000: offset=0xDEADBEEF, selector=0x10 */
+    static const uint8_t code[] = {
+        /* LGS EAX, [0x5000]: 0F B5 05 00 50 00 00 */
+        0x0F, 0xB5, 0x05, 0x00, 0x50, 0x00, 0x00,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    m->ram[0x5000] = 0xEF; m->ram[0x5001] = 0xBE;
+    m->ram[0x5002] = 0xAD; m->ram[0x5003] = 0xDE;
+    m->ram[0x5004] = 0x10; m->ram[0x5005] = 0x00;
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xDEADBEEFU);
+    machine_free(m);
+}
+
+/* =====================================================================
+ * Test: LSS — load SS:reg from memory (0F B2)
+ * ===================================================================== */
+static void test_lss(void)
+{
+    /* Build a far pointer at 0x5000: offset=0xCAFEBABE, selector=0x10 */
+    static const uint8_t code[] = {
+        /* LSS EAX, [0x5000]: 0F B2 05 00 50 00 00 */
+        0x0F, 0xB2, 0x05, 0x00, 0x50, 0x00, 0x00,
+        0xF4,
+    };
+
+    TestMachine *m = machine_new();
+    m->ram[0x5000] = 0xBE; m->ram[0x5001] = 0xBA;
+    m->ram[0x5002] = 0xFE; m->ram[0x5003] = 0xCA;
+    m->ram[0x5004] = 0x10; m->ram[0x5005] = 0x00;
+    memcpy(m->ram + 0x1000, code, sizeof(code));
+    enter_protected_mode(m, 0x2000, 0x1000, 0x3000);
+    run_cpu(m, 100000);
+
+    uint32_t eax = x86_cpu_get_reg(m->cpu, 0);
+    CHECK_EQ(eax, 0xCAFEBABEU);
+    machine_free(m);
+}
+
 int main(void)
 {
     fprintf(stderr, "Running x86 CPU emulator tests...\n\n");
@@ -3623,6 +3841,16 @@ int main(void)
     test_repne_cmpsw_ecx_count();
     test_iretd_eflags_reserved_cleared();
     test_iretd_reloads_cs_descriptor();
+
+    test_outsb();
+    test_insb();
+    test_xlat();
+    test_popcnt();
+    test_tzcnt();
+    test_lzcnt();
+    test_lfs();
+    test_lgs();
+    test_lss();
 
     fprintf(stderr, "\nResults: %d/%d passed", tests_pass, tests_run);
     if (tests_fail)

@@ -1897,6 +1897,34 @@ static void exec_0f(DecodeState *ds)
         s->cr0 &= ~(1U << 3);
         break;
 
+    /*
+     * 0F 28-2F: MOVAPS, MOVAPD, CVTPI2PS, …  All no-ops that consume ModRM.
+     * 0F 38-3F: SSSE3/SSE4 3-byte escapes.   All no-ops.
+     * 0F 50-7F: SSE/SSE2 arithmetic.          All no-ops that consume ModRM.
+     * These stubs prevent #UD → triple-fault when any kernel SSE code
+     * is encountered, even though we don't advertise SSE in CPUID.
+     */
+    case 0x28: case 0x29: case 0x2A: case 0x2B: case 0x2C: case 0x2D: case 0x2E: case 0x2F:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
+    case 0x38: case 0x39: case 0x3A: case 0x3B:
+    case 0x3C: case 0x3D: case 0x3E: case 0x3F: {
+        /* 3-byte escape: one extra opcode byte after ModRM */
+        uint8_t b3 = fetch_byte(ds);
+        (void)b3;
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        /* 0F 3A: has an additional imm8 operand */
+        if (op2 == 0x3A) fetch_byte(ds);
+        break; }
+    case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
+    case 0x58: case 0x59: case 0x5A: case 0x5B: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+    case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66: case 0x67:
+    case 0x68: case 0x69: case 0x6A: case 0x6B: case 0x6C: case 0x6D: case 0x6E: case 0x6F:
+    case 0x70: case 0x71: case 0x72: case 0x73: case 0x74: case 0x75: case 0x76: case 0x77:
+    case 0x78: case 0x79: case 0x7A: case 0x7B: case 0x7C: case 0x7D: case 0x7E: case 0x7F:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
+
     case 0x20: { /* MOV r, CRn */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         if (rm_reg < 0) rm_reg = reg; /* rm field is the register in this encoding */
@@ -2567,6 +2595,12 @@ static void exec_0f(DecodeState *ds)
         }
         break; }
 
+    case 0xA6: case 0xA7: /* IBTS/XBTS (286/386 only) or undocumented SSE — no-op with ModRM */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
+    case 0xAA: /* RSM: Return from System Management Mode — no-op */
+        break;
+
     case 0xA8: push32(s, s->segs[X86_CPU_SEG_GS].sel); break; /* PUSH GS */
     case 0xA9: s->segs[X86_CPU_SEG_GS].sel = pop32(s) & 0xFFFF; break; /* POP GS */
 
@@ -2675,6 +2709,21 @@ static void exec_0f(DecodeState *ds)
         }
         break; }
 
+    case 0xB2: { /* LSS r, m — Load SS:r from memory */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        if (rm_reg >= 0) { raise_exception(s, EXCP_UD); break; }
+        uint64_t lin = seg_ea(s, ea, ea_seg);
+        if (ds->op32) {
+            set_reg32(s, reg, vmem_read32(s, lin));
+            s->segs[X86_CPU_SEG_SS].sel = vmem_read16(s, lin + 4);
+            load_seg_desc(s, X86_CPU_SEG_SS, s->segs[X86_CPU_SEG_SS].sel);
+        } else {
+            set_reg16(s, reg, vmem_read16(s, lin));
+            s->segs[X86_CPU_SEG_SS].sel = vmem_read16(s, lin + 2);
+            load_seg_desc(s, X86_CPU_SEG_SS, s->segs[X86_CPU_SEG_SS].sel);
+        }
+        break; }
+
     case 0xB3: { /* BTR r/m, r */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         uint32_t bit = (uint32_t)s->regs[reg] & 31;
@@ -2682,6 +2731,43 @@ static void exec_0f(DecodeState *ds)
         if ((base >> bit) & 1) s->eflags |= EF_CF; else s->eflags &= ~EF_CF;
         base &= ~(1U << bit);
         if (rm_reg >= 0) set_reg32(s, rm_reg, base); else vmem_write32(s, seg_ea(s, ea, ea_seg), base);
+        break; }
+
+    case 0xB4: { /* LFS r, m — Load FS:r from memory */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        if (rm_reg >= 0) { raise_exception(s, EXCP_UD); break; }
+        uint64_t lin = seg_ea(s, ea, ea_seg);
+        if (ds->op64) {
+            set_reg64(s, reg, vmem_read64(s, lin));
+            s->segs[X86_CPU_SEG_FS].sel = vmem_read16(s, lin + 8);
+            load_seg_desc(s, X86_CPU_SEG_FS, s->segs[X86_CPU_SEG_FS].sel);
+        } else if (ds->op32) {
+            set_reg32(s, reg, vmem_read32(s, lin));
+            s->segs[X86_CPU_SEG_FS].sel = vmem_read16(s, lin + 4);
+            load_seg_desc(s, X86_CPU_SEG_FS, s->segs[X86_CPU_SEG_FS].sel);
+        } else {
+            set_reg16(s, reg, vmem_read16(s, lin));
+            s->segs[X86_CPU_SEG_FS].sel = vmem_read16(s, lin + 2);
+            load_seg_desc(s, X86_CPU_SEG_FS, s->segs[X86_CPU_SEG_FS].sel);
+        }
+        break; }
+    case 0xB5: { /* LGS r, m — Load GS:r from memory */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        if (rm_reg >= 0) { raise_exception(s, EXCP_UD); break; }
+        uint64_t lin = seg_ea(s, ea, ea_seg);
+        if (ds->op64) {
+            set_reg64(s, reg, vmem_read64(s, lin));
+            s->segs[X86_CPU_SEG_GS].sel = vmem_read16(s, lin + 8);
+            load_seg_desc(s, X86_CPU_SEG_GS, s->segs[X86_CPU_SEG_GS].sel);
+        } else if (ds->op32) {
+            set_reg32(s, reg, vmem_read32(s, lin));
+            s->segs[X86_CPU_SEG_GS].sel = vmem_read16(s, lin + 4);
+            load_seg_desc(s, X86_CPU_SEG_GS, s->segs[X86_CPU_SEG_GS].sel);
+        } else {
+            set_reg16(s, reg, vmem_read16(s, lin));
+            s->segs[X86_CPU_SEG_GS].sel = vmem_read16(s, lin + 2);
+            load_seg_desc(s, X86_CPU_SEG_GS, s->segs[X86_CPU_SEG_GS].sel);
+        }
         break; }
 
     case 0xB6: { /* MOVZX r, r/m8 */
@@ -2699,41 +2785,86 @@ static void exec_0f(DecodeState *ds)
         else set_reg32(s, reg, v);
         break; }
 
-    case 0xB8: { /* POPCNT / BSF fallthrough - BSF r, r/m */
-        /* Treat as BSF */
-        /* FALLTHROUGH to 0xBC */
-    }
-    case 0xBC: { /* BSF r, r/m */
+    case 0xB8: { /* POPCNT (F3 prefix) or BSF */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        if (ds->rep) { /* F3 0F B8 = POPCNT */
+            if (ds->op64) {
+                uint64_t src = (rm_reg >= 0) ? get_reg64(s, rm_reg) : vmem_read64(s, seg_ea(s, ea, ea_seg));
+                int cnt = __builtin_popcountll(src);
+                set_reg64(s, reg, (uint64_t)cnt);
+                s->eflags &= ~(EF_ZF|EF_CF|EF_OF|EF_SF|EF_PF|EF_AF);
+                if (src == 0) s->eflags |= EF_ZF;
+            } else if (ds->op32) {
+                uint32_t src = (rm_reg >= 0) ? get_reg32(s, rm_reg) : vmem_read32(s, seg_ea(s, ea, ea_seg));
+                int cnt = __builtin_popcount(src);
+                set_reg32(s, reg, (uint32_t)cnt);
+                s->eflags &= ~(EF_ZF|EF_CF|EF_OF|EF_SF|EF_PF|EF_AF);
+                if (src == 0) s->eflags |= EF_ZF;
+            } else {
+                uint16_t src = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, seg_ea(s, ea, ea_seg));
+                int cnt = __builtin_popcount(src);
+                set_reg16(s, reg, (uint16_t)cnt);
+                s->eflags &= ~(EF_ZF|EF_CF|EF_OF|EF_SF|EF_PF|EF_AF);
+                if (src == 0) s->eflags |= EF_ZF;
+            }
+        } else { /* BSF */
+            if (ds->op64) {
+                uint64_t src = (rm_reg >= 0) ? get_reg64(s, rm_reg) : vmem_read64(s, seg_ea(s, ea, ea_seg));
+                if (src == 0) { s->eflags |= EF_ZF; break; }
+                s->eflags &= ~EF_ZF;
+                set_reg64(s, reg, (uint64_t)__builtin_ctzll(src));
+            } else {
+                uint32_t src = (rm_reg >= 0) ? get_reg32(s, rm_reg) : vmem_read32(s, seg_ea(s, ea, ea_seg));
+                if (src == 0) { s->eflags |= EF_ZF; break; }
+                s->eflags &= ~EF_ZF;
+                set_reg32(s, reg, (uint32_t)__builtin_ctz(src));
+            }
+        }
+        break; }
+    case 0xB9: /* UD1 */
+        raise_exception(s, EXCP_UD);
+        break;
+
+    case 0xBC: { /* TZCNT (F3 prefix) or BSF r, r/m */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         if (ds->op64) {
             uint64_t src = (rm_reg >= 0) ? get_reg64(s, rm_reg) : vmem_read64(s, seg_ea(s, ea, ea_seg));
-            if (src == 0) { s->eflags |= EF_ZF; break; }
+            if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg64(s, reg, 64); } break; }
             s->eflags &= ~EF_ZF;
-            int i; for (i = 0; i < 64 && !((src >> i) & 1); i++);
-            set_reg64(s, reg, (uint64_t)i);
-        } else {
+            set_reg64(s, reg, (uint64_t)__builtin_ctzll(src));
+        } else if (ds->op32) {
             uint32_t src = (rm_reg >= 0) ? get_reg32(s, rm_reg) : vmem_read32(s, seg_ea(s, ea, ea_seg));
-            if (src == 0) { s->eflags |= EF_ZF; break; }
+            if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg32(s, reg, 32); } break; }
             s->eflags &= ~EF_ZF;
-            int i; for (i = 0; i < 32 && !((src >> i) & 1); i++);
-            set_reg32(s, reg, (uint32_t)i);
+            set_reg32(s, reg, (uint32_t)__builtin_ctz(src));
+        } else {
+            uint16_t src = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, seg_ea(s, ea, ea_seg));
+            if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg16(s, reg, 16); } break; }
+            s->eflags &= ~EF_ZF;
+            set_reg16(s, reg, (uint16_t)__builtin_ctz(src));
         }
         break; }
 
-    case 0xBD: { /* BSR r, r/m */
+    case 0xBD: { /* LZCNT (F3 prefix) or BSR r, r/m */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         if (ds->op64) {
             uint64_t src = (rm_reg >= 0) ? get_reg64(s, rm_reg) : vmem_read64(s, seg_ea(s, ea, ea_seg));
-            if (src == 0) { s->eflags |= EF_ZF; break; }
+            if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg64(s, reg, 64); } break; }
             s->eflags &= ~EF_ZF;
-            int i; for (i = 63; i >= 0 && !((src >> i) & 1); i--);
-            set_reg64(s, reg, (uint64_t)i);
-        } else {
+            if (ds->rep) set_reg64(s, reg, (uint64_t)__builtin_clzll(src));
+            else set_reg64(s, reg, 63 - (uint64_t)__builtin_clzll(src));
+        } else if (ds->op32) {
             uint32_t src = (rm_reg >= 0) ? get_reg32(s, rm_reg) : vmem_read32(s, seg_ea(s, ea, ea_seg));
-            if (src == 0) { s->eflags |= EF_ZF; break; }
+            if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg32(s, reg, 32); } break; }
             s->eflags &= ~EF_ZF;
-            int i; for (i = 31; i >= 0 && !((src >> i) & 1); i--);
-            set_reg32(s, reg, (uint32_t)i);
+            if (ds->rep) set_reg32(s, reg, (uint32_t)__builtin_clz(src));
+            else set_reg32(s, reg, 31 - (uint32_t)__builtin_clz(src));
+        } else {
+            uint16_t src = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, seg_ea(s, ea, ea_seg));
+            if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg16(s, reg, 16); } break; }
+            s->eflags &= ~EF_ZF;
+            if (ds->rep) set_reg16(s, reg, (uint16_t)__builtin_clz((uint32_t)src) - 16);
+            else set_reg16(s, reg, 15 - (uint16_t)(__builtin_clz((uint32_t)src) - 16));
         }
         break; }
 
@@ -2943,6 +3074,16 @@ static void exec_0f(DecodeState *ds)
         }
         break; }
 
+    case 0x0D: /* PREFETCHW / AMD hint NOP - consume ModRM, do nothing */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
+    case 0x0E: /* FEMMS: fast MMX exit — no-op in emulation */
+        break;
+    case 0x0F: { /* 3DNow! prefix: ModRM + 1-byte opcode suffix — no-op */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        fetch_byte(ds); /* consume the 3DNow! opcode byte */
+        break; }
+
     case 0x08: /* INVD: invalidate caches; treated as no-op (same as WBINVD) */
     case 0x09: /* WBINVD: write-back and invalidate caches; no-op in emulation */
         break;
@@ -2962,6 +3103,16 @@ static void exec_0f(DecodeState *ds)
     case 0x19: case 0x1A: case 0x1B: case 0x1C: case 0x1D: case 0x1E:
     case 0x1F:
         /* Consume ModRM + SIB + displacement; the result is discarded. */
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
+
+    /*
+     * 0F 10-17: SSE/SSE2 move group (MOVUPS, MOVSS, MOVLPS, …).
+     * We don't implement an XMM register file, so these become no-ops
+     * that still consume their ModRM bytes so the PC advances correctly.
+     */
+    case 0x10: case 0x11: case 0x12: case 0x13:
+    case 0x14: case 0x15: case 0x16: case 0x17:
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
         break;
 
@@ -3011,6 +3162,37 @@ static void exec_0f(DecodeState *ds)
         }
 #undef FXSAVE_AREA_SIZE
         break; }
+
+    /* 0F C2: CMPPS/CMPPD/CMPSS/CMPSD xmm, xmm/m, imm8 — SSE stub (consume ModRM + imm8) */
+    case 0xC2:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        fetch_byte(ds); /* imm8 comparison predicate */
+        break;
+    /* 0F C3: MOVNTI m, r — store r to memory with non-temporal hint; implement as plain store */
+    case 0xC3: {
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        if (rm_reg >= 0) { raise_exception(s, EXCP_UD); break; }
+        uint64_t lin = seg_ea(s, ea, ea_seg);
+        if (ds->op64) vmem_write64(s, lin, get_reg64(s, reg));
+        else vmem_write32(s, lin, get_reg32(s, reg));
+        break; }
+    /* 0F C4: PINSRW — SSE stub */
+    case 0xC4:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        fetch_byte(ds); /* imm8 */
+        break;
+    /* 0F C5: PEXTRW — SSE stub (reg = 0 as placeholder) */
+    case 0xC5:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        fetch_byte(ds); /* imm8 */
+        if (ds->op64) set_reg64(s, reg, 0);
+        else set_reg32(s, reg, 0);
+        break;
+    /* 0F C6: SHUFPS/SHUFPD — SSE stub */
+    case 0xC6:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        fetch_byte(ds); /* imm8 */
+        break;
 
     case 0xC7: { /* GROUP 9 */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
@@ -3068,6 +3250,20 @@ static void exec_0f(DecodeState *ds)
             break;
         }
         break; }
+
+    /*
+     * 0F D0-0F FF: SSE2/SSE3/MMX arithmetic, compare, pack, unpack, shuffle …
+     * We don't implement an XMM/MM register file; treat all of these as
+     * ModRM-consuming no-ops to prevent #UD → triple-fault.
+     */
+    case 0xD0: case 0xD1: case 0xD2: case 0xD3: case 0xD4: case 0xD5: case 0xD6: case 0xD7:
+    case 0xD8: case 0xD9: case 0xDA: case 0xDB: case 0xDC: case 0xDD: case 0xDE: case 0xDF:
+    case 0xE0: case 0xE1: case 0xE2: case 0xE3: case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+    case 0xE8: case 0xE9: case 0xEA: case 0xEB: case 0xEC: case 0xED: case 0xEE: case 0xEF:
+    case 0xF0: case 0xF1: case 0xF2: case 0xF3: case 0xF4: case 0xF5: case 0xF6: case 0xF7:
+    case 0xF8: case 0xF9: case 0xFA: case 0xFB: case 0xFC: case 0xFD: case 0xFE: case 0xFF:
+        decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
+        break;
 
     default:
         fprintf(stderr, "x86: unhandled 0F opcode 0x%02X at RIP=%llx\n",
@@ -3928,6 +4124,55 @@ prefix_loop:
         }
         break; }
 
+    case 0x6C: { /* INSB: ES:[EDI] ← I/O(DX), update EDI */
+        uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        int di_inc = (s->eflags & EF_DF) ? -1 : 1;
+        while (cnt--) {
+            uint8_t v = (uint8_t)port_read(s, (uint16_t)s->regs[2], 0);
+            vmem_write8(s, seg_ea(s, ds->addr64 ? s->regs[7] : (uint32_t)s->regs[7], X86_CPU_SEG_ES), v);
+            s->regs[7] += di_inc;
+            if (!ds->addr64) s->regs[7] &= 0xFFFFFFFF;
+        }
+        if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
+        break; }
+    case 0x6D: { /* INSW/INSD: ES:[EDI] ← I/O(DX), update EDI */
+        int sz = ds->op32 ? 4 : 2;
+        uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        int di_inc = (s->eflags & EF_DF) ? -sz : sz;
+        while (cnt--) {
+            uint64_t lin = seg_ea(s, ds->addr64 ? s->regs[7] : (uint32_t)s->regs[7], X86_CPU_SEG_ES);
+            if (sz == 4) vmem_write32(s, lin, port_read(s, (uint16_t)s->regs[2], 2));
+            else vmem_write16(s, lin, (uint16_t)port_read(s, (uint16_t)s->regs[2], 1));
+            s->regs[7] += di_inc;
+            if (!ds->addr64) s->regs[7] &= 0xFFFFFFFF;
+        }
+        if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
+        break; }
+    case 0x6E: { /* OUTSB: I/O(DX) ← DS:[ESI], update ESI */
+        uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        int di_inc = (s->eflags & EF_DF) ? -1 : 1;
+        while (cnt--) {
+            uint8_t v = vmem_read8(s, seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS));
+            port_write(s, (uint16_t)s->regs[2], v, 0);
+            s->regs[6] += di_inc;
+            if (!ds->addr64) s->regs[6] &= 0xFFFFFFFF;
+        }
+        if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
+        break; }
+    case 0x6F: { /* OUTSW/OUTSD: I/O(DX) ← DS:[ESI], update ESI */
+        int sz = ds->op32 ? 4 : 2;
+        uint64_t cnt = ds->rep ? (ds->addr64 ? s->regs[1] : ds->addr32 ? (uint32_t)s->regs[1] : (uint16_t)s->regs[1]) : 1;
+        int di_inc = (s->eflags & EF_DF) ? -sz : sz;
+        while (cnt--) {
+            uint64_t lin = seg_ea(s, ds->addr64 ? s->regs[6] : (uint32_t)s->regs[6], ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS);
+            if (sz == 4) port_write(s, (uint16_t)s->regs[2], vmem_read32(s, lin), 2);
+            else port_write(s, (uint16_t)s->regs[2], vmem_read16(s, lin), 1);
+            s->regs[6] += di_inc;
+            if (!ds->addr64) s->regs[6] &= 0xFFFFFFFF;
+        }
+        if (ds->rep) { if (ds->addr64) s->regs[1] = 0; else if (ds->addr32) set_reg32(s, 1, 0); else set_reg16(s, 1, 0); }
+        break; }
+
     case 0x70: { /* J0 short */
         int8_t rel = (int8_t)fetch_byte(ds);
         if (test_cc(s, 0x0)) {
@@ -4734,6 +4979,12 @@ prefix_loop:
 
     case 0xD4: /* AAM */ raise_exception(s, EXCP_UD); break;
     case 0xD5: /* AAD */ raise_exception(s, EXCP_UD); break;
+
+    case 0xD7: { /* XLAT/XLATB: AL ← [BX+AL] (or [EBX+AL]) */
+        uint64_t base = ds->addr64 ? s->regs[3] : ds->addr32 ? (uint32_t)s->regs[3] : (uint16_t)s->regs[3];
+        uint8_t al = (uint8_t)s->regs[0];
+        s->regs[0] = (s->regs[0] & ~0xFFULL) | vmem_read8(s, seg_ea(s, base + al, ds->seg_ovr >= 0 ? ds->seg_ovr : X86_CPU_SEG_DS));
+        break; }
 
     case 0xD8: { /* ESC 0 (FPU) */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
