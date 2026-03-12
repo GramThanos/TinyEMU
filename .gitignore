@@ -1,0 +1,4 @@
+*.o
+*.d
+temu
+test_x86cpu
