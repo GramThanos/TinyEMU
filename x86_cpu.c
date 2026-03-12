@@ -1909,11 +1909,10 @@ static void exec_0f(DecodeState *ds)
         break;
     case 0x38: case 0x39: case 0x3A: case 0x3B:
     case 0x3C: case 0x3D: case 0x3E: case 0x3F: {
-        /* 3-byte escape: one extra opcode byte after ModRM */
-        uint8_t b3 = fetch_byte(ds);
-        (void)b3;
+        /* 3-byte escape: one extra opcode byte before ModRM */
+        (void)fetch_byte(ds); /* consume sub-opcode byte */
         decode_modrm(ds, &reg, &rm_reg, &ea, &ea_seg);
-        /* 0F 3A: has an additional imm8 operand */
+        /* 0F 3A: has an additional imm8 operand after ModRM */
         if (op2 == 0x3A) fetch_byte(ds);
         break; }
     case 0x50: case 0x51: case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57:
@@ -2863,8 +2862,8 @@ static void exec_0f(DecodeState *ds)
             uint16_t src = (rm_reg >= 0) ? get_reg16(s, rm_reg) : vmem_read16(s, seg_ea(s, ea, ea_seg));
             if (src == 0) { s->eflags |= EF_ZF; if (ds->rep) { set_reg16(s, reg, 16); } break; }
             s->eflags &= ~EF_ZF;
-            if (ds->rep) set_reg16(s, reg, (uint16_t)(__builtin_clz((uint32_t)src) - 16));
-            else set_reg16(s, reg, 15 - (uint16_t)(__builtin_clz((uint32_t)src) - 16));
+            if (ds->rep) set_reg16(s, reg, (uint16_t)__builtin_clz((uint32_t)src << 16));
+            else set_reg16(s, reg, (uint16_t)(15 - __builtin_clz((uint32_t)src << 16)));
         }
         break; }
 
