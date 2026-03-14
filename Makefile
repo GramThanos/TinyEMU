@@ -101,6 +101,7 @@ endif
 ifdef CONFIG_X86EMU
 CFLAGS+=-DCONFIG_X86EMU
 EMU_OBJS+=x86_cpu.o x86_machine.o ide.o ps2.o vmmouse.o pckbd.o vga.o
+EMU_LIBS+=-lunicorn
 endif
 
 temu$(EXE): $(EMU_OBJS)
