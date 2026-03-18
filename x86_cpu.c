@@ -472,8 +472,8 @@ static bool hook_insn_invalid(uc_engine *uc, void *user_data)
     }
 
     fprintf(stderr,
-            "x86_cpu: unsupported instruction at RIP=%" PRIx64
-            " bytes=%02x %02x %02x %02x %02x %02x\n",
+            "x86_cpu: unsupported instruction after fallback emulation at "
+            "RIP=%" PRIx64 " bytes=%02x %02x %02x %02x %02x %02x\n",
             rip, code[0], code[1], code[2], code[3], code[4], code[5]);
     return false;
 }
