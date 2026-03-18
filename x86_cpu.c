@@ -23,8 +23,8 @@
  *
  * This file implements x86/x64 CPU emulation without KVM by delegating to the
  * Unicorn Engine (https://www.unicorn-engine.org/), a lightweight CPU emulator
- * framework based on QEMU's TCG JIT.  Unicorn handles 16-bit real mode,
- * 32-bit protected mode, and 64-bit long mode transparently.
+ * framework based on QEMU's TCG JIT.  TinyEMU's current x86 machine setup
+ * uses 32-bit protected mode execution.
  *
  * Memory regions registered with PhysMemoryMap are mapped into Unicorn on
  * first access via the UC_HOOK_MEM_UNMAPPED hook:
@@ -613,11 +613,12 @@ X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
     s->mem_map = mem_map;
 
     /*
-     * Open the engine in 64-bit mode so that it can handle both 32-bit
-     * compatibility mode (CS.L = 0) and 64-bit long mode (CS.L = 1).
-     * Unicorn / QEMU manages the mode transition internally.
+     * TinyEMU's x86 machine boots a 32-bit kernel path (protected mode).
+     * Using UC_MODE_64 here keeps decoding in long-mode semantics and can
+     * reject valid 32-bit instructions (e.g. PUSHA/POPA with prefixes) with
+     * UC_ERR_INSN_INVALID, so start the engine in 32-bit mode.
      */
-    err = uc_open(UC_ARCH_X86, UC_MODE_64, &s->uc);
+    err = uc_open(UC_ARCH_X86, UC_MODE_32, &s->uc);
     if (err != UC_ERR_OK) {
         fprintf(stderr, "x86_cpu_init: uc_open failed: %s\n",
                 uc_strerror(err));
