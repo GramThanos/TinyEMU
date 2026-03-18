@@ -775,11 +775,20 @@ void x86_cpu_set_seg(X86CPUState *s, int seg, const X86CPUSeg *sd)
     if (seg < 0 || seg >= 10)
         return;
 
-    uc_x86_mmr mmr;
+    uc_x86_mmr mmr = { 0 };
     mmr.selector = sd->sel;
     mmr.base     = sd->base;
     mmr.limit    = sd->limit;
     mmr.flags    = sd->flags;
+
+    /*
+     * GDTR/IDTR only consume base+limit. Keep selector/flags cleared for
+     * these pseudo-segments so callers don't need to initialize unused fields.
+     */
+    if (seg == X86_CPU_SEG_GDT || seg == X86_CPU_SEG_IDT) {
+        mmr.selector = 0;
+        mmr.flags = 0;
+    }
 
     uc_reg_write(s->uc, seg_uc_id[seg], &mmr);
 }
