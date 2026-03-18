@@ -65,6 +65,16 @@
 #define EFLAGS_VM   (1U << 17)
 
 #define X86_OPCODE_HLT      0xf4U  /* HLT instruction opcode */
+#define X86_OPCODE_2B_0F    0x0fU
+#define X86_OPCODE_3B_0F01  0x01U
+#define X86_OPCODE_3B_0F31  0x31U /* RDTSC */
+#define X86_OPCODE_3B_0F1E  0x1eU
+#define X86_OPCODE_3B_0FCA  0xcaU /* CLAC */
+#define X86_OPCODE_3B_0FCB  0xcbU /* STAC */
+#define X86_OPCODE_3B_0FF9  0xf9U /* RDTSCP */
+#define X86_PREFIX_F3       0xf3U
+#define X86_ENDBR64_LAST    0xfaU
+#define X86_ENDBR32_LAST    0xfbU
 /* Unicorn timeout in microseconds per x86_cpu_interp() slice */
 #define INTERP_TIMEOUT_US   5000   /* 5 ms */
 
@@ -385,6 +395,90 @@ static void hook_insn_out(uc_engine *uc, uint32_t port,
 }
 
 /* ======================================================================
+ * Invalid instruction fallback
+ *
+ * Newer Linux kernels may emit CET ENDBR instructions even when CET is not
+ * enabled at runtime. If Unicorn does not decode them, we treat ENDBR as NOP.
+ * We also provide minimal emulation for RDTSC/RDTSCP and AC-flag controls
+ * (CLAC/STAC) to avoid hard failures on older Unicorn builds.
+ * ====================================================================== */
+
+static bool hook_insn_invalid(uc_engine *uc, void *user_data)
+{
+    X86CPUState *s = user_data;
+    uint64_t rip = 0;
+    uint8_t code[6];
+    uint32_t eax, edx, ecx, eflags;
+    uint64_t tsc;
+
+    if (uc_reg_read(uc, UC_X86_REG_RIP, &rip) != UC_ERR_OK)
+        return false;
+    if (uc_mem_read(uc, rip, code, sizeof(code)) != UC_ERR_OK)
+        return false;
+
+    /* ENDBR64/ENDBR32: F3 0F 1E FA / F3 0F 1E FB -> architectural NOP */
+    if (code[0] == X86_PREFIX_F3 &&
+        code[1] == X86_OPCODE_2B_0F &&
+        code[2] == X86_OPCODE_3B_0F1E &&
+        (code[3] == X86_ENDBR64_LAST || code[3] == X86_ENDBR32_LAST)) {
+        rip += 4;
+        uc_reg_write(uc, UC_X86_REG_RIP, &rip);
+        return true;
+    }
+
+    /* RDTSC: 0F 31 */
+    if (code[0] == X86_OPCODE_2B_0F &&
+        code[1] == X86_OPCODE_3B_0F31) {
+        tsc = s->get_tsc ? s->get_tsc(s->tsc_opaque) : (uint64_t)s->cycles;
+        eax = (uint32_t)tsc;
+        edx = (uint32_t)(tsc >> 32);
+        rip += 2;
+        uc_reg_write(uc, UC_X86_REG_EAX, &eax);
+        uc_reg_write(uc, UC_X86_REG_EDX, &edx);
+        uc_reg_write(uc, UC_X86_REG_RIP, &rip);
+        return true;
+    }
+
+    /* RDTSCP: 0F 01 F9 */
+    if (code[0] == X86_OPCODE_2B_0F &&
+        code[1] == X86_OPCODE_3B_0F01 &&
+        code[2] == X86_OPCODE_3B_0FF9) {
+        tsc = s->get_tsc ? s->get_tsc(s->tsc_opaque) : (uint64_t)s->cycles;
+        eax = (uint32_t)tsc;
+        edx = (uint32_t)(tsc >> 32);
+        ecx = 0; /* IA32_TSC_AUX */
+        rip += 3;
+        uc_reg_write(uc, UC_X86_REG_EAX, &eax);
+        uc_reg_write(uc, UC_X86_REG_EDX, &edx);
+        uc_reg_write(uc, UC_X86_REG_ECX, &ecx);
+        uc_reg_write(uc, UC_X86_REG_RIP, &rip);
+        return true;
+    }
+
+    /* CLAC/STAC: 0F 01 CA / 0F 01 CB */
+    if (code[0] == X86_OPCODE_2B_0F &&
+        code[1] == X86_OPCODE_3B_0F01 &&
+        (code[2] == X86_OPCODE_3B_0FCA || code[2] == X86_OPCODE_3B_0FCB)) {
+        if (uc_reg_read(uc, UC_X86_REG_EFLAGS, &eflags) == UC_ERR_OK) {
+            if (code[2] == X86_OPCODE_3B_0FCA)
+                eflags &= ~(1U << 18); /* AC */
+            else
+                eflags |= (1U << 18);  /* AC */
+            uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags);
+        }
+        rip += 3;
+        uc_reg_write(uc, UC_X86_REG_RIP, &rip);
+        return true;
+    }
+
+    fprintf(stderr,
+            "x86_cpu: unsupported instruction at RIP=%" PRIx64
+            " bytes=%02x %02x %02x %02x %02x %02x\n",
+            rip, code[0], code[1], code[2], code[3], code[4], code[5]);
+    return false;
+}
+
+/* ======================================================================
  * Hardware interrupt injection
  *
  * Unicorn has no native IRQ injection API, so we simulate it by directly
@@ -534,6 +628,10 @@ X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
     /* On-demand memory mapping for regions not yet known to Unicorn */
     uc_hook_add(s->uc, &h, UC_HOOK_MEM_UNMAPPED,
                 hook_mem_invalid, s, 1, 0);
+
+    /* Fallback decode/emulation path for instructions Unicorn rejects */
+    uc_hook_add(s->uc, &h, UC_HOOK_INSN_INVALID,
+                hook_insn_invalid, s, 1, 0);
 
     /* Port I/O intercept */
     uc_hook_add(s->uc, &h, UC_HOOK_INSN,
