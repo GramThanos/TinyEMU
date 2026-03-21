@@ -1,0 +1,7 @@
+*.o
+*.d
+temu
+build_filelist
+splitimg
+slirp/*.o
+slirp/*.d

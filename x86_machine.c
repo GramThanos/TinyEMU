@@ -2485,6 +2485,7 @@ static void copy_kernel(PCMachine *s, const uint8_t *buf, int buf_len,
         int i;
         X86CPUSeg sd;
         uint32_t val;
+        memset(&sd, 0, sizeof(sd));
         val = x86_cpu_get_reg(s->cpu_state, X86_CPU_REG_CR0);
         x86_cpu_set_reg(s->cpu_state, X86_CPU_REG_CR0, val | (1 << 0));
         
