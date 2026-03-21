@@ -58,6 +58,9 @@ ifndef CONFIG_WIN32
 ifdef CONFIG_FS_NET
 PROGS+=build_filelist splitimg
 endif
+ifdef CONFIG_X86EMU
+PROGS+=x86_unicorn_test
+endif
 endif
 
 all: $(PROGS)
@@ -121,6 +124,9 @@ build_filelist: build_filelist.o fs_utils.o cutils.o
 
 splitimg: splitimg.o
 	$(CC) $(LDFLAGS) -o $@ $^
+
+x86_unicorn_test: x86_unicorn_test.o x86_cpu.o iomem.o cutils.o
+	$(CC) $(LDFLAGS) -o $@ $^ -lunicorn
 
 install: $(PROGS)
 	$(STRIP) $(PROGS)

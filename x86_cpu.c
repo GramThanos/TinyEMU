@@ -131,29 +131,29 @@ struct X86CPUState {
     MMIOInfo *mmio_info[PHYS_MEM_RANGE_MAX];          /* one entry per MMIO range slot */
 };
 
-static BOOL x86_uc_read_pc(uc_engine *uc, uint64_t *pc)
+static BOOL x86_uc_read_pc(X86CPUState *s, uint64_t *pc)
 {
     uint64_t rip = 0;
     uint32_t eip = 0;
 
-    if (uc_reg_read(uc, UC_X86_REG_RIP, &rip) == UC_ERR_OK) {
-        *pc = rip;
+    if (uc_reg_read(s->uc, UC_X86_REG_EIP, &eip) == UC_ERR_OK) {
+        *pc = eip;
         return TRUE;
     }
-    if (uc_reg_read(uc, UC_X86_REG_EIP, &eip) == UC_ERR_OK) {
-        *pc = eip;
+    if (uc_reg_read(s->uc, UC_X86_REG_RIP, &rip) == UC_ERR_OK) {
+        *pc = rip;
         return TRUE;
     }
     return FALSE;
 }
 
-static BOOL x86_uc_write_pc(uc_engine *uc, uint64_t pc)
+static BOOL x86_uc_write_pc(X86CPUState *s, uint64_t pc)
 {
     uint32_t eip = (uint32_t)pc;
 
-    if (uc_reg_write(uc, UC_X86_REG_RIP, &pc) == UC_ERR_OK)
+    if (uc_reg_write(s->uc, UC_X86_REG_EIP, &eip) == UC_ERR_OK)
         return TRUE;
-    if (uc_reg_write(uc, UC_X86_REG_EIP, &eip) == UC_ERR_OK)
+    if (uc_reg_write(s->uc, UC_X86_REG_RIP, &pc) == UC_ERR_OK)
         return TRUE;
     return FALSE;
 }
@@ -438,7 +438,7 @@ static bool hook_insn_invalid(uc_engine *uc, void *user_data)
     uint32_t eax, edx, ecx, eflags;
     uint64_t tsc;
 
-    if (!x86_uc_read_pc(uc, &rip))
+    if (!x86_uc_read_pc(s, &rip))
         return false;
     if (uc_mem_read(uc, rip, code, sizeof(code)) != UC_ERR_OK)
         return false;
@@ -449,7 +449,7 @@ static bool hook_insn_invalid(uc_engine *uc, void *user_data)
         code[2] == X86_OPCODE_3B_0F1E &&
         (code[3] == X86_ENDBR64_LAST || code[3] == X86_ENDBR32_LAST)) {
         rip += 4;
-        x86_uc_write_pc(uc, rip);
+        x86_uc_write_pc(s, rip);
         return true;
     }
 
@@ -462,7 +462,7 @@ static bool hook_insn_invalid(uc_engine *uc, void *user_data)
         rip += 2;
         uc_reg_write(uc, UC_X86_REG_EAX, &eax);
         uc_reg_write(uc, UC_X86_REG_EDX, &edx);
-        x86_uc_write_pc(uc, rip);
+        x86_uc_write_pc(s, rip);
         return true;
     }
 
@@ -478,7 +478,7 @@ static bool hook_insn_invalid(uc_engine *uc, void *user_data)
         uc_reg_write(uc, UC_X86_REG_EAX, &eax);
         uc_reg_write(uc, UC_X86_REG_EDX, &edx);
         uc_reg_write(uc, UC_X86_REG_ECX, &ecx);
-        x86_uc_write_pc(uc, rip);
+        x86_uc_write_pc(s, rip);
         return true;
     }
 
@@ -494,7 +494,7 @@ static bool hook_insn_invalid(uc_engine *uc, void *user_data)
             uc_reg_write(uc, UC_X86_REG_EFLAGS, &eflags);
         }
         rip += 3;
-        x86_uc_write_pc(uc, rip);
+        x86_uc_write_pc(s, rip);
         return true;
     }
 
@@ -545,7 +545,7 @@ static void inject_irq(X86CPUState *s, int intno)
             return; /* gate not present */
 
         uint64_t rip, rsp, rflags = eflags;
-        x86_uc_read_pc(s->uc, &rip);
+        x86_uc_read_pc(s, &rip);
         uc_reg_read(s->uc, UC_X86_REG_RSP, &rsp);
 
         /* Same-privilege interrupt frame: RFLAGS, CS, RIP */
@@ -578,7 +578,7 @@ static void inject_irq(X86CPUState *s, int intno)
         uint32_t esp = 0;
         uint64_t rip = 0;
         uc_reg_read(s->uc, UC_X86_REG_ESP, &esp);
-        x86_uc_read_pc(s->uc, &rip);
+        x86_uc_read_pc(s, &rip);
         uint32_t eip = (uint32_t)rip;
 
         /* Same-privilege interrupt frame: EFLAGS, CS, EIP */
@@ -706,7 +706,10 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
 
     /* Read the current program counter to pass as the start address */
     uint64_t rip = 0;
-    x86_uc_read_pc(s->uc, &rip);
+    if (!x86_uc_read_pc(s, &rip)) {
+        fprintf(stderr, "x86_cpu_interp: failed to read PC register\n");
+        return;
+    }
 
     /*
      * Execute up to max_cycles instructions, or for INTERP_TIMEOUT_US
@@ -725,7 +728,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
          * The PC stays on the HLT, so we detect it by inspecting the byte.
          */
         uint64_t new_rip = 0;
-        x86_uc_read_pc(s->uc, &new_rip);
+        x86_uc_read_pc(s, &new_rip);
         uint8_t opcode = 0;
         if (uc_mem_read(s->uc, new_rip, &opcode, 1) == UC_ERR_OK &&
             opcode == X86_OPCODE_HLT) {
