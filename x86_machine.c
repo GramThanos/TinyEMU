@@ -42,9 +42,7 @@
 #include "ide.h"
 #include "ps2.h"
 
-#if defined(__linux__) && (defined(__i386__) || defined(__x86_64__))
-#define USE_KVM
-#endif
+/* x86 backend selection provided by build system (USE_KVM, else software CPU) */
 
 #ifdef USE_KVM
 #include <linux/kvm.h>
@@ -342,7 +340,11 @@ static void pic_reset(PICState *s)
     /* all 8 bit registers */
     s->last_irr = 0; /* edge detection */
     s->irr = 0; /* interrupt request register */
-    s->imr = 0; /* interrupt mask register */
+    /* Mask all IRQs at reset, like a BIOS-initialized PC. Without this the
+     * (host-time-driven) PIT can deliver a timer IRQ before the kernel remaps
+     * and unmasks the PIC, landing on vector 0 and looking like a #DE. The
+     * kernel programs the real mask via OCW1 during 8259 init. */
+    s->imr = 0xff; /* interrupt mask register (all masked) */
     s->isr = 0; /* interrupt service register */
     s->priority_add = 0; /* used to compute irq priority */
     s->irq_base = 0;
@@ -432,7 +434,7 @@ static void pic_write(void *opaque, uint32_t offset,
     
     addr = offset & 1;
 #ifdef DEBUG_PIC
-    console.log("pic_write: addr=" + toHex2(addr) + " val=" + toHex2(val));
+    printf("pic_write: addr=%02x val=%02x\n", addr, val);
 #endif
     if (addr == 0) {
         if (val & 0x10) {
@@ -540,7 +542,7 @@ static uint32_t pic_read(void *opaque, uint32_t offset, int size_log2)
         ret = s->imr;
     }
 #ifdef DEBUG_PIC
-    console.log("pic_read: addr=" + toHex2(addr1) + " val=" + toHex2(ret));
+    printf("pic_read: addr=%02x val=%02x\n", addr, ret);
 #endif
     return ret;
 }
@@ -617,9 +619,7 @@ static void pic2_update_irq(void *opaque)
     }
     /* look at requested irq */
     irq = pic_get_irq(s->pics[0]);
-#if 0
-    console.log("irr=" + toHex2(s->pics[0].irr) + " imr=" + toHex2(s->pics[0].imr) + " isr=" + toHex2(s->pics[0].isr) + " irq="+ irq);
-#endif
+
     if (irq >= 0) {
         /* raise IRQ request on the CPU */
         s->cpu_set_irq(s->opaque, 1);
@@ -634,7 +634,7 @@ static void pic2_set_irq(void *opaque, int irq, int level)
     PIC2State *s = opaque;
 #if defined(DEBUG_PIC)
     if (irq != 0 && level != s->irq_level[irq]) {
-        console.log("pic_set_irq: irq=" + irq + " level=" + level);
+        printf("pic_set_irq: irq=%d level=%d\n", irq, level);
         s->irq_level[irq] = level;
     }
 #endif
@@ -1284,6 +1284,7 @@ typedef struct PCMachine {
     uint64_t ram_size;
     PhysMemoryMap *mem_map;
     PhysMemoryMap *port_map;
+    BOOL accel_active;
     
     X86CPUState *cpu_state;
     PIC2State *pic_state;
@@ -1452,8 +1453,12 @@ static BOOL dump_port(int port)
 }
 #endif
 
-static void st_port(void *opaque, uint32_t port, uint32_t val, int size_log2)
+void st_port(void *opaque, uint32_t port, uint32_t val, int size_log2)
 {
+#ifdef X86_PORTLOG
+    { static int n; if (n++ < 100)
+        fprintf(stderr, "[port] out %04x <- %08x (sz%d)\n", port, val, 1 << size_log2); }
+#endif
     PCMachine *s = opaque;
     PhysMemoryRange *pr;
 #ifdef DUMP_IOPORT
@@ -1473,7 +1478,7 @@ static void st_port(void *opaque, uint32_t port, uint32_t val, int size_log2)
     }
 }
 
-static uint32_t ld_port(void *opaque, uint32_t port1, int size_log2)
+uint32_t ld_port(void *opaque, uint32_t port1, int size_log2)
 {
     PCMachine *s = opaque;
     PhysMemoryRange *pr;
@@ -1978,20 +1983,36 @@ static VirtMachine *pc_machine_init(const VirtMachineParams *p)
     s->port_map = phys_mem_map_init();
     s->mem_map = phys_mem_map_init();
 
-#ifdef USE_KVM
     if (p->accel_enable) {
-        kvm_init(s);
-    }
-#endif
-
 #ifdef USE_KVM
-    if (!s->kvm_enabled)
+        kvm_init(s);
+        if (s->kvm_enabled) s->accel_active = TRUE;
 #endif
-    {
+    }
+
+    /* The software x86 CPU is 32-bit protected-mode only: it boots a Linux kernel
+     * image via the built-in protected-mode entry (linuxstart). It has no 16-bit
+     * real mode or BIOS interrupt interface, so a BIOS-booted guest (no `kernel:`,
+     * e.g. FreeDOS/DOS/Windows) cannot run. Fail clearly instead of executing the
+     * BIOS until it hits an unimplemented real-mode opcode and hangs. */
+    if (!s->accel_active && !p->files[VM_FILE_KERNEL].buf) {
+        fprintf(stderr,
+"temu: the software x86 CPU can only boot a Linux kernel image.\n"
+"      This configuration has no \"kernel:\" entry, so it is a real-mode/BIOS boot\n"
+"      (FreeDOS, MS-DOS, Windows, ReactOS, ...). 16-bit real mode and the BIOS\n"
+"      interface are not implemented and are out of scope for this build.\n"
+"      Use a Linux configuration (one with a \"kernel:\"), e.g.\n"
+"        ./temu https://bellard.org/jslinux/alpine-x86.cfg\n"
+"      Real-mode guests require the KVM backend (build with USE_KVM=1 on a Linux\n"
+"      host with /dev/kvm).\n");
+        exit(1);
+    }
+
+    if (!s->accel_active) {
         s->cpu_state = x86_cpu_init(s->mem_map);
         x86_cpu_set_get_tsc(s->cpu_state, cpu_get_tsc, s);
         x86_cpu_set_port_io(s->cpu_state, ld_port, st_port, s);
-        
+
         /* needed to handle the RAM dirty bits */
         s->mem_map->opaque = s;
         s->mem_map->flush_tlb_write_range = pc_flush_tlb_write_range;
@@ -2032,18 +2053,15 @@ static VirtMachine *pc_machine_init(const VirtMachineParams *p)
 #endif
     }
 
-#ifdef USE_KVM
-    if (!s->kvm_enabled)
-#endif
-    {
-        s->pic_state = pic2_init(s->port_map, 0x20, 0xa0,
-                                 0x4d0, 0x4d1,
-                                 pic_set_irq_cb, s,
-                                 s->pic_irq);
+    s->pic_state = pic2_init(s->port_map, 0x20, 0xa0,
+                             0x4d0, 0x4d1,
+                             pic_set_irq_cb, s,
+                             s->pic_irq);
+    if (!s->accel_active) {
         x86_cpu_set_get_hard_intno(s->cpu_state, get_hard_intno_cb, s);
-        s->pit_state = pit_init(s->port_map, 0x40, 0x61, &s->pic_irq[0],
-                                pit_get_ticks_cb, s);
     }
+    s->pit_state = pit_init(s->port_map, 0x40, 0x61, &s->pic_irq[0],
+                            pit_get_ticks_cb, s);
 
     s->cmos_state = cmos_init(s->port_map, 0x70, &s->pic_irq[8],
                               p->rtc_local_time);
@@ -2066,10 +2084,8 @@ static VirtMachine *pc_machine_init(const VirtMachineParams *p)
     
     s->common.console = p->console;
     /* serial console */
-    if (0) {
     s->serial_state = serial_init(s->port_map, 0x3f8, &s->pic_irq[4],
                                   serial_write_cb, s);
-    }
     
     memset(vbus, 0, sizeof(*vbus));
     vbus->pci_bus = pci_bus;
@@ -2527,14 +2543,14 @@ static int pc_machine_get_sleep_duration(VirtMachine *s1, int delay)
 {
     PCMachine *s = (PCMachine *)s1;
 
-#ifdef USE_KVM
-    if (s->kvm_enabled) {
-        /* XXX: improve */
+    if (s->accel_active) {
+        /* Under acceleration (KVM): update device state but DO NOT force delay=0.
+         * Let the main loop wait for the normal device delay (typically 10ms from PIT).
+         * This ensures proper timing between accelerated execution timeslices.
+         * Devices need periodic updates (host-driven), which the main loop select() provides. */
         cmos_update_irq(s->cmos_state);
-        delay = 0;
-    } else
-#endif
-    {
+        delay = min_int(delay, pit_update_irq(s->pit_state));
+    } else {
         cmos_update_irq(s->cmos_state);
         delay = min_int(delay, pit_update_irq(s->pit_state));
         if (!x86_cpu_get_power_down(s->cpu_state))
@@ -2549,11 +2565,10 @@ static void pc_machine_interp(VirtMachine *s1, int max_exec_cycles)
 #ifdef USE_KVM
     if (s->kvm_enabled) {
         kvm_exec(s);
-    } else 
-#endif
-    {
-        x86_cpu_interp(s->cpu_state, max_exec_cycles);
+        return;
     }
+#endif
+    x86_cpu_interp(s->cpu_state, max_exec_cycles);
 }
 
 const VirtMachineClass pc_machine_class = {

@@ -48,7 +48,22 @@ CC=$(CROSS_PREFIX)gcc
 STRIP=$(CROSS_PREFIX)strip
 CFLAGS=-O2 -Wall -g -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD
 CFLAGS+=-D_GNU_SOURCE -DCONFIG_VERSION=\"$(shell cat VERSION)\"
+CFLAGS+=$(EXTRA_CFLAGS)
 LDFLAGS=
+DIST_DIR=dist
+DIST_LINUX_DIR=$(DIST_DIR)/linux
+DIST_WINDOWS_DIR=$(DIST_DIR)/windows
+WIN_CROSS_PREFIX ?= x86_64-w64-mingw32-
+
+# x86 backend selection.
+#   default    : software x86 CPU (x86_cpu.c) — the WASM-targetable path
+#   USE_KVM=1  : native KVM acceleration, for Linux-host debugging only (not WASM)
+ifndef CONFIG_WIN32
+ifeq ($(USE_KVM),1)
+CFLAGS += -DUSE_KVM
+endif
+endif
+
 
 bindir=/usr/local/bin
 INSTALL=install
@@ -62,6 +77,8 @@ endif
 
 all: $(PROGS)
 
+.PHONY: all install clean distclean dist dist-linux-backends dist-windows
+
 EMU_OBJS:=virtio.o pci.o fs.o cutils.o iomem.o simplefb.o \
     json.o machine.o temu.o
 
@@ -72,8 +89,11 @@ endif
 
 ifndef CONFIG_WIN32
 EMU_OBJS+=fs_disk.o
-EMU_LIBS=-lrt
+EMU_LIBS=-lrt -lm
+else
+EMU_LIBS+=-lws2_32 -lwinpthread
 endif
+
 ifdef CONFIG_FS_NET
 CFLAGS+=-DCONFIG_FS_NET
 EMU_OBJS+=fs_net.o fs_wget.o fs_utils.o block_net.o
@@ -106,6 +126,30 @@ endif
 temu$(EXE): $(EMU_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(EMU_LIBS)
 
+# Software x86 CPU regression self-test (see tests/x86_cpu_selftest.c).
+# Filter prerequisites to sources/objects: the -MMD .d file adds header
+# prerequisites, and a bare $^ would pass them to the compiler as inputs.
+x86-selftest: tests/x86_cpu_selftest.c x86_cpu.o iomem.o cutils.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^) -lm
+	./$@
+
+dist-linux-backends:
+	mkdir -p $(DIST_LINUX_DIR)
+	$(MAKE) clean
+	$(MAKE) temu$(EXE)
+	cp temu$(EXE) $(DIST_LINUX_DIR)/temu-soft$(EXE)
+	$(MAKE) clean
+	$(MAKE) USE_KVM=1 temu$(EXE)
+	cp temu$(EXE) $(DIST_LINUX_DIR)/temu-kvm$(EXE)
+
+dist-windows:
+	mkdir -p $(DIST_WINDOWS_DIR)
+	$(MAKE) clean
+	$(MAKE) CONFIG_WIN32=y CROSS_PREFIX=$(WIN_CROSS_PREFIX) CONFIG_SDL= CONFIG_FS_NET= CONFIG_SLIRP= all
+	cp temu.exe $(DIST_WINDOWS_DIR)/temu.exe
+
+dist: dist-linux-backends dist-windows
+
 riscv_cpu32.o: riscv_cpu.c
 	$(CC) $(CFLAGS) -DMAX_XLEN=32 -c -o $@ $<
 
@@ -128,8 +172,13 @@ install: $(PROGS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# clean removes build intermediates and the in-tree dev binaries. The dist/
+# tree (Docker release artifacts) is left alone; use distclean to remove it.
 clean:
-	rm -f *.o *.d *~ $(PROGS) slirp/*.o slirp/*.d slirp/*~
+	rm -f *.o *.d *~ $(PROGS) x86-selftest slirp/*.o slirp/*.d slirp/*~
+
+distclean: clean
+	rm -rf $(DIST_DIR)
 
 -include $(wildcard *.d)
 -include $(wildcard slirp/*.d)

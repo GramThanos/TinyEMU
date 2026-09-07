@@ -612,10 +612,27 @@ static struct option options[] = {
     { NULL },
 };
 
+static void print_backend_info(void)
+{
+#if defined(USE_KVM)
+    {
+        int kvm_fd = open("/dev/kvm", O_RDONLY);
+        if (kvm_fd >= 0) {
+            printf("x86 backend : KVM (available)\n");
+            close(kvm_fd);
+        } else {
+            printf("x86 backend : KVM (built-in, /dev/kvm not accessible on this host)\n");
+        }
+    }
+#else
+    printf("x86 backend : software interpreter (no acceleration)\n");
+#endif
+}
+
 void help(void)
 {
     printf("temu version " CONFIG_VERSION ", Copyright (c) 2016-2018 Fabrice Bellard\n"
-           "usage: riscvemu [options] config_file\n"
+           "usage: temu [options] config_file\n"
            "options are:\n"
            "-m ram_size       set the RAM size in MB\n"
            "-rw               allow write access to the disk image (default=snapshot)\n"
@@ -625,7 +642,9 @@ void help(void)
            "-no-accel         disable VM acceleration (KVM, x86 machine only)\n"
            "\n"
            "Console keys:\n"
-           "Press C-a x to exit the emulator, C-a h to get some help.\n");
+           "Press C-a x to exit the emulator, C-a h to get some help.\n"
+           "\n");
+    print_backend_info();
     exit(1);
 }
 
@@ -820,7 +839,7 @@ int main(int argc, char **argv)
     s = virt_machine_init(p);
     if (!s)
         exit(1);
-    
+
     virt_machine_free_config(p);
 
     if (s->net) {

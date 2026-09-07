@@ -151,9 +151,13 @@ static char *cmdline_subst(const char *cmdline)
                 struct tm tm;
                 int n, sg;
                 /* get the offset to UTC */
+#ifdef _WIN32
+                n = 0;
+#else
                 time(&ti);
                 localtime_r(&ti, &tm);
                 n = tm.tm_gmtoff / 60;
+#endif
                 sg = '-';
                 if (n < 0) {
                     sg = '+';

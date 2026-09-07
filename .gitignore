@@ -1,0 +1,8 @@
+# Build objects / deps
+*.o
+*.d
+
+# Distribution tree (Docker `make dist` output: dist/linux, dist/windows)
+/dist
+
+/x86-docs
