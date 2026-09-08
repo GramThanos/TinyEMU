@@ -21,6 +21,16 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#ifdef _WIN32
+/* winsock2.h must precede windows.h so the latter does not pull in the
+ * conflicting winsock v1 header. */
+#include <winsock2.h>
+#include <windows.h>
+#include <conio.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -204,7 +214,120 @@ CharacterDevice *console_init(BOOL allow_ctrlc)
     return dev;
 }
 
-#endif /* !_WIN32 */
+#else /* _WIN32 */
+
+/* Windows console backend. Output goes to the console via WriteFile (binary,
+ * with ANSI/VT escape processing enabled); input is polled with _kbhit/_getch
+ * because Windows console handles cannot be used with select(). */
+typedef struct {
+    int console_esc_state;
+    BOOL resize_pending;
+    int last_w, last_h;
+} STDIODevice;
+
+static STDIODevice *global_stdio_device;
+
+static void console_write(void *opaque, const uint8_t *buf, int len)
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written;
+    (void)opaque;
+    WriteFile(h, buf, len, &written, NULL);
+}
+
+static int console_read(void *opaque, uint8_t *buf, int len)
+{
+    STDIODevice *s = opaque;
+    int j = 0;
+
+    while (j < len && _kbhit()) {
+        int c = _getch();
+        uint8_t ch;
+        /* extended keys (arrows, function keys) arrive as a 0x00/0xE0 prefix
+           followed by a scan code; drop both rather than feed garbage. */
+        if (c == 0x00 || c == 0xE0) {
+            if (_kbhit())
+                _getch();
+            continue;
+        }
+        ch = (uint8_t)c;
+        if (s->console_esc_state) {
+            s->console_esc_state = 0;
+            switch(ch) {
+            case 'x':
+                printf("Terminated\n");
+                exit(0);
+            case 'h':
+                printf("\n"
+                       "C-a h   print this help\n"
+                       "C-a x   exit emulator\n"
+                       "C-a C-a send C-a\n"
+                       );
+                break;
+            case 1:
+                buf[j++] = 1;
+                break;
+            default:
+                break;
+            }
+        } else {
+            if (ch == 1)
+                s->console_esc_state = 1;
+            else
+                buf[j++] = ch;
+        }
+    }
+    return j;
+}
+
+static void console_get_size(int *pw, int *ph)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    int width = 80, height = 25;
+
+    if (GetConsoleScreenBufferInfo(h, &info)) {
+        int w = info.srWindow.Right - info.srWindow.Left + 1;
+        int hgt = info.srWindow.Bottom - info.srWindow.Top + 1;
+        if (w >= 4 && hgt >= 4) {
+            width = w;
+            height = hgt;
+        }
+    }
+    *pw = width;
+    *ph = height;
+}
+
+CharacterDevice *console_init(BOOL allow_ctrlc)
+{
+    CharacterDevice *dev;
+    STDIODevice *s;
+    HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    (void)allow_ctrlc;
+
+    /* enable ANSI escape sequence processing on output (Windows 10+) */
+    if (GetConsoleMode(hout, &mode))
+        SetConsoleMode(hout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    /* raw input: no line buffering / echo (getch bypasses these regardless) */
+    if (GetConsoleMode(hin, &mode))
+        SetConsoleMode(hin, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                                     ENABLE_PROCESSED_INPUT));
+
+    dev = mallocz(sizeof(*dev));
+    s = mallocz(sizeof(*s));
+    s->resize_pending = TRUE;
+    s->last_w = s->last_h = -1;
+    global_stdio_device = s;
+
+    dev->opaque = s;
+    dev->write_data = console_write;
+    dev->read_data = console_read;
+    return dev;
+}
+
+#endif /* _WIN32 */
 
 typedef enum {
     BF_MODE_RO,
@@ -550,9 +673,9 @@ void virt_machine_run(VirtMachine *m)
     FD_ZERO(&wfds);
     FD_ZERO(&efds);
     fd_max = -1;
-#ifndef _WIN32
     if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
         STDIODevice *s = m->console->opaque;
+#ifndef _WIN32
         stdin_fd = s->stdin_fd;
         FD_SET(stdin_fd, &rfds);
         fd_max = stdin_fd;
@@ -563,8 +686,19 @@ void virt_machine_run(VirtMachine *m)
             virtio_console_resize_event(m->console_dev, width, height);
             s->resize_pending = FALSE;
         }
-    }
+#else
+        /* console input is polled after select() (not selectable on Windows);
+           here we only propagate host console resizes to the guest. */
+        int width, height;
+        console_get_size(&width, &height);
+        if (s->resize_pending || width != s->last_w || height != s->last_h) {
+            virtio_console_resize_event(m->console_dev, width, height);
+            s->resize_pending = FALSE;
+            s->last_w = width;
+            s->last_h = height;
+        }
 #endif
+    }
     if (m->net) {
         m->net->select_fill(m->net, &fd_max, &rfds, &wfds, &efds, &delay);
     }
@@ -573,6 +707,14 @@ void virt_machine_run(VirtMachine *m)
 #endif
     tv.tv_sec = delay / 1000;
     tv.tv_usec = (delay % 1000) * 1000;
+#ifdef _WIN32
+    /* select() with no descriptors errors out immediately on Windows, which
+       would busy-loop; sleep for the delay instead. */
+    if (fd_max < 0) {
+        Sleep(delay);
+        ret = 0;
+    } else
+#endif
     ret = select(fd_max + 1, &rfds, &wfds, &efds, &tv);
     if (m->net) {
         m->net->select_poll(m->net, &rfds, &wfds, &efds, ret);
@@ -591,6 +733,18 @@ void virt_machine_run(VirtMachine *m)
         }
 #endif
     }
+#ifdef _WIN32
+    /* Windows console input is not selectable; poll it each iteration. */
+    if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
+        uint8_t buf[128];
+        int rlen, len;
+        len = virtio_console_get_write_len(m->console_dev);
+        len = min_int(len, (int)sizeof(buf));
+        rlen = m->console->read_data(m->console->opaque, buf, len);
+        if (rlen > 0)
+            virtio_console_write_data(m->console_dev, buf, rlen);
+    }
+#endif
 
 #ifdef CONFIG_SDL
     sdl_refresh(m);
@@ -827,12 +981,7 @@ int main(int argc, char **argv)
     } else
 #endif
     {
-#ifdef _WIN32
-        fprintf(stderr, "Console not supported yet\n");
-        exit(1);
-#else
         p->console = console_init(allow_ctrlc);
-#endif
     }
     p->rtc_real_time = TRUE;
 

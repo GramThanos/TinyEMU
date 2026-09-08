@@ -22,6 +22,56 @@ typedef char *caddr_t;
 # define EHOSTUNREACH WSAEHOSTUNREACH
 # define ENETUNREACH WSAENETUNREACH
 # define ECONNREFUSED WSAECONNREFUSED
+
+/* Win32 has no <sys/uio.h>; provide the scatter/gather bits slirp needs. */
+struct iovec {
+    void *iov_base;
+    size_t iov_len;
+};
+
+/* winsock has inet_addr() but not inet_aton(); slirp uses the latter. */
+static inline int inet_aton(const char *cp, struct in_addr *ia)
+{
+    unsigned long addr = inet_addr(cp);
+    if (addr == INADDR_NONE)
+        return 0;
+    ia->s_addr = addr;
+    return 1;
+}
+
+static inline int readv(int fd, const struct iovec *iov, int iovcnt)
+{
+    WSABUF bufs[8];
+    DWORD nrecv = 0, flags = 0;
+    int i;
+
+    if (iovcnt > (int)(sizeof(bufs) / sizeof(bufs[0])))
+        iovcnt = sizeof(bufs) / sizeof(bufs[0]);
+    for (i = 0; i < iovcnt; i++) {
+        bufs[i].len = (ULONG)iov[i].iov_len;
+        bufs[i].buf = (char *)iov[i].iov_base;
+    }
+    if (WSARecv((SOCKET)fd, bufs, iovcnt, &nrecv, &flags, NULL, NULL) == SOCKET_ERROR)
+        return -1;
+    return (int)nrecv;
+}
+
+static inline int writev(int fd, const struct iovec *iov, int iovcnt)
+{
+    WSABUF bufs[8];
+    DWORD nsent = 0;
+    int i;
+
+    if (iovcnt > (int)(sizeof(bufs) / sizeof(bufs[0])))
+        iovcnt = sizeof(bufs) / sizeof(bufs[0]);
+    for (i = 0; i < iovcnt; i++) {
+        bufs[i].len = (ULONG)iov[i].iov_len;
+        bufs[i].buf = (char *)iov[i].iov_base;
+    }
+    if (WSASend((SOCKET)fd, bufs, iovcnt, &nsent, 0, NULL, NULL) == SOCKET_ERROR)
+        return -1;
+    return (int)nsent;
+}
 #else
 # define ioctlsocket ioctl
 # define closesocket(s) close(s)

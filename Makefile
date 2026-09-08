@@ -54,6 +54,9 @@ DIST_DIR=dist
 DIST_LINUX_DIR=$(DIST_DIR)/linux
 DIST_WINDOWS_DIR=$(DIST_DIR)/windows
 WIN_CROSS_PREFIX ?= x86_64-w64-mingw32-
+# CA bundle shipped with the Windows build so its OpenSSL-based libcurl can
+# verify HTTPS. Default path is Fedora's ca-certificates location.
+WIN_CA_BUNDLE ?= /etc/pki/tls/certs/ca-bundle.crt
 
 # x86 backend selection.
 #   default    : software x86 CPU (x86_cpu.c) — the WASM-targetable path
@@ -91,7 +94,7 @@ ifndef CONFIG_WIN32
 EMU_OBJS+=fs_disk.o
 EMU_LIBS=-lrt -lm
 else
-EMU_LIBS+=-lws2_32 -lwinpthread
+EMU_LIBS+=-lws2_32 -liphlpapi -lwinpthread
 endif
 
 ifdef CONFIG_FS_NET
@@ -142,11 +145,18 @@ dist-linux-backends:
 	$(MAKE) USE_KVM=1 temu$(EXE)
 	cp temu$(EXE) $(DIST_LINUX_DIR)/temu-kvm$(EXE)
 
+# Windows cross build. CONFIG_FS_NET (remote configs/assets over HTTP) and
+# CONFIG_SLIRP (user-mode networking) are enabled; SDL is left off (headless).
+# Required MinGW runtime DLLs are bundled next to the .exe so it runs standalone.
 dist-windows:
 	mkdir -p $(DIST_WINDOWS_DIR)
 	$(MAKE) clean
-	$(MAKE) CONFIG_WIN32=y CROSS_PREFIX=$(WIN_CROSS_PREFIX) CONFIG_SDL= CONFIG_FS_NET= CONFIG_SLIRP= all
-	cp temu.exe $(DIST_WINDOWS_DIR)/temu.exe
+	$(MAKE) CONFIG_WIN32=y CROSS_PREFIX=$(WIN_CROSS_PREFIX) CONFIG_SDL= all
+	cp -f temu.exe $(DIST_WINDOWS_DIR)/temu.exe
+	cp -f $(WIN_CA_BUNDLE) $(DIST_WINDOWS_DIR)/ca-bundle.crt
+	chmod u+w $(DIST_WINDOWS_DIR)/ca-bundle.crt
+	OBJDUMP=$(WIN_CROSS_PREFIX)objdump sh scripts/bundle-win-dlls.sh \
+	    $(DIST_WINDOWS_DIR)/temu.exe $(DIST_WINDOWS_DIR)
 
 dist: dist-linux-backends dist-windows
 
