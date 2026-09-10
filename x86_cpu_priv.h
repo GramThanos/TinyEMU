@@ -191,17 +191,32 @@ struct X86CPUState {
      * index, hash, tag compare, bounds compare), so a 5-byte instruction pays
      * that five times before any work happens.
      *
-     * Deliberately re-derived from the TLB each instruction instead of being
-     * carried across instructions: that way every existing invalidation (TLB
-     * flush, CR3/CR0/CR4 write, CS load, CPL change, jump) already covers it,
-     * with no new invalidation rules to get wrong. Carrying it across straight-
-     * line instructions is the obvious next step, and needs those rules.
+     * The window is now *carried across straight-line instructions*: the interp
+     * loop re-runs fetch_refill() only when the window can no longer serve the
+     * next opcode. That is decided by a self-checking invariant that needs no
+     * per-handler bookkeeping. While fetching stays sequential, fetch8() bumps
+     * fetch_ptr and eip in lockstep, so (uintptr_t)fetch_ptr - eip is invariant
+     * across the window; fetch_refill() records it as win_eip_addend along with
+     * win_cs_base. At the top of each instruction the loop keeps the window iff
+     *   fetch_ptr < fetch_end   (not exhausted / page-crossed)
+     *   && CS.base == win_cs_base
+     *   && (uintptr_t)fetch_ptr == win_eip_addend + eip   (eip advanced only by fetch)
+     * Any control transfer moves eip without moving fetch_ptr, so the last test
+     * fails and the window is rebuilt; a far transfer also changes CS.base. The
+     * one class the eip/CS test cannot see is a translation change with eip/CS
+     * unchanged (CR3/CR0/CR4/EFER write, invlpg, external SMC/DMA flush), so the
+     * TLB-flush paths set fetch_dirty to force a refill. Those flush instructions
+     * finish fetching their own bytes before the flush runs, so setting the flag
+     * (rather than clobbering fetch_ptr) never disturbs an in-flight fetch.
      *
      * When the window cannot be established both point at x86_fetch_none, so
      * `fetch_ptr < fetch_end` is false and every byte falls back to ld_lin() --
      * which keeps faults, MMIO and page-crossing fetches exactly as they were. */
     const uint8_t *fetch_ptr;
     const uint8_t *fetch_end;
+    uintptr_t win_eip_addend;   /* (uintptr_t)fetch_ptr - eip for the live window */
+    uint32_t  win_cs_base;      /* CS.base the live window was built against */
+    int       fetch_dirty;      /* a TLB flush invalidated the window; force refill */
 
     /* Fault/exception unwinding (see raise_exception / interp loop) */
     uint32_t cur_eip;       /* EIP at the start of the current instruction */

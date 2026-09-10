@@ -336,6 +336,10 @@ static void tlb_flush_all(X86CPUState *s)
             s->tlb_code[mi][i].vaddr = X86_TLB_EMPTY(i);
         }
     }
+    /* The carried fetch window is a raw host pointer built from tlb_code; a flush
+     * may have changed the linear->physical mapping of the current code page, so
+     * force the interp loop to re-derive it (see x86_cpu_priv.h). */
+    s->fetch_dirty = 1;
 }
 
 /* Invalidate one linear page in both MMU indexes (invlpg is not CPL-scoped). */
@@ -348,6 +352,7 @@ static void tlb_flush_page(X86CPUState *s, uint32_t la)
         s->tlb_write[mi][i].vaddr = X86_TLB_EMPTY(i);
         s->tlb_code[mi][i].vaddr = X86_TLB_EMPTY(i);
     }
+    s->fetch_dirty = 1;   /* window may map the flushed page; force a refill */
 }
 
 /* Flush after a CR0/CR4 write that changes how translation works: CR0.PG,
@@ -702,11 +707,17 @@ static inline void fetch_refill(X86CPUState *s)
         const uint8_t *p = (const uint8_t *)(e->mem_addend + la);
         s->fetch_ptr = p;
         s->fetch_end = p + (0x1000u - (la & 0xfffu));
+        /* Record what this window maps so the loop can tell, next instruction,
+         * whether it still serves CS.base+eip (see the priv-header comment). */
+        s->win_eip_addend = (uintptr_t)p - s->eip;
+        s->win_cs_base = s->seg[X86_CPU_SEG_CS].base;
+        s->fetch_dirty = 0;
         return;
     }
 #endif
     s->fetch_ptr = x86_fetch_none;
     s->fetch_end = x86_fetch_none;
+    s->fetch_dirty = 0;
 }
 
 static uint8_t fetch8_slow(X86CPUState *s)
@@ -2143,6 +2154,92 @@ static void x86_trace_dump(X86CPUState *s)
 }
 #endif
 
+#ifdef X86_OPHIST
+/* Opcode-mix histogram: counts every executed instruction, bucketed by opcode.
+ * Two-byte (0x0f) ops are split by mandatory prefix (none/66/f3/f2) so SSE/SSE2
+ * ops can be told apart from the integer 0x0f space. Dumped periodically to
+ * stderr and again at process exit. Answers "what fraction of retired
+ * instructions are SIMD?" before committing to an XMM/SSE implementation. */
+static uint64_t g_op1[256];        /* one-byte opcode b (b != 0x0f)            */
+static uint64_t g_op0f[4][256];    /* 0x0f b2, indexed by prefix class below   */
+static uint64_t g_op_total;
+static uint64_t g_op_next_dump = 100000000ull;
+
+/* Is (prefix-class pc, second byte b2) an SSE/SSE2 XMM instruction?
+ * Covers the SSE1/SSE2 opcode map: 10-17,28-2F,50-6F,70-7F,C2-C6,D0-FF.
+ * Excludes the non-SSE 0x0f integer space (jcc 80-8F, setcc 90-9F, cpuid A2,
+ * bt/bsf/movzx B0-BF, etc.). Prefixed forms (66/f2/f3) in these ranges are
+ * always SSE; the no-prefix (pc==0) forms in 50-6F/D0-FF are MMX, which this
+ * guest cannot run (MMX not advertised), so count them as SIMD too. */
+static int op0f_is_sse(int pc, int b2)
+{
+    (void)pc;
+    if (b2 >= 0x10 && b2 <= 0x17) return 1;
+    if (b2 >= 0x28 && b2 <= 0x2f) return 1;
+    if (b2 >= 0x50 && b2 <= 0x6f) return 1;
+    if (b2 >= 0x70 && b2 <= 0x7f) return 1;
+    if (b2 >= 0xc2 && b2 <= 0xc6) return 1;
+    if (b2 >= 0xd0 && b2 <= 0xff) return 1;
+    return 0;
+}
+
+static void ophist_dump(void)
+{
+    uint64_t sse = 0, f0 = 0, total = g_op_total;
+    int pc, i;
+    if (total == 0) return;
+    for (pc = 0; pc < 4; pc++)
+        for (i = 0; i < 256; i++) {
+            uint64_t n = g_op0f[pc][i];
+            if (!n) continue;
+            f0 += n;
+            if (op0f_is_sse(pc, i)) sse += n;
+        }
+    fprintf(stderr, "\n=== x86 opcode-mix histogram (total=%llu) ===\n",
+            (unsigned long long)total);
+    fprintf(stderr, "  SSE/SSE2 (XMM) ops: %llu  (%.4f%%)\n",
+            (unsigned long long)sse, 100.0 * (double)sse / (double)total);
+    fprintf(stderr, "  all 0x0f two-byte:  %llu  (%.4f%%)\n",
+            (unsigned long long)f0, 100.0 * (double)f0 / (double)total);
+    /* Top one-byte opcodes (non-destructive: rank over a copy). */
+    fprintf(stderr, "  --- top one-byte opcodes ---\n");
+    { uint64_t tmp[256]; int k;
+      for (i = 0; i < 256; i++) tmp[i] = g_op1[i];
+      for (k = 0; k < 16; k++) {
+        int best = -1; uint64_t bv = 0;
+        for (i = 0; i < 256; i++) if (tmp[i] > bv) { bv = tmp[i]; best = i; }
+        if (best < 0) break;
+        fprintf(stderr, "    op %02x : %llu  (%.3f%%)\n", best,
+                (unsigned long long)bv, 100.0 * (double)bv / (double)total);
+        tmp[best] = 0;
+    } }
+    /* Any SSE actually attempted? List nonzero SSE buckets. */
+    if (sse) {
+        static const char *pn[4] = { "np", "66", "f3", "f2" };
+        fprintf(stderr, "  --- SSE buckets hit ---\n");
+        for (pc = 0; pc < 4; pc++)
+            for (i = 0; i < 256; i++)
+                if (g_op0f[pc][i] && op0f_is_sse(pc, i))
+                    fprintf(stderr, "    0f.%s.%02x : %llu\n", pn[pc], i,
+                            (unsigned long long)g_op0f[pc][i]);
+    }
+    fprintf(stderr, "=== end histogram ===\n");
+}
+
+static int g_ophist_atexit;
+static void ophist_atexit(void) { ophist_dump(); }
+#endif
+
+/* 1 for every byte that is an x86 prefix (operand/address size, lock, rep/repne,
+ * and the six segment overrides). Lets the interpreter gate the prefix-decode
+ * chain on a single table lookup: prefix-free instructions -- the overwhelming
+ * majority -- then skip the ~8-compare walk that used to run before the chain
+ * fell through to `break`. */
+static const uint8_t x86_is_prefix[256] = {
+    [0x66] = 1, [0x67] = 1, [0xf0] = 1, [0xf3] = 1, [0xf2] = 1,
+    [0x2e] = 1, [0x36] = 1, [0x3e] = 1, [0x26] = 1, [0x64] = 1, [0x65] = 1,
+};
+
 void x86_cpu_interp(X86CPUState *s, int max_cycles)
 {
     int i;
@@ -2196,6 +2293,9 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         int op_size, seg_override = -1, rep = 0;
         int b, reg, def_op;
         Modrm rm;
+#ifdef X86_OPHIST
+        int pfx66 = 0;
+#endif
 
         s->cur_eip = s->eip;
 #ifdef X86_SYSLOG
@@ -2233,16 +2333,33 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         }
 
         /* Establish the fetch window for this instruction. Must come after any
-         * interrupt delivery above, which can change both CS and EIP. */
-        fetch_refill(s);
+         * interrupt delivery above, which can change both CS and EIP.
+         *
+         * The window is carried across straight-line instructions: refill only
+         * when it can no longer serve CS.base+eip. It still serves when it is
+         * non-empty, CS.base is unchanged, no TLB flush marked it dirty, and
+         * fetch_ptr still tracks eip (true iff eip advanced only through fetch8,
+         * i.e. no control transfer happened). Any miss falls back to the full
+         * refill, which re-validates through tlb_code exactly as before. */
+        if (unlikely(s->fetch_dirty
+                     || !(s->fetch_ptr < s->fetch_end)
+                     || s->seg[X86_CPU_SEG_CS].base != s->win_cs_base
+                     || (uintptr_t)s->fetch_ptr != s->win_eip_addend + s->eip))
+            fetch_refill(s);
 
         def_op = (s->seg[X86_CPU_SEG_CS].flags & 0x4000) ? 4 : 2; /* D/B bit */
         op_size = def_op;
         s->addr_size = def_op;
 
-        /* prefixes */
-        for (;;) {
-            b = fetch8(s);
+        /* prefixes: the common case is no prefix, so the decode chain is gated on
+         * a table lookup the branch predictor keeps not-taken -- one array read
+         * replaces the ~8 compares every prefix-free instruction used to walk
+         * before falling out of the old `for(;;) ... else break;`. */
+        b = fetch8(s);
+        while (unlikely(x86_is_prefix[b])) {
+#ifdef X86_OPHIST
+            if (b == 0x66) pfx66 = 1;
+#endif
             if (b == 0x66) { op_size = (def_op == 4) ? 2 : 4; }
             else if (b == 0x67) { s->addr_size = (def_op == 4) ? 2 : 4; }
             else if (b == 0xf0) { /* lock: ignore */ }
@@ -2254,8 +2371,18 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             else if (b == 0x26) seg_override = X86_CPU_SEG_ES;
             else if (b == 0x64) seg_override = X86_CPU_SEG_FS;
             else if (b == 0x65) seg_override = X86_CPU_SEG_GS;
-            else break;
+            b = fetch8(s);
         }
+
+#ifdef X86_OPHIST
+        if (!g_ophist_atexit) { g_ophist_atexit = 1; atexit(ophist_atexit); }
+        g_op_total++;
+        if (b != 0x0f) g_op1[b]++;   /* 0x0f recorded after b2 is known */
+        if (g_op_total >= g_op_next_dump) {
+            ophist_dump();
+            g_op_next_dump += 100000000ull;
+        }
+#endif
 
 #ifdef X86_TRACE
         g_trace_eip[g_trace_i] = s->cur_eip;
@@ -2445,6 +2572,10 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         } break;
         case 0x0f: { /* two-byte */
             uint8_t b2 = fetch8(s);
+#ifdef X86_OPHIST
+            { int pc = (rep == 1) ? 2 : (rep == 2) ? 3 : (pfx66 ? 1 : 0);
+              g_op0f[pc][b2]++; }
+#endif
             if (b2 >= 0x80 && b2 <= 0x8f) { /* Jcc rel */
                 int32_t d = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
                 if (test_cc(s, b2 & 0xf)) jmp_rel(s, d, op_size);
