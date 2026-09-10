@@ -368,6 +368,12 @@ static int bf_read_async(BlockDevice *bs,
 #endif
     if (!bf->f)
         return -1;
+    /* An out-of-range request must never walk off sector_table or issue a
+       negative-length read: return an I/O error to the guest instead of
+       corrupting/segfaulting the host. This also stops a too-small file
+       (e.g. a chunk manifest mistaken for a raw image) from crashing here. */
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
     if (bf->mode == BF_MODE_SNAPSHOT) {
         int i;
         for(i = 0; i < n; i++) {
@@ -395,6 +401,8 @@ static int bf_write_async(BlockDevice *bs,
     BlockDeviceFile *bf = bs->opaque;
     int ret;
 
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
     switch(bf->mode) {
     case BF_MODE_RO:
         ret = -1; /* error */
@@ -466,6 +474,230 @@ static BlockDevice *block_device_init(const char *filename,
     bs->get_sector_count = bf_get_sector_count;
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;
+    return bs;
+}
+
+/**********************************************************/
+/* local split (chunked) block device
+ *
+ * Serves a disk from the multi-file layout produced by splitimg: a JSON
+ * manifest ("blk.txt": { block_size (in KB), n_block }) plus "blk%09u.bin"
+ * chunk files of block_size KB each, sitting in the same directory. This is
+ * the exact on-disk layout the browser build fetches over HTTP
+ * (block_device_init_http). Recognising it for local files lets a config.cfg
+ * point drive0 at a chunked image with the native/Docker build too, instead of
+ * the manifest being mistaken for a raw image. */
+
+typedef struct BlockDeviceSplit {
+    BlockDeviceModeEnum mode;
+    int64_t nb_sectors;
+    int block_size;         /* sectors per chunk, power of two */
+    int n_block;
+    char *dir;              /* manifest directory, incl. trailing separator */
+    uint8_t **sector_table; /* write overlay (SNAPSHOT), lazily populated */
+    FILE *cur_f;            /* cached open chunk file for reads */
+    int cur_block;          /* chunk index of cur_f, -1 if none */
+} BlockDeviceSplit;
+
+static int64_t bs_split_get_sector_count(BlockDevice *bs)
+{
+    BlockDeviceSplit *bf = bs->opaque;
+    return bf->nb_sectors;
+}
+
+static FILE *bs_split_open_chunk(BlockDeviceSplit *bf, int block_num)
+{
+    char filename[1024];
+    if (bf->cur_f && bf->cur_block == block_num)
+        return bf->cur_f;
+    if (bf->cur_f) {
+        fclose(bf->cur_f);
+        bf->cur_f = NULL;
+        bf->cur_block = -1;
+    }
+    snprintf(filename, sizeof(filename), "%sblk%09u.bin", bf->dir, block_num);
+    bf->cur_f = fopen(filename, "rb");
+    if (bf->cur_f)
+        bf->cur_block = block_num;
+    return bf->cur_f;
+}
+
+static int bs_split_read_async(BlockDevice *bs,
+                               uint64_t sector_num, uint8_t *buf, int n,
+                               BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    BlockDeviceSplit *bf = bs->opaque;
+    int i;
+
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
+    for(i = 0; i < n; i++) {
+        if (bf->sector_table && bf->sector_table[sector_num]) {
+            memcpy(buf, bf->sector_table[sector_num], SECTOR_SIZE);
+        } else {
+            int block_num = sector_num / bf->block_size;
+            int offset = sector_num % bf->block_size;
+            FILE *f = bs_split_open_chunk(bf, block_num);
+            /* a missing or short chunk reads back as zeroes */
+            memset(buf, 0, SECTOR_SIZE);
+            if (f) {
+                fseek(f, (int64_t)offset * SECTOR_SIZE, SEEK_SET);
+                if (fread(buf, 1, SECTOR_SIZE, f) != SECTOR_SIZE) {
+                    /* leave the zero fill */
+                }
+            }
+        }
+        sector_num++;
+        buf += SECTOR_SIZE;
+    }
+    return 0;
+}
+
+static int bs_split_write_async(BlockDevice *bs,
+                                uint64_t sector_num, const uint8_t *buf, int n,
+                                BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    BlockDeviceSplit *bf = bs->opaque;
+    int i;
+
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
+    switch(bf->mode) {
+    case BF_MODE_RO:
+        return -1;
+    case BF_MODE_SNAPSHOT:
+        /* copy-on-write into an in-memory overlay; chunk files untouched */
+        for(i = 0; i < n; i++) {
+            if (!bf->sector_table[sector_num])
+                bf->sector_table[sector_num] = malloc(SECTOR_SIZE);
+            memcpy(bf->sector_table[sector_num], buf, SECTOR_SIZE);
+            sector_num++;
+            buf += SECTOR_SIZE;
+        }
+        return 0;
+    case BF_MODE_RW:
+        for(i = 0; i < n; i++) {
+            int block_num = sector_num / bf->block_size;
+            int offset = sector_num % bf->block_size;
+            char filename[1024];
+            FILE *f;
+            /* drop the read cache if it points at the chunk we are writing */
+            if (bf->cur_f && bf->cur_block == block_num) {
+                fclose(bf->cur_f);
+                bf->cur_f = NULL;
+                bf->cur_block = -1;
+            }
+            snprintf(filename, sizeof(filename), "%sblk%09u.bin",
+                     bf->dir, block_num);
+            f = fopen(filename, "r+b");
+            if (!f)
+                return -1;
+            fseek(f, (int64_t)offset * SECTOR_SIZE, SEEK_SET);
+            fwrite(buf, 1, SECTOR_SIZE, f);
+            fclose(f);
+            sector_num++;
+            buf += SECTOR_SIZE;
+        }
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/* If filename is a splitimg JSON manifest, build a chunked block device from
+   it; otherwise return NULL so the caller falls back to a raw image. */
+static BlockDevice *block_device_init_split(const char *filename,
+                                            BlockDeviceModeEnum mode)
+{
+    BlockDevice *bs;
+    BlockDeviceSplit *bf;
+    FILE *f;
+    int64_t file_size;
+    char *data;
+    const char *p;
+    int block_size_kb, n_block, block_size, sep;
+    JSONValue cfg, vbs, vnb;
+
+    f = fopen(filename, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    file_size = ftello(f);
+    /* a manifest is tiny; anything sizeable is a raw image */
+    if (file_size <= 0 || file_size > 65536) {
+        fclose(f);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_SET);
+    data = malloc(file_size + 1);
+    if (fread(data, 1, file_size, f) != (size_t)file_size) {
+        free(data);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    data[file_size] = '\0';
+
+    /* quick reject: JSON objects start with '{' */
+    p = data;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        p++;
+    if (*p != '{') {
+        free(data);
+        return NULL;
+    }
+
+    cfg = json_parse_value_len(data, file_size);
+    free(data);
+    if (json_is_error(cfg)) {
+        json_free(cfg);
+        return NULL;
+    }
+    /* must carry both manifest fields to be treated as a split image */
+    vbs = json_object_get(cfg, "block_size");
+    vnb = json_object_get(cfg, "n_block");
+    if (vbs.type != JSON_INT || vnb.type != JSON_INT) {
+        json_free(cfg);
+        return NULL;
+    }
+    block_size_kb = vbs.u.int32;
+    n_block = vnb.u.int32;
+    json_free(cfg);
+
+    block_size = block_size_kb * 2; /* KB -> 512-byte sectors */
+    if (block_size_kb <= 0 || (block_size & (block_size - 1)) != 0 ||
+        n_block <= 0) {
+        vm_error("%s: invalid split-image manifest\n", filename);
+        exit(1);
+    }
+
+    bs = mallocz(sizeof(*bs));
+    bf = mallocz(sizeof(*bf));
+    bf->mode = mode;
+    bf->block_size = block_size;
+    bf->n_block = n_block;
+    bf->nb_sectors = (int64_t)block_size * n_block;
+    bf->cur_f = NULL;
+    bf->cur_block = -1;
+
+    /* directory prefix of the manifest (handles both separators) */
+    sep = -1;
+    for(p = filename; *p; p++) {
+        if (*p == '/' || *p == '\\')
+            sep = p - filename;
+    }
+    bf->dir = mallocz(sep + 2);
+    if (sep >= 0)
+        memcpy(bf->dir, filename, sep + 1); /* keep trailing separator */
+
+    if (mode == BF_MODE_SNAPSHOT)
+        bf->sector_table = mallocz(sizeof(bf->sector_table[0]) *
+                                   bf->nb_sectors);
+
+    bs->opaque = bf;
+    bs->get_sector_count = bs_split_get_sector_count;
+    bs->read_async = bs_split_read_async;
+    bs->write_async = bs_split_write_async;
     return bs;
 }
 
@@ -915,7 +1147,11 @@ int main(int argc, char **argv)
         } else
 #endif
         {
-            drive = block_device_init(fname, drive_mode);
+            /* recognise a splitimg chunk manifest (e.g. blk.txt); fall back to
+               a raw image otherwise */
+            drive = block_device_init_split(fname, drive_mode);
+            if (!drive)
+                drive = block_device_init(fname, drive_mode);
         }
         free(fname);
         p->tab_drive[i].block_dev = drive;

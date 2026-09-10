@@ -24,9 +24,18 @@
 
 # Build the Javascript version of TinyEMU
 EMCC=emcc
-EMCFLAGS=-O2 -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD -fno-strict-aliasing -DCONFIG_FS_NET
+# -O3 -flto to match Makefile.js: the interpreter's hot path crosses translation
+# units (riscv_cpu.c -> iomem.h / cutils), so cross-TU inlining of the memory
+# accessors is worth more than the code-size cost. Must be passed at compile and
+# link time.
+#
+# The wasm feature flags used by Makefile.js (-mbulk-memory,
+# -mnontrapping-fptoint) are deliberately NOT set here: the same objects feed
+# both the wasm and the wasm2js (-s WASM=0) outputs below, and features must be
+# selected at compile time. Drop the asm.js targets first if those are wanted.
+EMCFLAGS=-O3 -flto -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD -fno-strict-aliasing -DCONFIG_FS_NET
 #EMCFLAGS+=-Werror
-EMLDFLAGS=-O3 -sASSERTIONS --memory-init-file 0 --closure 0 -s NO_EXIT_RUNTIME=1 -s NO_FILESYSTEM=1 -s "EXPORTED_FUNCTIONS=['_console_queue_char','_vm_start','_fs_import_file','_display_key_event','_display_mouse_event','_display_wheel_event','_net_write_packet','_net_set_carrier','_free','_malloc']" -s 'EXPORTED_RUNTIME_METHODS=["ccall", "cwrap"]' --js-library js/lib.js
+EMLDFLAGS=-O3 -flto -sASSERTIONS --memory-init-file 0 --closure 0 -s NO_EXIT_RUNTIME=1 -s NO_FILESYSTEM=1 -s "EXPORTED_FUNCTIONS=['_console_queue_char','_vm_start','_fs_import_file','_display_key_event','_display_mouse_event','_display_wheel_event','_net_write_packet','_net_set_carrier','_free','_malloc']" -s 'EXPORTED_RUNTIME_METHODS=["ccall", "cwrap"]' --js-library js/lib.js
 EMLDFLAGS_ASMJS:=$(EMLDFLAGS) -s WASM=0
 EMLDFLAGS_WASM:=$(EMLDFLAGS) -s WASM=1 -s TOTAL_MEMORY=67108864 -s ALLOW_MEMORY_GROWTH=1
 

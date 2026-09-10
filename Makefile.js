@@ -12,10 +12,35 @@ EMCC = emcc
 LIBJS = web/js/lib.js
 OUTDIR = web/js
 
-EMCFLAGS = -O2 -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD \
-           -fno-strict-aliasing -DCONFIG_FS_NET -DCONFIG_X86EMU
+# -O3 + LTO: the interpreter's hot path spans translation units (x86_cpu.c ->
+# iomem.h / cutils), so cross-TU inlining of the memory accessors matters more
+# here than the small code-size cost.
+#
+# -sSUPPORT_LONGJMP=wasm: x86_cpu_interp() calls setjmp() and faults unwind via
+# longjmp(). Emscripten's default (=emscripten) rewrites every non-inlined call
+# inside a setjmp-containing function into an indirect call through a JS
+# `invoke_*` trampoline with try/catch -- i.e. the whole interpreter hot loop
+# round-trips through JavaScript. The wasm variant uses native Wasm exception
+# handling and stays inside the module. Must be passed at compile *and* link
+# time. Needs a browser with Wasm EH: Chrome 95+, Safari 15.4+, Firefox 131+.
+#
+# -mbulk-memory: gives memory.copy/memory.fill instead of a called-out loop,
+# which is what the `rep movs`/`rep stos` bulk path (string_bulk) and the
+# device DMA paths spend their time in.
+# -mnontrapping-fptoint: without it every float->int conversion (x87 fistp/fisttp,
+# and the RISC-V fcvt family) lowers to a guarded helper sequence instead of a
+# single instruction.
+# Both are older wasm features than the Wasm EH required by -sSUPPORT_LONGJMP=wasm
+# below, so they do not narrow the set of supported browsers. Features are
+# selected at compile time, so they must be on EMCFLAGS, not just at link.
+EMCFLAGS = -O3 -flto -Wall -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD \
+           -fno-strict-aliasing -sSUPPORT_LONGJMP=wasm \
+           -mbulk-memory -mnontrapping-fptoint \
+           -DCONFIG_FS_NET -DCONFIG_X86EMU
 
-EMLDFLAGS = -O3 --no-entry \
+EMLDFLAGS = -O3 -flto --no-entry \
+  -sSUPPORT_LONGJMP=wasm \
+  -mbulk-memory -mnontrapping-fptoint \
   -s NO_EXIT_RUNTIME=1 \
   -s NO_FILESYSTEM=1 \
   -s WASM=1 \
