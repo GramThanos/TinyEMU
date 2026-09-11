@@ -735,6 +735,20 @@ static no_inline uint8_t fetch8(X86CPUState *s)
     }
     return fetch8_slow(s);
 }
+/* Inlined twin of fetch8's fast path, for the two byte fetches every
+ * instruction pays: the opcode byte in the interp loop and the ModR/M byte in
+ * decode_modrm. fetch8 is deliberately noinline to keep its ~50 immediate call
+ * sites from each pasting the fast path, but those two sites run once per
+ * instruction, so folding the window-hit case inline there removes a call/ret
+ * from the hottest path. The window-miss case defers to the out-of-line fetch8. */
+static inline uint8_t fetch8_fast(X86CPUState *s)
+{
+    if (likely(s->fetch_ptr < s->fetch_end)) {
+        s->eip++;
+        return *s->fetch_ptr++;
+    }
+    return fetch8(s);
+}
 /* The byte-at-a-time fallbacks are kept out of line on purpose. They only run
  * for an instruction that straddles a page boundary or whose page is not
  * cached, but inlining them would paste fetch8's own fast path two or four
@@ -1056,7 +1070,7 @@ static void decode_modrm(X86CPUState *s, uint8_t m, int seg_override,
     }
 
     if (rmf == 4) { /* SIB */
-        uint8_t sib = fetch8(s);
+        uint8_t sib = fetch8_fast(s);
         int scale = sib >> 6, index = (sib >> 3) & 7, base = sib & 7;
         if (index != 4)
             ea += s->regs[index] << scale;
@@ -1074,7 +1088,7 @@ static void decode_modrm(X86CPUState *s, uint8_t m, int seg_override,
         if (rmf == 5) def_seg = X86_CPU_SEG_SS; /* [ebp] */
     }
 
-    if (mod == 1) ea += (int32_t)(int8_t)fetch8(s);
+    if (mod == 1) ea += (int32_t)(int8_t)fetch8_fast(s);
     else if (mod == 2) ea += fetch32(s);
 
     rm->ea = ea;
@@ -2355,7 +2369,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
          * a table lookup the branch predictor keeps not-taken -- one array read
          * replaces the ~8 compares every prefix-free instruction used to walk
          * before falling out of the old `for(;;) ... else break;`. */
-        b = fetch8(s);
+        b = fetch8_fast(s);
         while (unlikely(x86_is_prefix[b])) {
 #ifdef X86_OPHIST
             if (b == 0x66) pfx66 = 1;
@@ -2430,31 +2444,31 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             uint32_t a, v, r;
             switch (form) {
             case 0: { /* r/m8, r8 */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 a = rm_read(s, &rm, 1); v = get_reg8(s, reg);
                 r = alu(s, aluop, a, v, 1);
                 if (aluop != 7) rm_write(s, &rm, r, 1);
             } break;
             case 1: { /* r/m, r */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 a = rm_read(s, &rm, op_size); v = get_regv(s, reg, op_size);
                 r = alu(s, aluop, a, v, op_size);
                 if (aluop != 7) rm_write(s, &rm, r, op_size);
             } break;
             case 2: { /* r8, r/m8 */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 a = get_reg8(s, reg); v = rm_read(s, &rm, 1);
                 r = alu(s, aluop, a, v, 1);
                 if (aluop != 7) set_reg8(s, reg, r);
             } break;
             case 3: { /* r, r/m */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 a = get_regv(s, reg, op_size); v = rm_read(s, &rm, op_size);
                 r = alu(s, aluop, a, v, op_size);
                 if (aluop != 7) set_regv(s, reg, r, op_size);
             } break;
             case 4: { /* AL, imm8 */
-                a = get_reg8(s, REG_EAX); v = (uint8_t)fetch8(s);
+                a = get_reg8(s, REG_EAX); v = (uint8_t)fetch8_fast(s);
                 r = alu(s, aluop, a, v, 1);
                 if (aluop != 7) set_reg8(s, REG_EAX, r);
             } break;
@@ -2490,46 +2504,46 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             set_regv(s, b & 7, pop_val(s, op_size), op_size);
             break;
         case 0x68: push_val(s, fetch_imm(s, op_size), op_size); break; /* push imm32 */
-        case 0x6a: push_val(s, (int32_t)(int8_t)fetch8(s), op_size); break; /* push imm8 */
+        case 0x6a: push_val(s, (int32_t)(int8_t)fetch8_fast(s), op_size); break; /* push imm8 */
 
         case 0x80: case 0x82: { /* group1 r/m8, imm8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
-            uint32_t a = rm_read(s, &rm, 1), v = (uint8_t)fetch8(s);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, 1), v = (uint8_t)fetch8_fast(s);
             uint32_t r = alu(s, reg, a, v, 1);
             if (reg != 7) rm_write(s, &rm, r, 1);
         } break;
         case 0x81: { /* group1 r/m, imm */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t a = rm_read(s, &rm, op_size), v = fetch_imm(s, op_size);
             uint32_t r = alu(s, reg, a, v, op_size);
             if (reg != 7) rm_write(s, &rm, r, op_size);
         } break;
         case 0x83: { /* group1 r/m, imm8 (sign-extended) */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t a = rm_read(s, &rm, op_size);
-            uint32_t v = (uint32_t)(int32_t)(int8_t)fetch8(s);
+            uint32_t v = (uint32_t)(int32_t)(int8_t)fetch8_fast(s);
             uint32_t r = alu(s, reg, a, v, op_size);
             if (reg != 7) rm_write(s, &rm, r, op_size);
         } break;
 
         case 0x88: { /* mov r/m8, r8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             rm_write(s, &rm, get_reg8(s, reg), 1);
         } break;
         case 0x89: { /* mov r/m, r */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             rm_write(s, &rm, get_regv(s, reg, op_size), op_size);
         } break;
         case 0x8a: { /* mov r8, r/m8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             set_reg8(s, reg, rm_read(s, &rm, 1));
         } break;
         case 0x8b: { /* mov r, r/m */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             set_regv(s, reg, rm_read(s, &rm, op_size), op_size);
         } break;
         case 0x8d: { /* lea r, m */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             if (rm.is_reg) { x86_stop(s, "lea with register operand"); break; }
             /* The effective address is the segment *offset*: decode_modrm may have
              * formed rm.addr with the SS base ([esp+n] / [ebp+n]), so subtracting
@@ -2539,25 +2553,25 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
 
         case 0xb0: case 0xb1: case 0xb2: case 0xb3:
         case 0xb4: case 0xb5: case 0xb6: case 0xb7: /* mov r8, imm8 */
-            set_reg8(s, b & 7, (uint8_t)fetch8(s));
+            set_reg8(s, b & 7, (uint8_t)fetch8_fast(s));
             break;
         case 0xb8: case 0xb9: case 0xba: case 0xbb:
         case 0xbc: case 0xbd: case 0xbe: case 0xbf: /* mov r, imm */
             set_regv(s, b & 7, fetch_imm(s, op_size), op_size);
             break;
         case 0xc6: { /* mov r/m8, imm8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
-            rm_write(s, &rm, (uint8_t)fetch8(s), 1);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            rm_write(s, &rm, (uint8_t)fetch8_fast(s), 1);
         } break;
         case 0xc7: { /* mov r/m, imm */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             rm_write(s, &rm, fetch_imm(s, op_size), op_size);
         } break;
 
         case 0x90: /* nop */ break;
 
         case 0xeb: { /* jmp rel8 */
-            int32_t d = (int8_t)fetch8(s); jmp_rel(s, d, op_size);
+            int32_t d = (int8_t)fetch8_fast(s); jmp_rel(s, d, op_size);
         } break;
         case 0xe9: { /* jmp rel */
             int32_t d = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
@@ -2567,11 +2581,11 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         case 0x74: case 0x75: case 0x76: case 0x77:
         case 0x78: case 0x79: case 0x7a: case 0x7b:
         case 0x7c: case 0x7d: case 0x7e: case 0x7f: { /* Jcc rel8 */
-            int32_t d = (int8_t)fetch8(s);
+            int32_t d = (int8_t)fetch8_fast(s);
             if (test_cc(s, b & 0xf)) jmp_rel(s, d, op_size);
         } break;
         case 0x0f: { /* two-byte */
-            uint8_t b2 = fetch8(s);
+            uint8_t b2 = fetch8_fast(s);
 #ifdef X86_OPHIST
             { int pc = (rep == 1) ? 2 : (rep == 2) ? 3 : (pfx66 ? 1 : 0);
               g_op0f[pc][b2]++; }
@@ -2580,10 +2594,10 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 int32_t d = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
                 if (test_cc(s, b2 & 0xf)) jmp_rel(s, d, op_size);
             } else if (b2 >= 0x90 && b2 <= 0x9f) { /* setcc r/m8 */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 rm_write(s, &rm, test_cc(s, b2 & 0xf) ? 1 : 0, 1);
             } else if (b2 == 0x02 || b2 == 0x03) { /* lar / lsl r, r/m16 */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint16_t sel = (uint16_t)rm_read(s, &rm, 2);
                 uint32_t out = 0;
                 flags_sync(s);
@@ -2594,18 +2608,18 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                     s->eflags_ &= ~EFL_ZF;
                 }
             } else if (b2 == 0xb2 || b2 == 0xb4 || b2 == 0xb5) { /* lss/lfs/lgs */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 int seg = (b2 == 0xb2) ? X86_CPU_SEG_SS
                         : (b2 == 0xb4) ? X86_CPU_SEG_FS : X86_CPU_SEG_GS;
                 if (rm.is_reg) { raise_fault(s, EXC_UD); break; }
                 load_far_ptr(s, seg, reg, rm.addr, op_size);
             } else if (b2 == 0xb6 || b2 == 0xb7) { /* movzx r, r/m8|16 */
                 int ssz = (b2 == 0xb6) ? 1 : 2;
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 set_regv(s, reg, rm_read(s, &rm, ssz), op_size);
             } else if (b2 == 0xbe || b2 == 0xbf) { /* movsx r, r/m8|16 */
                 int ssz = (b2 == 0xbe) ? 1 : 2;
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t v = rm_read(s, &rm, ssz);
                 int32_t sv = (ssz == 1) ? (int8_t)v : (int16_t)v;
                 set_regv(s, reg, (uint32_t)sv, op_size);
@@ -2628,7 +2642,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 }
                 tlb_flush_on_cr_change(s, o0, o4);
             } else if (b2 == 0xaf) { /* imul r, r/m */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 int64_t a = (op_size == 2) ? (int16_t)get_regv(s, reg, 2) : (int32_t)get_regv(s, reg, 4);
                 int64_t c = (op_size == 2) ? (int16_t)rm_read(s, &rm, 2) : (int32_t)rm_read(s, &rm, 4);
                 int64_t r = a * c;
@@ -2638,7 +2652,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 if ((op_size == 2 && r != (int16_t)r) || (op_size == 4 && r != (int32_t)r))
                     s->eflags_ |= EFL_CF | EFL_OF;
             } else if (b2 == 0x01) { /* group7: [ls]gdt/[ls]idt/[ls]msw/invlpg */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 switch (reg) {
                 case 0: st_lin(s, rm.addr, s->seg[X86_CPU_SEG_GDT].limit, 2);
                         st_lin(s, rm.addr + 2, s->seg[X86_CPU_SEG_GDT].base, 4); break; /* sgdt */
@@ -2656,7 +2670,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 default: x86_stop(s, "0F 01 /%d", reg); break;
                 }
             } else if (b2 == 0x00) { /* group6: [ls]ldt / [ls]tr */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 switch (reg) {
                 case 0: rm_write(s, &rm, s->seg[X86_CPU_SEG_LDT].sel, 2); break; /* sldt */
                 case 1: rm_write(s, &rm, s->seg[X86_CPU_SEG_TR].sel, 2); break;  /* str  */
@@ -2756,11 +2770,11 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 s->regs[REG_ESP] = s->regs[REG_ECX];
                 s->eip = s->regs[REG_EDX];
             } else if (b2 >= 0x40 && b2 <= 0x4f) { /* cmovcc */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t v = rm_read(s, &rm, op_size);
                 if (test_cc(s, b2 & 0xf)) set_regv(s, reg, v, op_size);
             } else if (b2 == 0xbc || b2 == 0xbd) { /* bsf / bsr */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t mask = (op_size == 2) ? 0xffff : 0xffffffffu;
                 uint32_t v = rm_read(s, &rm, op_size) & mask;
                 flags_sync(s);
@@ -2774,7 +2788,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 }
             } else if (b2 == 0xa3 || b2 == 0xab || b2 == 0xb3 || b2 == 0xbb || b2 == 0xba) {
                 /* bt / bts / btr / btc  (reg form, and 0F BA imm form) */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 int kind, bit;
                 /* The immediate form takes the offset modulo the operand size
                  * (even for a memory bit base); only the register-offset form
@@ -2806,7 +2820,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             } else if (b2 == 0xa4 || b2 == 0xa5 || b2 == 0xac || b2 == 0xad) {
                 /* shld / shrd */
                 int is_shld = (b2 == 0xa4 || b2 == 0xa5);
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t dst = rm_read(s, &rm, op_size), src = get_regv(s, reg, op_size);
                 int cnt = (b2 == 0xa4 || b2 == 0xac) ? (uint8_t)fetch8(s) : get_reg8(s, REG_ECX);
                 int bits = op_size * 8;
@@ -2836,7 +2850,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 }
             } else if (b2 == 0xc0 || b2 == 0xc1) { /* xadd */
                 int sz = (b2 == 0xc0) ? 1 : op_size;
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t d = rm_read(s, &rm, sz);
                 uint32_t sr = (sz == 1) ? get_reg8(s, reg) : get_regv(s, reg, sz);
                 uint32_t sum = alu(s, 0, d, sr, sz);
@@ -2849,7 +2863,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 if (sz == 1) set_reg8(s, reg, d); else set_regv(s, reg, d, sz);
             } else if (b2 == 0xb0 || b2 == 0xb1) { /* cmpxchg */
                 int sz = (b2 == 0xb0) ? 1 : op_size;
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t mask = (sz == 1) ? 0xff : (sz == 2) ? 0xffff : 0xffffffffu;
                 uint32_t d = rm_read(s, &rm, sz), acc = get_regv(s, REG_EAX, sz) & mask;
                 (void)alu(s, 7, acc, d, sz);
@@ -2860,7 +2874,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                     set_regv(s, REG_EAX, d, sz);
                 }
             } else if (b2 == 0xc7) { /* cmpxchg8b m64 */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
                 uint32_t lo = ld_lin(s, rm.addr, 4), hi = ld_lin(s, rm.addr + 4, 4);
                 if (lo == s->regs[REG_EAX] && hi == s->regs[REG_EDX]) {
                     /* Two separate stores: probe both dwords writable first, or a
@@ -2898,18 +2912,18 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             } else if (b2 == 0xa8) { push_val(s, s->seg[X86_CPU_SEG_GS].sel, op_size);
             } else if (b2 == 0xa9) { pop_seg(s, X86_CPU_SEG_GS, op_size);
             } else if (b2 == 0x0d || (b2 >= 0x18 && b2 <= 0x1f)) { /* hint nops */
-                uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             } else {
                 x86_stop(s, "unimplemented opcode 0F %02x", b2);
             }
         } break;
 
         case 0x84: { /* test r/m8, r8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             (void)alu(s, 4, rm_read(s, &rm, 1), get_reg8(s, reg), 1);
         } break;
         case 0x85: { /* test r/m, r */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             (void)alu(s, 4, rm_read(s, &rm, op_size), get_regv(s, reg, op_size), op_size);
         } break;
         case 0xa8: /* test al, imm8 */
@@ -2920,12 +2934,12 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             break;
 
         case 0x86: { /* xchg r/m8, r8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t a = rm_read(s, &rm, 1), b2 = get_reg8(s, reg);
             rm_write(s, &rm, b2, 1); set_reg8(s, reg, a);
         } break;
         case 0x87: { /* xchg r/m, r */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t a = rm_read(s, &rm, op_size), b2 = get_regv(s, reg, op_size);
             rm_write(s, &rm, b2, op_size); set_regv(s, reg, a, op_size);
         } break;
@@ -2937,21 +2951,21 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         } break;
 
         case 0x8c: { /* mov r/m, Sreg */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             /* reg 6/7 would index seg[6]/seg[7] = LDT/TR, which are not segment
              * registers: the encoding is #UD, not a silent alias. */
             if (reg > 5) raise_fault(s, EXC_UD);
             rm_write(s, &rm, s->seg[reg].sel, 2);
         } break;
         case 0x8e: { /* mov Sreg, r/m16 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             /* CS cannot be loaded this way (#UD); 6/7 are not segment registers. */
             if (reg == X86_CPU_SEG_CS || reg > 5) raise_fault(s, EXC_UD);
             load_seg(s, reg, (uint16_t)rm_read(s, &rm, 2));
             if (reg == X86_CPU_SEG_SS) s->int_shadow = 1;
         } break;
         case 0xc4: case 0xc5: { /* les / lds r, m16:off */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             if (rm.is_reg) { raise_fault(s, EXC_UD); break; }
             load_far_ptr(s, (b == 0xc4) ? X86_CPU_SEG_ES : X86_CPU_SEG_DS,
                          reg, rm.addr, op_size);
@@ -3000,25 +3014,25 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
 
         case 0xc0: case 0xc1: { /* group2 r/m, imm8 */
             int sz = (b == 0xc0) ? 1 : op_size;
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
-            uint32_t v = rm_read(s, &rm, sz); int cnt = (uint8_t)fetch8(s);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t v = rm_read(s, &rm, sz); int cnt = (uint8_t)fetch8_fast(s);
             rm_write(s, &rm, do_shift(s, reg, v, cnt, sz), sz);
         } break;
         case 0xd0: case 0xd1: { /* group2 r/m, 1 */
             int sz = (b == 0xd0) ? 1 : op_size;
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             rm_write(s, &rm, do_shift(s, reg, rm_read(s, &rm, sz), 1, sz), sz);
         } break;
         case 0xd2: case 0xd3: { /* group2 r/m, CL */
             int sz = (b == 0xd2) ? 1 : op_size;
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             int cnt = get_reg8(s, REG_ECX);
             rm_write(s, &rm, do_shift(s, reg, rm_read(s, &rm, sz), cnt, sz), sz);
         } break;
 
         case 0xf6: case 0xf7: { /* group3 */
             int sz = (b == 0xf6) ? 1 : op_size;
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t a = rm_read(s, &rm, sz);
             switch (reg) {
             case 0: case 1: /* test r/m, imm */
@@ -3127,12 +3141,12 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         } break;
 
         case 0xfe: { /* group4: inc/dec r/m8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t a = rm_read(s, &rm, 1);
             rm_write(s, &rm, alu_incdec(s, reg != 0, a, 1), 1);
         } break;
         case 0xff: { /* group5 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             switch (reg) {
             case 0: case 1: { /* inc/dec r/m */
                 uint32_t a = rm_read(s, &rm, op_size);
@@ -3173,7 +3187,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         } break;
 
         case 0x69: { /* imul r, r/m, imm */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             int64_t src = (op_size == 2) ? (int16_t)rm_read(s, &rm, 2) : (int32_t)rm_read(s, &rm, 4);
             int64_t imm = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
             int64_t r = src * imm;
@@ -3184,7 +3198,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 s->eflags_ |= EFL_CF | EFL_OF;
         } break;
         case 0x6b: { /* imul r, r/m, imm8 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             int64_t src = (op_size == 2) ? (int16_t)rm_read(s, &rm, 2) : (int32_t)rm_read(s, &rm, 4);
             int64_t imm = (int8_t)fetch8(s);
             int64_t r = src * imm;
@@ -3334,7 +3348,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
 
         case 0x62: { /* bound r, m16&16 / m32&32 */
             int32_t idx, lo, hi;
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             if (rm.is_reg) raise_fault(s, EXC_UD);
             if (op_size == 2) {
                 idx = (int16_t)get_regv(s, reg, 2);
@@ -3349,7 +3363,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                 raise_fault(s, EXC_BR);
         } break;
         case 0x63: { /* arpl r/m16, r16 */
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t d = rm_read(s, &rm, 2), sr = get_regv(s, reg, 2);
             if ((d & 3) < (sr & 3)) {
                 rm_write(s, &rm, (d & ~3u) | (sr & 3), 2);
@@ -3509,7 +3523,7 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                         ESP is incremented, so pop the value first (e.g. the
                         `pushf; pop [esp]` local_irq_save idiom depends on this). */
             uint32_t osp = s->regs[REG_ESP];
-            uint8_t m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             uint32_t v;
             /* Per Intel, an ESP-based destination address is formed from the
              * already-incremented ESP; add the delta rather than mutating ESP,
