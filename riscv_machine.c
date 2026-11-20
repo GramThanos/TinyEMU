@@ -79,12 +79,11 @@ typedef struct RISCVMachine {
 #define RTC_FREQ_DIV 16 /* arbitrary, relative to CPU freq to have a
                            10 MHz frequency */
 
+/* host_clock_ns(), not clock_gettime(): restoring a browser snapshot shifts that
+ * clock, so the guest's mtime carries on from the snapshot (see machine.c). */
 static uint64_t rtc_get_real_time(RISCVMachine *s)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * RTC_FREQ +
-        (ts.tv_nsec / (1000000000 / RTC_FREQ));
+    return (uint64_t)host_clock_ns() / (1000000000 / RTC_FREQ);
 }
 
 static uint64_t rtc_get_time(RISCVMachine *m)
@@ -623,9 +622,15 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     misa = riscv_cpu_get_misa(m->cpu_state);
     q = isa_string;
     q += snprintf(isa_string, sizeof(isa_string), "rv%d", max_xlen);
-    for(i = 0; i < 26; i++) {
-        if (misa & (1 << i))
-            *q++ = 'a' + i;
+    /* Canonical order (IMAFDQC), not misa's bit order, and without the 's'
+     * and 'u' privilege bits, which are not ISA extensions: Linux 6.x refuses
+     * a hart whose string does not start with "rv64ima" / "rv32ima". */
+    {
+        static const char order[] = "imafdqc";
+        for(i = 0; order[i] != '\0'; i++) {
+            if (misa & (1 << (order[i] - 'a')))
+                *q++ = order[i];
+        }
     }
     *q = '\0';
     fdt_prop_str(s, "riscv,isa", isa_string);
@@ -652,11 +657,37 @@ static int riscv_build_fdt(RISCVMachine *m, uint8_t *dst,
     tab[2] = m->ram_size >> 32;
     tab[3] = m->ram_size;
     fdt_prop_tab_u32(s, "reg", tab, 4);
-    
+
     fdt_end_node(s); /* memory */
+
+    /* The firmware (bios) lives at the start of RAM, below the kernel. Linux
+     * 6.x uses all of RAM, the part below its own image included, unless the
+     * device tree reserves it. OpenSBI only adds that reservation when the hart
+     * has PMP, which this CPU lacks, so without this node Linux hands
+     * OpenSBI's pages out and the next trap into the firmware runs garbage. */
+    if (kernel_size > 0 && kernel_start > RAM_BASE_ADDR) {
+        fdt_begin_node(s, "reserved-memory");
+        fdt_prop_u32(s, "#address-cells", 2);
+        fdt_prop_u32(s, "#size-cells", 2);
+        fdt_prop(s, "ranges", NULL, 0);
+        fdt_begin_node_num(s, "firmware", RAM_BASE_ADDR);
+        fdt_prop_tab_u64_2(s, "reg", RAM_BASE_ADDR, kernel_start - RAM_BASE_ADDR);
+        fdt_prop(s, "no-map", NULL, 0);
+        fdt_end_node(s); /* firmware */
+        fdt_end_node(s); /* reserved-memory */
+    }
 
     fdt_begin_node(s, "htif");
     fdt_prop_str(s, "compatible", "ucb,htif0");
+    /* fromhost, then tohost, as OpenSBI's HTIF driver reads them. Without
+     * this, OpenSBI uses tohost/fromhost words in its own image, which nothing
+     * answers, and its second console write spins forever. */
+    {
+        uint64_t fromhost = HTIF_BASE_ADDR + 8, tohost = HTIF_BASE_ADDR;
+        uint32_t reg[8] = { fromhost >> 32, fromhost, 0, 8,
+                            tohost >> 32, tohost, 0, 8 };
+        fdt_prop_tab_u32(s, "reg", reg, 8);
+    }
     fdt_end_node(s); /* htif */
 
     fdt_begin_node(s, "soc");
@@ -1017,6 +1048,12 @@ static void riscv_machine_interp(VirtMachine *s1, int max_exec_cycle)
     riscv_cpu_interp(s->cpu_state, max_exec_cycle);
 }
 
+static int64_t riscv_machine_get_cycles(VirtMachine *s1)
+{
+    RISCVMachine *s = (RISCVMachine *)s1;
+    return (int64_t)riscv_cpu_get_cycles(s->cpu_state);
+}
+
 static void riscv_vm_send_key_event(VirtMachine *s1, BOOL is_down,
                                     uint16_t key_code)
 {
@@ -1050,4 +1087,5 @@ const VirtMachineClass riscv_machine_class = {
     riscv_vm_mouse_is_absolute,
     riscv_vm_send_mouse_event,
     riscv_vm_send_key_event,
+    riscv_machine_get_cycles,
 };

@@ -6,3 +6,9 @@
 /dist
 
 /x86-docs
+
+# Phase-2 boot-validation scratch (large generated guest images; regenerate via
+# the distro pipeline in ../TinyEMU-distros). Not committed.
+/_bootcheck
+/web/_distro
+/web/agent/.cache

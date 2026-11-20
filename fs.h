@@ -196,6 +196,9 @@ struct FSDevice {
 FSDevice *fs_disk_init(const char *root_path);
 FSDevice *fs_mem_init(void);
 FSDevice *fs_net_init(const char *url, void (*start)(void *opaque), void *opaque);
+#ifdef EMSCRIPTEN
+FSDevice *fs_js_init(const char *name);   /* JS-backed volume; see fs_js.c */
+#endif
 void fs_net_set_pwd(FSDevice *fs, const char *pwd);
 #ifdef EMSCRIPTEN
 void fs_import_file(const char *filename, uint8_t *buf, int buf_len);

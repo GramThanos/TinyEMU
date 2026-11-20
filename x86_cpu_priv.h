@@ -86,6 +86,8 @@ enum {
 #define CR0_WP   0x00010000
 #define CR0_PG   0x80000000
 #define CR4_PAE  0x00000020
+#define CR4_OSFXSR     0x00000200  /* OS saves XMM state; SSE ops enabled */
+#define CR4_OSXMMEXCPT 0x00000400
 
 /* EFER (MSR 0xC0000080). Only NXE (no-execute enable) is modelled: it gates
  * whether the XD/NX bit (bit 63) of a PAE paging entry is enforced. */
@@ -146,6 +148,15 @@ typedef struct {
     uintptr_t mem_addend;   /* host pointer = mem_addend + linear address */
 } X86TLBEntry;
 
+/* One 128-bit XMM register, viewed as lanes of each SSE/SSE2 element type. */
+typedef union {
+    uint8_t  b[16];  int8_t  sb[16];
+    uint16_t w[8];   int16_t sw[8];
+    uint32_t d[4];   int32_t sd[4];
+    uint64_t q[2];   int64_t sq[2];
+    float    f[4];   double  fd[2];
+} X86XMM;
+
 struct X86CPUState {
     /* Architectural state */
     uint32_t regs[X86_NB_REGS];
@@ -171,12 +182,19 @@ struct X86CPUState {
      * translation. Its high half reads back as 0 via RDMSR. */
     uint32_t efer;
 
-    /* x87 FPU (register stack modelled with doubles) */
-    double   fpst[8];        /* physical registers; ST(i) = fpst[(fpu_top+i)&7] */
+    /* x87 FPU (register stack modelled with 80-bit extended = C long double,
+     * which is the native x87 format on x86 hosts; see the x87 section notes) */
+    long double fpst[8];     /* physical registers; ST(i) = fpst[(fpu_top+i)&7] */
     int      fpu_top;        /* 0-7 */
     uint16_t fpu_cw;         /* control word  */
     uint16_t fpu_sw;         /* status word (condition codes; TOP kept separate) */
     uint8_t  fpu_tag[8];     /* per physical reg: 0=valid, 3=empty */
+
+    /* SSE/SSE2 register file. Lanes go through the union in host byte order,
+     * which matches the guest on the little-endian hosts we target (x86,
+     * WASM). MXCSR: RC is honored, exception flags are not accumulated. */
+    X86XMM   xmm[8];
+    uint32_t mxcsr;
 
     /* Execution bookkeeping */
     int64_t  cycle_count;

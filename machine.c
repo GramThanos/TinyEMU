@@ -198,14 +198,8 @@ static BOOL find_name(const char *name, const char *name_list)
 }
 
 static const VirtMachineClass *virt_machine_list[] = {
-#if defined(EMSCRIPTEN)
-    /* only a single machine in the EMSCRIPTEN target */
-#ifndef CONFIG_X86EMU
+    /* The browser engine (Makefile.js) holds both: riscv32/64 and pc. */
     &riscv_machine_class,
-#endif    
-#else
-    &riscv_machine_class,
-#endif /* !EMSCRIPTEN */
 #ifdef CONFIG_X86EMU
     &pc_machine_class,
 #endif
@@ -641,4 +635,19 @@ void virt_machine_set_defaults(VirtMachineParams *p)
 void virt_machine_end(VirtMachine *s)
 {
     s->vmc->virt_machine_end(s);
+}
+
+static int64_t host_clock_offset;
+
+int64_t host_clock_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec + host_clock_offset;
+}
+
+void host_clock_set(int64_t ns)
+{
+    host_clock_offset = 0;
+    host_clock_offset = ns - host_clock_ns();
 }

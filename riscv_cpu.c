@@ -644,8 +644,10 @@ static void glue(riscv_cpu_flush_tlb_write_range_ram,
                       MSTATUS_FS | \
                       MSTATUS_MPRV | MSTATUS_SUM | MSTATUS_MXR)
 
-/* cycle and insn counters */
-#define COUNTEREN_MASK ((1 << 0) | (1 << 2))
+/* cycle, time and insn counters. There is no time CSR here: rdtime traps to
+   M-mode, and OpenSBI emulates it only when mcounteren.TM is set, so the bit
+   must stick even though this CPU never reads it. */
+#define COUNTEREN_MASK ((1 << 0) | (1 << 1) | (1 << 2))
 
 /* return the complete mstatus with the SD bit */
 static target_ulong get_mstatus(RISCVCPUState *s, target_ulong mask)
@@ -837,6 +839,13 @@ static int csr_read(RISCVCPUState *s, target_ulong *pval, uint32_t csr,
         if (s->cur_xlen != 32)
             goto invalid_csr;
         val = s->insn_counter >> 32;
+        break;
+    case 0xf11: /* mvendorid */
+    case 0xf12: /* marchid */
+    case 0xf13: /* mimpid */
+        /* Mandatory, and 0 means "not implemented / non-commercial". OpenSBI
+           reads mvendorid unconditionally. */
+        val = 0;
         break;
     case 0xf14:
         val = s->mhartid;

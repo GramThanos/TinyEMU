@@ -32,6 +32,9 @@ CONFIG_SDL=y
 CONFIG_INT128=y
 # build x86 emulator
 CONFIG_X86EMU=y
+# x86: inflate a gzip bzImage on the host instead of running the kernel's own
+# decompressor on the emulated CPU. `make CONFIG_KERNEL_INFLATE=` turns it off.
+CONFIG_KERNEL_INFLATE=y
 # win32 build (not usable yet)
 #CONFIG_WIN32=y
 # user space network redirector
@@ -82,8 +85,9 @@ all: $(PROGS)
 
 .PHONY: all install clean distclean dist dist-linux-backends dist-windows
 
+# inflate.o: gzip disk chunks (temu.c, block_net.c) and, for x86, kernels
 EMU_OBJS:=virtio.o pci.o fs.o cutils.o iomem.o simplefb.o \
-    json.o machine.o temu.o
+    json.o machine.o temu.o inflate.o
 
 ifdef CONFIG_SLIRP
 CFLAGS+=-DCONFIG_SLIRP
@@ -124,6 +128,9 @@ endif
 ifdef CONFIG_X86EMU
 CFLAGS+=-DCONFIG_X86EMU
 EMU_OBJS+=x86_cpu.o x86_machine.o ide.o ps2.o vmmouse.o pckbd.o vga.o
+ifndef CONFIG_KERNEL_INFLATE
+CFLAGS+=-DX86_NO_KERNEL_INFLATE
+endif
 endif
 
 temu$(EXE): $(EMU_OBJS)
@@ -135,6 +142,18 @@ temu$(EXE): $(EMU_OBJS)
 x86-selftest: tests/x86_cpu_selftest.c x86_cpu.o iomem.o cutils.o
 	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^) -lm
 	./$@
+
+# Deterministic, network-free interpreter microbenchmark (see bench/microbench.c).
+# Times a tight scalar-mix loop straight through x86_cpu_interp -- a reproducible
+# stand-in for the awk boot benchmark, which depends on the flaky remote 9p rootfs.
+# Run e.g. `./microbench 200000000`.
+microbench: bench/microbench.c x86_cpu.o iomem.o cutils.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^) -lm
+
+# gzip decoder (used to load bzImage kernels) against gzip(1) output; see
+# tests/inflate_test.sh.
+inflate-test: tests/inflate_test.c inflate.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^)
 
 dist-linux-backends:
 	mkdir -p $(DIST_LINUX_DIR)

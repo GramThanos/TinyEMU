@@ -58,6 +58,7 @@
 #ifdef CONFIG_FS_NET
 #include "fs_utils.h"
 #include "fs_wget.h"
+#include "inflate.h"
 #endif
 #ifdef CONFIG_SLIRP
 #include "slirp/libslirp.h"
@@ -497,7 +498,46 @@ typedef struct BlockDeviceSplit {
     uint8_t **sector_table; /* write overlay (SNAPSHOT), lazily populated */
     FILE *cur_f;            /* cached open chunk file for reads */
     int cur_block;          /* chunk index of cur_f, -1 if none */
+    BOOL gzip;              /* "compression": "gzip": chunks are blk%09u.bin.gz */
+    uint8_t *gz_buf;        /* the inflated chunk gz_block, for reads */
+    int gz_block;           /* -1 if none */
 } BlockDeviceSplit;
+
+/* gzip chunks: inflate a whole chunk into gz_buf and keep the latest one. A
+   missing chunk reads back as zeroes, as a missing raw chunk does. */
+static const uint8_t *bs_split_gz_chunk(BlockDeviceSplit *bf, int block_num)
+{
+    char filename[1024];
+    size_t block_bytes = (size_t)bf->block_size * SECTOR_SIZE;
+    uint8_t *src;
+    long len;
+    FILE *f;
+
+    if (bf->gz_block == block_num)
+        return bf->gz_buf;
+    if (!bf->gz_buf)
+        bf->gz_buf = malloc(block_bytes);
+    bf->gz_block = -1;
+    memset(bf->gz_buf, 0, block_bytes);
+    snprintf(filename, sizeof(filename), "%sblk%09u.bin.gz", bf->dir, block_num);
+    f = fopen(filename, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        src = malloc(len > 0 ? len : 1);
+        if (len <= 0 || fread(src, 1, len, f) != (size_t)len ||
+            gzip_size(src, len) != (long)block_bytes ||
+            gzip_inflate(bf->gz_buf, block_bytes, src, len) < 0) {
+            vm_error("%s: corrupt compressed chunk\n", filename);
+            exit(1);
+        }
+        free(src);
+        fclose(f);
+    }
+    bf->gz_block = block_num;
+    return bf->gz_buf;
+}
 
 static int64_t bs_split_get_sector_count(BlockDevice *bs)
 {
@@ -537,7 +577,15 @@ static int bs_split_read_async(BlockDevice *bs,
         } else {
             int block_num = sector_num / bf->block_size;
             int offset = sector_num % bf->block_size;
-            FILE *f = bs_split_open_chunk(bf, block_num);
+            FILE *f;
+            if (bf->gzip) {
+                memcpy(buf, bs_split_gz_chunk(bf, block_num) +
+                       (size_t)offset * SECTOR_SIZE, SECTOR_SIZE);
+                sector_num++;
+                buf += SECTOR_SIZE;
+                continue;
+            }
+            f = bs_split_open_chunk(bf, block_num);
             /* a missing or short chunk reads back as zeroes */
             memset(buf, 0, SECTOR_SIZE);
             if (f) {
@@ -616,7 +664,8 @@ static BlockDevice *block_device_init_split(const char *filename,
     char *data;
     const char *p;
     int block_size_kb, n_block, block_size, sep;
-    JSONValue cfg, vbs, vnb;
+    BOOL gzip;
+    JSONValue cfg, vbs, vnb, vcomp;
 
     f = fopen(filename, "rb");
     if (!f)
@@ -662,7 +711,26 @@ static BlockDevice *block_device_init_split(const char *filename,
     }
     block_size_kb = vbs.u.int32;
     n_block = vnb.u.int32;
+    /* optional, as in block_net.c: absent or "none", or "gzip" */
+    vcomp = json_object_get(cfg, "compression");
+    gzip = FALSE;
+    if (!json_is_undefined(vcomp)) {
+        const char *name = json_get_str(vcomp);
+        if (name && !strcmp(name, "gzip")) {
+            gzip = TRUE;
+        } else if (!name || strcmp(name, "none") != 0) {
+            vm_error("%s: unsupported compression\n", filename);
+            exit(1);
+        }
+    }
     json_free(cfg);
+    /* writes go back into the chunk files, which can't be done in place
+       for gzip ones */
+    if (gzip && mode == BF_MODE_RW) {
+        vm_error("%s: a compressed split image can't be opened read-write; "
+                 "use snapshot mode\n", filename);
+        exit(1);
+    }
 
     block_size = block_size_kb * 2; /* KB -> 512-byte sectors */
     if (block_size_kb <= 0 || (block_size & (block_size - 1)) != 0 ||
@@ -679,6 +747,9 @@ static BlockDevice *block_device_init_split(const char *filename,
     bf->nb_sectors = (int64_t)block_size * n_block;
     bf->cur_f = NULL;
     bf->cur_block = -1;
+    bf->gzip = gzip;
+    bf->gz_buf = NULL;
+    bf->gz_block = -1;
 
     /* directory prefix of the manifest (handles both separators) */
     sep = -1;

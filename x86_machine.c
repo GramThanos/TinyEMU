@@ -41,6 +41,7 @@
 #include "pci.h"
 #include "ide.h"
 #include "ps2.h"
+#include "inflate.h"
 
 /* x86 backend selection provided by build system (USE_KVM, else software CPU) */
 
@@ -180,11 +181,10 @@ CMOSState *cmos_init(PhysMemoryMap *port_map, int addr,
 
 static uint32_t cmos_get_timer(CMOSState *s)
 {
-    struct timespec ts;
+    int64_t t = host_clock_ns();
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint32_t)ts.tv_sec * CMOS_FREQ +
-        ((uint64_t)ts.tv_nsec * CMOS_FREQ / 1000000000);
+    return (uint32_t)(t / 1000000000) * CMOS_FREQ +
+        ((uint64_t)(t % 1000000000) * CMOS_FREQ / 1000000000);
 }
 
 static void cmos_update_timer(CMOSState *s)
@@ -1287,6 +1287,7 @@ typedef struct PCMachine {
     BOOL accel_active;
     
     X86CPUState *cpu_state;
+    uint64_t last_tsc;      /* last value returned by cpu_get_tsc() */
     PIC2State *pic_state;
     IRQSignal pic_irq[16];
     PITState *pit_state;
@@ -1426,11 +1427,10 @@ static int get_hard_intno_cb(void *opaque)
 
 static int64_t pit_get_ticks_cb(void *opaque)
 {
-    struct timespec ts;
+    int64_t t = host_clock_ns();
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * PIT_FREQ +
-        ((uint64_t)ts.tv_nsec * PIT_FREQ / 1000000000);
+    return (uint64_t)(t / 1000000000) * PIT_FREQ +
+        ((uint64_t)(t % 1000000000) * PIT_FREQ / 1000000000);
 }
 
 #define FRAMEBUFFER_BASE_ADDR 0xf0400000
@@ -1930,30 +1930,28 @@ static void kvm_exec(PCMachine *s)
 }
 #endif
 
-#if defined(EMSCRIPTEN)
-/* with Javascript clock_gettime() is not enough precise enough to
-   have a reliable TSC counter. XXX: increment the cycles during the
-   power down time */
-static uint64_t cpu_get_tsc(void *opaque)
-{
-    PCMachine *s = opaque;
-    uint64_t c;
-    c = x86_cpu_get_cycles(s->cpu_state);
-    return c;
-}
-#else
+/* The TSC follows the host clock, like the PIT and CMOS, in both the native
+   and the Emscripten build. Deriving it from the instruction count makes
+   guest time drift: Linux calibrates the TSC against the PIT during an
+   I/O-bound loop (~1.7 MHz of instructions) and then the CPU retires
+   several times more per second (rep string ops count per element), so a
+   5.15 kernel that keeps the TSC as its clocksource ran ~2-5x fast.
+   Browser clocks can be coarse (performance.now() may be clamped to
+   ~100 us), so keep the counter strictly increasing between host ticks. */
 
 #define TSC_FREQ 100000000
 
 static uint64_t cpu_get_tsc(void *opaque)
 {
-    struct timespec ts;
+    PCMachine *s = opaque;
+    uint64_t t;
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * TSC_FREQ +
-        (ts.tv_nsec / (1000000000 / TSC_FREQ));
+    t = (uint64_t)host_clock_ns() / (1000000000 / TSC_FREQ);
+    if (t <= s->last_tsc)
+        t = s->last_tsc + 1;
+    s->last_tsc = t;
+    return t;
 }
-#endif
 
 static void pc_flush_tlb_write_range(void *opaque, uint8_t *ram_addr,
                                      size_t ram_size)
@@ -2356,15 +2354,118 @@ struct  __attribute__ ((packed)) linux_params {
 
 #define KERNEL_PARAMS_ADDR 0x00090000
 
+/* Load the PT_LOAD segments of a 32-bit x86 vmlinux ELF at their physical
+   addresses. Returns its (physical) entry point, or 0, with RAM untouched, if
+   it is not one or does not fit. */
+static uint32_t load_vmlinux(PCMachine *s, const uint8_t *elf, size_t size)
+{
+    uint32_t phoff;
+    int i, phentsize, phnum;
+
+    if (size < 52 || memcmp(elf, "\x7f" "ELF\x01\x01", 6) != 0 ||
+        (elf[18] | (elf[19] << 8)) != 3)   /* EM_386 */
+        return 0;
+    phoff = get_le32(elf + 0x1c);
+    phentsize = elf[0x2a] | (elf[0x2b] << 8);
+    phnum = elf[0x2c] | (elf[0x2d] << 8);
+    if (phentsize < 32 || (uint64_t)phoff + (uint64_t)phnum * phentsize > size)
+        return 0;
+    /* check every segment before writing any */
+    for (i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + i * phentsize;
+        uint32_t off = get_le32(ph + 4), paddr = get_le32(ph + 12);
+        uint32_t filesz = get_le32(ph + 16), memsz = get_le32(ph + 20);
+        if (get_le32(ph) != 1)   /* PT_LOAD */
+            continue;
+        if (filesz > memsz || (uint64_t)off + filesz > size ||
+            paddr < 0x100000 || (uint64_t)paddr + memsz > s->ram_size) {
+            fprintf(stderr, "Kernel: ELF segment does not fit in RAM\n");
+            return 0;
+        }
+    }
+    for (i = 0; i < phnum; i++) {
+        const uint8_t *ph = elf + phoff + i * phentsize;
+        uint32_t off = get_le32(ph + 4), paddr = get_le32(ph + 12);
+        uint32_t filesz = get_le32(ph + 16), memsz = get_le32(ph + 20);
+        uint8_t *dst;
+        if (get_le32(ph) != 1)
+            continue;
+        dst = get_ram_ptr(s, paddr);
+        memcpy(dst, elf + off, filesz);
+        memset(dst + filesz, 0, memsz - filesz);
+    }
+    return get_le32(elf + 0x18);
+}
+
+/* Boot protocol 2.08+ says where the kernel payload is inside the
+   protected-mode code. All the kernel's own decompressor does with it is
+   unpack it and place the vmlinux ELF inside, so do that here instead:
+   - an uncompressed ELF payload is loaded as is;
+   - a gzip one is inflated on the host first (inflating ~17 MB on the
+     emulated CPU took ~35 s of a WASM boot). Building with
+     -DX86_NO_KERNEL_INFLATE leaves gzip to the decompressor.
+   Other compressors (LZ4, XZ, ...) always go through the decompressor.
+   The kernel then starts at its default physical address, so there is nothing
+   to relocate; the one difference is that KASLR never runs, as with nokaslr.
+   Returns the entry point, or 0 to boot through the decompressor instead. */
+static uint32_t load_bzimage_payload(PCMachine *s, const uint8_t *buf,
+                                     int buf_len, int header_len)
+{
+    const uint8_t *payload;
+    uint32_t payload_off, payload_len;
+
+    if ((buf[0x206] | (buf[0x207] << 8)) < 0x208)
+        return 0;
+    payload_off = get_le32(buf + 0x248);
+    payload_len = get_le32(buf + 0x24c);
+    if (payload_off > (uint32_t)(buf_len - header_len) ||
+        payload_len > (uint32_t)(buf_len - header_len) - payload_off)
+        return 0;
+    payload = buf + header_len + payload_off;
+    if (payload_len >= 4 && memcmp(payload, "\x7f" "ELF", 4) == 0)
+        return load_vmlinux(s, payload, payload_len);
+#ifndef X86_NO_KERNEL_INFLATE
+    {
+        long size = gzip_size(payload, payload_len);
+        uint32_t entry = 0;
+        uint8_t *elf;
+
+        if (size < 52 || !(elf = malloc(size)))
+            return 0;
+        if (gzip_inflate(elf, size, payload, payload_len) < 0)
+            fprintf(stderr, "Kernel: corrupt gzip payload\n");
+        else
+            entry = load_vmlinux(s, elf, size);
+        free(elf);
+        return entry;
+    }
+#else
+    return 0;
+#endif
+}
+
 static void copy_kernel(PCMachine *s, const uint8_t *buf, int buf_len,
                         const char *cmd_line)
 {
     uint8_t *ram_ptr;
     int setup_sects, header_len, copy_len, setup_hdr_start, setup_hdr_end;
-    uint32_t load_address;
+    int bare_elf = 0;
+    uint32_t load_address, entry;
     struct linux_params *params;
     FBDevice *fb_dev;
-    
+
+    load_address = 0x100000; /* we don't support older protocols */
+
+    if (buf_len >= 4 && memcmp(buf, "\x7f" "ELF", 4) == 0) {
+        /* a bare vmlinux: no setup header, one is made up below */
+        bare_elf = 1;
+        entry = load_vmlinux(s, buf, buf_len);
+        if (!entry) {
+            fprintf(stderr, "Kernel: unsupported ELF (needs 32-bit x86)\n");
+            exit(1);
+        }
+        goto params;
+    }
     if (buf_len < 1024) {
     too_small:
         fprintf(stderr, "Kernel too small\n");
@@ -2384,25 +2485,37 @@ static void copy_kernel(PCMachine *s, const uint8_t *buf, int buf_len,
         fprintf(stderr, "Kernel too old\n");
         exit(1);
     }
-    load_address = 0x100000; /* we don't support older protocols */
-
-    ram_ptr = get_ram_ptr(s, load_address);
-    copy_len = buf_len - header_len;
-    if (copy_len > (s->ram_size - load_address)) {
-        fprintf(stderr, "Not enough RAM\n");
-        exit(1);
+    entry = load_bzimage_payload(s, buf, buf_len, header_len);
+    if (!entry) {
+        ram_ptr = get_ram_ptr(s, load_address);
+        copy_len = buf_len - header_len;
+        if (copy_len > (s->ram_size - load_address)) {
+            fprintf(stderr, "Not enough RAM\n");
+            exit(1);
+        }
+        memcpy(ram_ptr, buf + header_len, copy_len);
+        entry = load_address;
     }
-    memcpy(ram_ptr, buf + header_len, copy_len);
 
+ params:
     params = (void *)get_ram_ptr(s, KERNEL_PARAMS_ADDR);
-    
+
     memset(params, 0, sizeof(struct linux_params));
 
-    /* copy the setup header */
-    setup_hdr_start = 0x1f1;
-    setup_hdr_end = 0x202 + buf[0x201];
-    memcpy((uint8_t *)params + setup_hdr_start, buf + setup_hdr_start,
-           setup_hdr_end - setup_hdr_start);
+    if (bare_elf) {
+        /* bare vmlinux: the fields of a 2.15 setup header the kernel reads */
+        ((uint8_t *)params)[0x1fe] = 0x55;   /* boot_flag */
+        ((uint8_t *)params)[0x1ff] = 0xaa;
+        memcpy(params->setup_signature, "HdrS", 4);
+        params->header_format_version = 0x020f;
+        params->loadflags = 0x01;   /* LOADED_HIGH */
+    } else {
+        /* copy the setup header */
+        setup_hdr_start = 0x1f1;
+        setup_hdr_end = 0x202 + buf[0x201];
+        memcpy((uint8_t *)params + setup_hdr_start, buf + setup_hdr_start,
+               setup_hdr_end - setup_hdr_start);
+    }
 
     strcpy((char *)params->commandline, cmd_line);
 
@@ -2488,7 +2601,7 @@ static void copy_kernel(PCMachine *s, const uint8_t *buf, int buf_len,
         }
         
         memset(&regs, 0, sizeof(regs));
-        regs.rip = load_address;
+        regs.rip = entry;
         regs.rsi = KERNEL_PARAMS_ADDR;
         regs.rflags = 0x2;
         if (ioctl(s->vcpu_fd, KVM_SET_REGS, &regs) < 0) {
@@ -2521,7 +2634,7 @@ static void copy_kernel(PCMachine *s, const uint8_t *buf, int buf_len,
             }
         }
                         
-        x86_cpu_set_reg(s->cpu_state, X86_CPU_REG_EIP, load_address);
+        x86_cpu_set_reg(s->cpu_state, X86_CPU_REG_EIP, entry);
         x86_cpu_set_reg(s->cpu_state, 6, KERNEL_PARAMS_ADDR); /* esi */
     }
 
@@ -2571,6 +2684,12 @@ static void pc_machine_interp(VirtMachine *s1, int max_exec_cycles)
     x86_cpu_interp(s->cpu_state, max_exec_cycles);
 }
 
+static int64_t pc_machine_get_cycles(VirtMachine *s1)
+{
+    PCMachine *s = (PCMachine *)s1;
+    return s->cpu_state ? x86_cpu_get_cycles(s->cpu_state) : 0;
+}
+
 const VirtMachineClass pc_machine_class = {
     "pc",
     pc_machine_set_defaults,
@@ -2581,4 +2700,5 @@ const VirtMachineClass pc_machine_class = {
     pc_vm_mouse_is_absolute,
     pc_vm_send_mouse_event,
     pc_vm_send_key_event,
+    pc_machine_get_cycles,
 };

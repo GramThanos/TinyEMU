@@ -23,8 +23,10 @@
  *   - system: cpuid, rdtsc, rd/wrmsr, mov cr/dr, clts, in/out
  *   - x87 FPU: loads/stores (m32/m64/m80, int m16/m32/m64, BCD), arithmetic,
  *     compares (incl. fcomi/fucomi), fcmovcc, transcendentals, fsave/frstor
- * NOT MODELLED: MMX/SSE (not advertised via CPUID), 3-level PAE paging, SMM
- * (rsm), and the WASM JIT. Unknown opcodes stop the CPU with a diagnostic.
+ *   - SSE/SSE2 on XMM registers, fxsave/fxrstor, ldmxcsr/stmxcsr, fences
+ * NOT MODELLED: MMX (not advertised via CPUID; its encodings #UD), SSE3+,
+ * SMM (rsm), and the WASM JIT. Unknown one-byte opcodes stop the CPU with a
+ * diagnostic; unknown 0F opcodes raise #UD.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -33,6 +35,7 @@
 #include <inttypes.h>
 #include <assert.h>
 #include <math.h>
+#include <fenv.h>
 
 #include "cutils.h"
 #include "x86_cpu.h"
@@ -942,8 +945,14 @@ static void set_szp(X86CPUState *s, uint32_t r, int size)
 /* ALU op codes 0..7 = add,or,adc,sbb,and,sub,xor,cmp.
  *
  * The hot path: compute the result, stash the operands, return. No flag bit
- * is produced here -- see the deferred-flag comment in x86_cpu_priv.h. */
-static uint32_t alu(X86CPUState *s, int op, uint32_t a, uint32_t b, int size)
+ * is produced here -- see the deferred-flag comment in x86_cpu_priv.h.
+ *
+ * force_inline: this is the single hottest helper (add/sub/cmp dominate the
+ * scalar mix), but at -O2 gcc leaves it out of line, so every ALU instruction
+ * paid a real call/ret. Inlining it at its handful of call sites lets the
+ * size-branch fold and the operands stay in registers; +~6% on an integer/
+ * branch microbenchmark, for ~1KB of code growth. */
+static force_inline uint32_t alu(X86CPUState *s, int op, uint32_t a, uint32_t b, int size)
 {
     uint32_t mask = (size == 1) ? 0xff : (size == 2) ? 0xffff : 0xffffffffu;
     uint32_t r;
@@ -980,8 +989,9 @@ static uint32_t alu(X86CPUState *s, int op, uint32_t a, uint32_t b, int size)
 
 /* inc/dec: an add/sub of 1 that leaves CF alone. Carrying the old CF in the
  * record keeps them on the deferred path instead of forcing a sync to save
- * and restore CF around a plain alu() call. */
-static uint32_t alu_incdec(X86CPUState *s, int dec, uint32_t a, int size)
+ * and restore CF around a plain alu() call. force_inline for the same reason
+ * as alu(): inc/dec are hot loop-counter ops and gcc kept it out of line. */
+static force_inline uint32_t alu_incdec(X86CPUState *s, int dec, uint32_t a, int size)
 {
     uint32_t mask = (size == 1) ? 0xff : (size == 2) ? 0xffff : 0xffffffffu;
     int cf = get_cf(s);
@@ -1131,7 +1141,10 @@ static uint32_t pop_val(X86CPUState *s, int size)
  * word: the overwhelmingly common `cmp` + `jne` then costs one zero-test,
  * with no parity fold and no AF/OF derivation. Every get_*() returns 0 or 1,
  * so the != comparisons below are sound. */
-static int test_cc(X86CPUState *s, int cc)
+/* force_inline: consumed by every jcc/setcc/cmovcc; the conditional branches
+ * are hot and gcc left this out of line. Inlining lets the flag derivation for
+ * the taken condition collapse against the pending-record state. */
+static force_inline int test_cc(X86CPUState *s, int cc)
 {
     int res;
     switch (cc >> 1) {
@@ -1589,19 +1602,27 @@ static void string_op(X86CPUState *s, int op, int size, int seg_override, int re
 }
 
 /* ---- x87 FPU ----------------------------------------------------------- */
-/* Modelled with C doubles on an 8-entry register stack. ST(i) is the logical
- * register i from the top of stack. State save/restore (FSAVE/FRSTOR) marshals
- * to/from the 80-bit extended layout the kernel expects. Precision is reduced
- * to double, which is sufficient to boot and run typical userspace. */
+/* Modelled with C `long double` on an 8-entry register stack. ST(i) is the
+ * logical register i from the top of stack. On the x86/x86-64 hosts this build
+ * targets, `long double` *is* the 80-bit extended format (64-bit significand,
+ * 15-bit exponent), so the register file, arithmetic, and the fld/fstp m80
+ * memory format all carry the full hardware precision -- no reduction to the
+ * 53-bit double significand as before. The control word's rounding-control (RC)
+ * and precision-control (PC) fields are honored: RC by setting the host
+ * rounding mode around each x87 instruction (see fpu_exec), PC by rounding each
+ * basic-arithmetic result's significand to 24/53/64 bits (see fpu_pc_round).
+ * (Where the host maps `long double` to a wider type, e.g. 128-bit on wasm,
+ * results are more precise than hardware rather than less, and the m80 memory
+ * format still round-trips through a true 64-bit significand.) */
 
 #define FPU_C0 0x0100
 #define FPU_C1 0x0200
 #define FPU_C2 0x0400
 #define FPU_C3 0x4000
 
-static double fpu_get(X86CPUState *s, int i) { return s->fpst[(s->fpu_top + i) & 7]; }
-static void   fpu_set(X86CPUState *s, int i, double v) { s->fpst[(s->fpu_top + i) & 7] = v; }
-static void   fpu_push(X86CPUState *s, double v)
+static long double fpu_get(X86CPUState *s, int i) { return s->fpst[(s->fpu_top + i) & 7]; }
+static void   fpu_set(X86CPUState *s, int i, long double v) { s->fpst[(s->fpu_top + i) & 7] = v; }
+static void   fpu_push(X86CPUState *s, long double v)
 {
     s->fpu_top = (s->fpu_top - 1) & 7;
     s->fpst[s->fpu_top] = v;
@@ -1616,9 +1637,9 @@ static void fpu_init(X86CPUState *s)
 {
     int i;
     s->fpu_cw = 0x037f; s->fpu_sw = 0; s->fpu_top = 0;
-    for (i = 0; i < 8; i++) { s->fpst[i] = 0.0; s->fpu_tag[i] = 3; }
+    for (i = 0; i < 8; i++) { s->fpst[i] = 0.0L; s->fpu_tag[i] = 3; }
 }
-static void fpu_setcc(X86CPUState *s, double a, double b)
+static void fpu_setcc(X86CPUState *s, long double a, long double b)
 {
     s->fpu_sw &= ~(FPU_C0 | FPU_C2 | FPU_C3);
     if (isnan(a) || isnan(b)) s->fpu_sw |= FPU_C0 | FPU_C2 | FPU_C3;
@@ -1626,50 +1647,82 @@ static void fpu_setcc(X86CPUState *s, double a, double b)
     else if (a == b) s->fpu_sw |= FPU_C3;
 }
 
-/* IEEE double <-> 80-bit extended */
-static void dbl_to_f80(double d, uint8_t *p)
+/* long double <-> 80-bit extended byte layout (10 bytes: 64-bit significand
+ * with explicit integer bit, then a 15-bit biased exponent + sign). Done via
+ * frexpl/ldexpl so it is exact and host-layout-independent: on a native 80-bit
+ * `long double` it round-trips bit-for-bit; on a wider one the encode rounds the
+ * significand to 64 bits (the format's width) and the decode is exact. */
+static void ld_to_f80(long double x, uint8_t *p)
 {
-    union { double dd; uint64_t u; } u; u.dd = d;
-    uint64_t bits = u.u, frac = bits & 0xfffffffffffffULL, mant;
-    int sign = (bits >> 63) & 1, exp = (bits >> 52) & 0x7ff, e80;
-    if (exp == 0) { mant = 0; e80 = 0; }               /* zero/subnormal -> 0 */
-    else if (exp == 0x7ff) { e80 = 0x7fff; mant = 0x8000000000000000ULL | (frac << 11); }
-    else { e80 = exp - 1023 + 16383; mant = 0x8000000000000000ULL | (frac << 11); }
+    uint64_t mant; uint16_t se; int sign = 0, e80;
+    if (signbit(x)) { sign = 1; x = -x; }
+    if (isnan(x))      { mant = 0xC000000000000000ULL; e80 = 0x7fff; }  /* QNaN */
+    else if (isinf(x)) { mant = 0x8000000000000000ULL; e80 = 0x7fff; }
+    else if (x == 0.0L){ mant = 0; e80 = 0; }
+    else {
+        int e; long double m = frexpl(x, &e);  /* x = m*2^e, m in [0.5,1)   */
+        e80 = e - 1 + 16383;                    /* integer-bit form: m*2 in [1,2) */
+        if (e80 >= 0x7fff) { mant = 0x8000000000000000ULL; e80 = 0x7fff; } /* ovf->inf */
+        else if (e80 <= 0) {                    /* subnormal / underflow      */
+            mant = (uint64_t)ldexpl(m, 64 + e80); /* shift significand down    */
+            e80 = 0;
+        } else {
+            mant = (uint64_t)ldexpl(m, 64);     /* m in [0.5,1) -> [2^63,2^64) */
+        }
+    }
     { int i; for (i = 0; i < 8; i++) p[i] = (mant >> (8 * i)) & 0xff; }
-    { uint16_t se = (sign << 15) | (e80 & 0x7fff); p[8] = se & 0xff; p[9] = se >> 8; }
+    se = ((uint16_t)sign << 15) | (uint16_t)(e80 & 0x7fff);
+    p[8] = se & 0xff; p[9] = se >> 8;
 }
-static double f80_to_dbl(const uint8_t *p)
+static long double f80_to_ld(const uint8_t *p)
 {
     uint64_t mant = 0; int i;
     for (i = 0; i < 8; i++) mant |= (uint64_t)p[i] << (8 * i);
     uint16_t se = p[8] | (p[9] << 8);
-    int sign = (se >> 15) & 1, e80 = se & 0x7fff, exp;
-    union { double dd; uint64_t u; } u;
-    if (e80 == 0) { u.u = (uint64_t)sign << 63; return u.dd; }
-    if (e80 == 0x7fff) { u.u = ((uint64_t)sign << 63) | (0x7ffULL << 52) |
-                               (((mant << 1) >> 12)); return u.dd; }
-    exp = e80 - 16383 + 1023;
-    if (exp <= 0) { u.u = (uint64_t)sign << 63; return u.dd; }
-    if (exp >= 0x7ff) { u.u = ((uint64_t)sign << 63) | (0x7ffULL << 52); return u.dd; }
-    u.u = ((uint64_t)sign << 63) | ((uint64_t)exp << 52) |
-          ((mant & 0x7fffffffffffffffULL) >> 11);
-    return u.dd;
+    int sign = (se >> 15) & 1, e80 = se & 0x7fff;
+    long double x;
+    if (e80 == 0)            /* zero or subnormal: value = mant * 2^(1-16383-63) */
+        x = (mant == 0) ? 0.0L : ldexpl((long double)mant, 1 - 16383 - 63);
+    else if (e80 == 0x7fff)  /* inf / NaN (explicit-int-bit nuance ignored) */
+        x = ((mant << 1) == 0) ? (long double)INFINITY : (long double)NAN;
+    else                     /* normal: value = (mant/2^63) * 2^(e80-16383) */
+        x = ldexpl((long double)mant, e80 - 16383 - 63);
+    return sign ? -x : x;
 }
 
-/* load/store a 32/64-bit float from linear memory */
-static double fpu_ld_mem(X86CPUState *s, uint32_t la, int size)
+/* load/store a 32/64-bit float from linear memory (widened to/narrowed from the
+ * extended register). The narrowing cast honors the host rounding mode, which
+ * fpu_exec has set from the control word's RC field. */
+static long double fpu_ld_mem(X86CPUState *s, uint32_t la, int size)
 {
-    if (size == 4) { union { float f; uint32_t u; } u; u.u = ld_lin(s, la, 4); return u.f; }
+    if (size == 4) { union { float f; uint32_t u; } u; u.u = ld_lin(s, la, 4); return (long double)u.f; }
     { union { double d; uint64_t u; } u;
       u.u = (uint64_t)ld_lin(s, la, 4) | ((uint64_t)ld_lin(s, la + 4, 4) << 32);
-      return u.d; }
+      return (long double)u.d; }
 }
-static void fpu_st_mem(X86CPUState *s, uint32_t la, double v, int size)
+static void fpu_st_mem(X86CPUState *s, uint32_t la, long double v, int size)
 {
     if (size == 4) { union { float f; uint32_t u; } u; u.f = (float)v; st_lin(s, la, u.u, 4); }
-    else { union { double d; uint64_t u; } u; u.d = v;
+    else { union { double d; uint64_t u; } u; u.d = (double)v;
            probe_write(s, la, 8);   /* both dwords must fault before either lands */
            st_lin(s, la, (uint32_t)u.u, 4); st_lin(s, la + 4, (uint32_t)(u.u >> 32), 4); }
+}
+
+/* Precision control: round a basic-arithmetic result's significand to 24-bit
+ * (single) or 53-bit (double) per CW[9:8], keeping the extended exponent range.
+ * PC=11 (64-bit extended, the reset default) is a no-op. rintl honors the host
+ * rounding mode, so RC applies to this rounding step too. */
+static long double fpu_pc_round(X86CPUState *s, long double r)
+{
+    int pc = (s->fpu_cw >> 8) & 3, bits;
+    int e; long double m, scale;
+    if (pc == 0) bits = 24; else if (pc == 2) bits = 53; else return r; /* 64-bit */
+    if (!isfinite(r) || r == 0.0L) return r;
+    m = frexpl(r, &e);                        /* m in [0.5,1)            */
+    scale = ldexpl(1.0L, bits);
+    m = rintl(m * scale) / scale;             /* round significand to `bits` */
+    if (m == 1.0L || m == -1.0L) { m *= 0.5L; e += 1; } /* rounding carried out */
+    return ldexpl(m, e);
 }
 
 /* FSAVE/FRSTOR 32-bit (108-byte) image */
@@ -1685,7 +1738,7 @@ static void fpu_save(X86CPUState *s, uint32_t la)
     for (i = 12; i < 28; i += 4) st_lin(s, la + i, 0, 4);
     for (i = 0; i < 8; i++) {
         int k;
-        dbl_to_f80(s->fpst[(s->fpu_top + i) & 7], buf);
+        ld_to_f80(s->fpst[(s->fpu_top + i) & 7], buf);
         for (k = 0; k < 10; k++) st_lin(s, la + 28 + i * 10 + k, buf[k], 1);
     }
     fpu_init(s); /* FSAVE reinitializes the FPU */
@@ -1701,13 +1754,15 @@ static void fpu_restore(X86CPUState *s, uint32_t la)
     tw = ld_lin(s, la + 8, 2);
     for (i = 0; i < 8; i++) {
         for (k = 0; k < 10; k++) buf[k] = ld_lin(s, la + 28 + i * 10 + k, 1);
-        s->fpst[(s->fpu_top + i) & 7] = f80_to_dbl(buf);
+        s->fpst[(s->fpu_top + i) & 7] = f80_to_ld(buf);
     }
     for (i = 0; i < 8; i++) s->fpu_tag[i] = (tw >> (i * 2)) & 3;
 }
 
-/* Execute an x87 escape opcode (0xD8..0xDF). `b` is the opcode byte. */
-static void fpu_exec(X86CPUState *s, int b, int seg_override)
+/* Execute an x87 escape opcode (0xD8..0xDF). `b` is the opcode byte. Wrapped by
+ * fpu_exec below, which sets the host rounding mode from the control word's RC
+ * field for the duration of the op (and restores it after / on fault). */
+static void fpu_exec_inner(X86CPUState *s, int b, int seg_override)
 {
     uint8_t modrm = fetch8(s);
     int reg, mod = modrm >> 6;
@@ -1744,12 +1799,12 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
             break;
         case 0xdb: /* m32 int + m80 */
             switch (reg) {
-            case 0: fpu_push(s, (double)(int32_t)ld_lin(s, la, 4)); return; /* fild m32 */
-            case 2: st_lin(s, la, (int32_t)llrint(fpu_get(s, 0)), 4); return; /* fist m32 */
-            case 3: st_lin(s, la, (int32_t)llrint(fpu_get(s, 0)), 4); fpu_pop(s); return;
+            case 0: fpu_push(s, (long double)(int32_t)ld_lin(s, la, 4)); return; /* fild m32 */
+            case 2: st_lin(s, la, (int32_t)llrintl(fpu_get(s, 0)), 4); return; /* fist m32 */
+            case 3: st_lin(s, la, (int32_t)llrintl(fpu_get(s, 0)), 4); fpu_pop(s); return;
             case 5: { uint8_t buf[10]; int k; for (k=0;k<10;k++) buf[k]=ld_lin(s,la+k,1);
-                      fpu_push(s, f80_to_dbl(buf)); return; }           /* fld m80  */
-            case 7: { uint8_t buf[10]; int k; dbl_to_f80(fpu_get(s,0),buf);
+                      fpu_push(s, f80_to_ld(buf)); return; }            /* fld m80  */
+            case 7: { uint8_t buf[10]; int k; ld_to_f80(fpu_get(s,0),buf);
                       probe_write(s, la, 10);
                       for (k=0;k<10;k++) st_lin(s,la+k,buf[k],1);
                       fpu_pop(s); return; } /* fstp m80 */
@@ -1757,12 +1812,12 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
             break;
         case 0xdf: /* m16 int + m64 int */
             switch (reg) {
-            case 0: fpu_push(s, (double)(int16_t)ld_lin(s, la, 2)); return; /* fild m16 */
-            case 2: st_lin(s, la, (int16_t)llrint(fpu_get(s, 0)), 2); return;
-            case 3: st_lin(s, la, (int16_t)llrint(fpu_get(s, 0)), 2); fpu_pop(s); return;
+            case 0: fpu_push(s, (long double)(int16_t)ld_lin(s, la, 2)); return; /* fild m16 */
+            case 2: st_lin(s, la, (int16_t)llrintl(fpu_get(s, 0)), 2); return;
+            case 3: st_lin(s, la, (int16_t)llrintl(fpu_get(s, 0)), 2); fpu_pop(s); return;
             case 5: { int64_t v = (int64_t)ld_lin(s,la,4) | ((int64_t)ld_lin(s,la+4,4)<<32);
-                      fpu_push(s, (double)v); return; }                 /* fild m64 */
-            case 4: { uint8_t buf[10]; int k; double v = 0, scale = 1;  /* fbld m80bcd */
+                      fpu_push(s, (long double)v); return; }            /* fild m64 */
+            case 4: { uint8_t buf[10]; int k; long double v = 0, scale = 1; /* fbld m80bcd */
                       for (k = 0; k < 10; k++) buf[k] = ld_lin(s, la+k, 1);
                       for (k = 0; k < 9; k++) {
                           v += (buf[k] & 0xf) * scale;  scale *= 10;
@@ -1770,9 +1825,9 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
                       }
                       if (buf[9] & 0x80) v = -v;
                       fpu_push(s, v); return; }
-            case 6: { uint8_t buf[10]; int k; double v = fpu_get(s, 0); /* fbstp m80bcd */
+            case 6: { uint8_t buf[10]; int k; long double v = fpu_get(s, 0); /* fbstp m80bcd */
                       int neg = signbit(v);
-                      int64_t iv = (int64_t)llrint(fabs(v));
+                      int64_t iv = (int64_t)llrintl(fabsl(v));
                       for (k = 0; k < 9; k++) {
                           buf[k]  = (uint8_t)(iv % 10);  iv /= 10;
                           buf[k] |= (uint8_t)((iv % 10) << 4);  iv /= 10;
@@ -1781,18 +1836,18 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
                       probe_write(s, la, 10);
                       for (k = 0; k < 10; k++) st_lin(s, la+k, buf[k], 1);
                       fpu_pop(s); return; }
-            case 7: { int64_t v = (int64_t)llrint(fpu_get(s,0));
+            case 7: { int64_t v = (int64_t)llrintl(fpu_get(s,0));
                       probe_write(s, la, 8);
                       st_lin(s,la,(uint32_t)v,4); st_lin(s,la+4,(uint32_t)(v>>32),4);
                       fpu_pop(s); return; }                             /* fistp m64 */
             }
             break;
         case 0xda: case 0xd8: case 0xdc: case 0xde: { /* arithmetic with memory operand */
-            double m = (b == 0xd8) ? fpu_ld_mem(s, la, 4)
+            long double m = (b == 0xd8) ? fpu_ld_mem(s, la, 4)
                      : (b == 0xdc) ? fpu_ld_mem(s, la, 8)
-                     : (b == 0xda) ? (double)(int32_t)ld_lin(s, la, 4)  /* m32int */
-                     : (double)(int16_t)ld_lin(s, la, 2); /* 0xde: m16int */
-            double st0 = fpu_get(s, 0), r = st0;
+                     : (b == 0xda) ? (long double)(int32_t)ld_lin(s, la, 4)  /* m32int */
+                     : (long double)(int16_t)ld_lin(s, la, 2); /* 0xde: m16int */
+            long double st0 = fpu_get(s, 0), r = st0;
             switch (reg) {
             case 0: r = st0 + m; break;
             case 1: r = st0 * m; break;
@@ -1803,7 +1858,7 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
             case 6: r = st0 / m; break;
             case 7: r = m / st0; break;
             }
-            fpu_set(s, 0, r); return;
+            fpu_set(s, 0, fpu_pc_round(s, r)); return;
         }
         }
         x86_stop(s, "x87 mem opcode %02x /%d", b, reg);
@@ -1816,39 +1871,39 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
         switch (b) {
         case 0xd9:
             if (modrm >= 0xc0 && modrm <= 0xc7) { fpu_push(s, fpu_get(s, rr)); return; } /* fld st(i) */
-            if (modrm >= 0xc8 && modrm <= 0xcf) { double t = fpu_get(s,0); fpu_set(s,0,fpu_get(s,rr)); fpu_set(s,rr,t); return; } /* fxch */
+            if (modrm >= 0xc8 && modrm <= 0xcf) { long double t = fpu_get(s,0); fpu_set(s,0,fpu_get(s,rr)); fpu_set(s,rr,t); return; } /* fxch */
             switch (modrm) {
             case 0xd0: return;                                  /* fnop */
             case 0xe0: fpu_set(s, 0, -fpu_get(s, 0)); return;   /* fchs */
-            case 0xe1: fpu_set(s, 0, fabs(fpu_get(s, 0))); return; /* fabs */
-            case 0xe4: fpu_setcc(s, fpu_get(s, 0), 0.0); return; /* ftst */
-            case 0xe5: { double v = fpu_get(s,0); s->fpu_sw &= ~(FPU_C0|FPU_C1|FPU_C2|FPU_C3); /* fxam */
+            case 0xe1: fpu_set(s, 0, fabsl(fpu_get(s, 0))); return; /* fabs */
+            case 0xe4: fpu_setcc(s, fpu_get(s, 0), 0.0L); return; /* ftst */
+            case 0xe5: { long double v = fpu_get(s,0); s->fpu_sw &= ~(FPU_C0|FPU_C1|FPU_C2|FPU_C3); /* fxam */
                          if (isnan(v)) s->fpu_sw |= FPU_C0;
                          else if (isinf(v)) s->fpu_sw |= FPU_C0|FPU_C2;
                          else if (v==0) s->fpu_sw |= FPU_C3;
                          else s->fpu_sw |= FPU_C2;
                          if (signbit(v)) s->fpu_sw |= FPU_C1; return; }
-            case 0xe8: fpu_push(s, 1.0); return;                /* fld1 */
-            case 0xe9: fpu_push(s, 3.3219280948873623); return; /* fldl2t */
-            case 0xea: fpu_push(s, 1.4426950408889634); return; /* fldl2e */
-            case 0xeb: fpu_push(s, 3.141592653589793); return;  /* fldpi */
-            case 0xec: fpu_push(s, 0.30102999566398120); return;/* fldlg2 */
-            case 0xed: fpu_push(s, 0.69314718055994531); return;/* fldln2 */
-            case 0xee: fpu_push(s, 0.0); return;                /* fldz */
-            case 0xfa: fpu_set(s, 0, sqrt(fpu_get(s, 0))); return; /* fsqrt */
-            case 0xfc: fpu_set(s, 0, rint(fpu_get(s, 0))); return; /* frndint */
-            case 0xfe: fpu_set(s, 0, sin(fpu_get(s, 0))); return;  /* fsin */
-            case 0xff: fpu_set(s, 0, cos(fpu_get(s, 0))); return;  /* fcos */
-            case 0xf1: { double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,y*log2(x)); fpu_pop(s); return; } /* fyl2x */
-            case 0xf0: fpu_set(s, 0, exp2(fpu_get(s, 0)) - 1.0); return; /* f2xm1 */
-            case 0xf2: { double x=fpu_get(s,0); fpu_set(s,0,tan(x)); fpu_push(s,1.0); s->fpu_sw&=~FPU_C2; return; } /* fptan */
-            case 0xf3: { double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,atan2(y,x)); fpu_pop(s); return; } /* fpatan */
-            case 0xf4: { double v=fpu_get(s,0), e=logb(v); fpu_set(s,0,e); fpu_push(s, scalbn(v,-(int)e)); return; } /* fxtract */
-            case 0xf5: { double a=fpu_get(s,0),bb=fpu_get(s,1); fpu_set(s,0,remainder(a,bb)); s->fpu_sw&=~FPU_C2; return; } /* fprem1 */
-            case 0xf9: { double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,y*log2(x+1.0)); fpu_pop(s); return; } /* fyl2xp1 */
-            case 0xfb: { double x=fpu_get(s,0); fpu_set(s,0,sin(x)); fpu_push(s,cos(x)); s->fpu_sw&=~FPU_C2; return; } /* fsincos */
-            case 0xf8: { double a=fpu_get(s,0),bb=fpu_get(s,1); fpu_set(s,0,fmod(a,bb)); s->fpu_sw&=~FPU_C2; return; } /* fprem */
-            case 0xfd: { double st0=fpu_get(s,0),st1=fpu_get(s,1); fpu_set(s,0, st0*pow(2.0, trunc(st1))); return; } /* fscale */
+            case 0xe8: fpu_push(s, 1.0L); return;                       /* fld1 */
+            case 0xe9: fpu_push(s, 3.32192809488736234787L); return;    /* fldl2t log2(10) */
+            case 0xea: fpu_push(s, 1.44269504088896340736L); return;    /* fldl2e log2(e)  */
+            case 0xeb: fpu_push(s, 3.14159265358979323846L); return;    /* fldpi  pi       */
+            case 0xec: fpu_push(s, 0.30102999566398119521L); return;    /* fldlg2 log10(2) */
+            case 0xed: fpu_push(s, 0.69314718055994530942L); return;    /* fldln2 ln(2)    */
+            case 0xee: fpu_push(s, 0.0L); return;                       /* fldz */
+            case 0xfa: fpu_set(s, 0, fpu_pc_round(s, sqrtl(fpu_get(s, 0)))); return; /* fsqrt */
+            case 0xfc: fpu_set(s, 0, rintl(fpu_get(s, 0))); return; /* frndint (honors RC) */
+            case 0xfe: fpu_set(s, 0, sinl(fpu_get(s, 0))); return;  /* fsin */
+            case 0xff: fpu_set(s, 0, cosl(fpu_get(s, 0))); return;  /* fcos */
+            case 0xf1: { long double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,y*log2l(x)); fpu_pop(s); return; } /* fyl2x */
+            case 0xf0: fpu_set(s, 0, exp2l(fpu_get(s, 0)) - 1.0L); return; /* f2xm1 */
+            case 0xf2: { long double x=fpu_get(s,0); fpu_set(s,0,tanl(x)); fpu_push(s,1.0L); s->fpu_sw&=~FPU_C2; return; } /* fptan */
+            case 0xf3: { long double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,atan2l(y,x)); fpu_pop(s); return; } /* fpatan */
+            case 0xf4: { long double v=fpu_get(s,0), e=logbl(v); fpu_set(s,0,e); fpu_push(s, scalbnl(v,-(int)e)); return; } /* fxtract */
+            case 0xf5: { long double a=fpu_get(s,0),bb=fpu_get(s,1); fpu_set(s,0,remainderl(a,bb)); s->fpu_sw&=~FPU_C2; return; } /* fprem1 */
+            case 0xf9: { long double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,y*log2l(x+1.0L)); fpu_pop(s); return; } /* fyl2xp1 */
+            case 0xfb: { long double x=fpu_get(s,0); fpu_set(s,0,sinl(x)); fpu_push(s,cosl(x)); s->fpu_sw&=~FPU_C2; return; } /* fsincos */
+            case 0xf8: { long double a=fpu_get(s,0),bb=fpu_get(s,1); fpu_set(s,0,fmodl(a,bb)); s->fpu_sw&=~FPU_C2; return; } /* fprem */
+            case 0xfd: { long double st0=fpu_get(s,0),st1=fpu_get(s,1); fpu_set(s,0, st0*powl(2.0L, truncl(st1))); return; } /* fscale */
             case 0xf6: s->fpu_top = (s->fpu_top+1)&7; return;   /* fdecstp (approx) */
             case 0xf7: s->fpu_top = (s->fpu_top-1)&7; return;   /* fincstp (approx) */
             }
@@ -1875,7 +1930,7 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
               else if (modrm >= 0xd8 && modrm <= 0xdf) cond = !get_pf(s);
               if (cond >= 0) { if (cond) fpu_set(s, 0, fpu_get(s, rr)); return; } }
             if (modrm >= 0xe8 && modrm <= 0xf7) { /* fcomi/fucomi -> set EFLAGS */
-                double a = fpu_get(s, 0), c = fpu_get(s, rr);
+                long double a = fpu_get(s, 0), c = fpu_get(s, rr);
                 flags_sync(s);
                 s->eflags_ &= ~(EFL_ZF | EFL_PF | EFL_CF);
                 if (isnan(a) || isnan(c)) s->eflags_ |= EFL_ZF | EFL_PF | EFL_CF;
@@ -1887,7 +1942,7 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
         case 0xdf:
             if (modrm == 0xe0) { set_regv(s, REG_EAX, s->fpu_sw | ((s->fpu_top & 7) << 11), 2); return; } /* fnstsw ax */
             if (modrm >= 0xe8 && modrm <= 0xf7) { /* fcomip/fucomip */
-                double a = fpu_get(s, 0), c = fpu_get(s, rr);
+                long double a = fpu_get(s, 0), c = fpu_get(s, rr);
                 flags_sync(s);
                 s->eflags_ &= ~(EFL_ZF | EFL_PF | EFL_CF);
                 if (isnan(a) || isnan(c)) s->eflags_ |= EFL_ZF | EFL_PF | EFL_CF;
@@ -1906,7 +1961,7 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
         case 0xd8: case 0xdc: case 0xde: { /* register arithmetic */
             /* D8: st0 op= st(i);  DC: st(i) op= st0;  DE: st(i) op= st0 then pop */
             int dst = (b == 0xd8) ? 0 : rr;
-            double a = fpu_get(s, dst), c = (b == 0xd8) ? fpu_get(s, rr) : fpu_get(s, 0), r = a;
+            long double a = fpu_get(s, dst), c = (b == 0xd8) ? fpu_get(s, rr) : fpu_get(s, 0), r = a;
             int grp = (modrm >> 3) & 7;
             if ((b == 0xde && modrm == 0xd9)) { /* fcompp */
                 fpu_setcc(s, fpu_get(s,0), fpu_get(s,1)); fpu_pop(s); fpu_pop(s); return;
@@ -1921,13 +1976,668 @@ static void fpu_exec(X86CPUState *s, int b, int seg_override)
             case 6: r = (b == 0xd8) ? a / c : c / a; break;      /* fdiv / fdivr */
             case 7: r = (b == 0xd8) ? c / a : a / c; break;      /* fdivr / fdiv */
             }
-            fpu_set(s, dst, r);
+            fpu_set(s, dst, fpu_pc_round(s, r));
             if (b == 0xde) fpu_pop(s);                           /* the P (pop) forms */
             return;
         }
         }
         x86_stop(s, "x87 reg opcode %02x modrm=%02x", b, modrm);
     }
+}
+
+/* RC (rounding-control) wrapper: set the host rounding mode from CW[11:10] for
+ * the duration of the escape, so every rounding step -- basic arithmetic, the
+ * fst/fist narrowing conversions, frndint, and the PC significand rounding --
+ * follows the guest's selected mode, then restore it. A fault inside longjmps
+ * past the restore; the interp loop's setjmp landing resets the host mode to
+ * nearest (temu's default), so the host FPU is never left in the guest mode. */
+static void fpu_exec(X86CPUState *s, int b, int seg_override)
+{
+    static const int rc_fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    int old = fegetround();
+    fesetround(rc_fe[(s->fpu_cw >> 10) & 3]);
+    fpu_exec_inner(s, b, seg_override);
+    fesetround(old);
+}
+
+/* ---- SSE / SSE2 ---------------------------------------------------------
+ *
+ * The XMM half of SSE and SSE2: moves, packed/scalar single and double
+ * arithmetic, compares, conversions, the 128-bit integer ops, shuffles, and
+ * fxsave/fxrstor/ldmxcsr/stmxcsr plus the fences. The 64-bit MMX forms (the
+ * same opcodes with no mandatory prefix in the integer space) are #UD, since
+ * CPUID does not advertise MMX.
+ *
+ * Userland needs this even though early kernels ran without it: Alpine's
+ * i686 build targets an SSE2 baseline, and libpython's interpreter setup
+ * runs `movd %eax,%xmm0` before any Python code.
+ *
+ * Restart-safety follows the rest of the file: every memory operand is
+ * loaded (and every store target probed) before an XMM register or memory
+ * byte changes, so a #PF restarts the instruction cleanly.
+ *
+ * Floating point is done in host float/double, which is IEEE single/double
+ * on every target. Results that differ by host are pinned to the x86
+ * answers: a NaN result takes the first NaN operand (quieted), or the
+ * negative "default NaN" when an invalid operation produced it from
+ * non-NaN inputs. min/max return the second operand on NaN or on equal
+ * zeros, and float->int conversions that overflow give 0x80000000. MXCSR.RC
+ * is applied through the host rounding mode, as fpu_exec does for the x87
+ * RC. The exception flags are never accumulated and FTZ/DAZ are ignored;
+ * all exceptions behave as masked. */
+
+#define SSE_NP 0   /* no mandatory prefix: ps forms */
+#define SSE_66 1   /* pd and the 128-bit integer forms */
+#define SSE_F3 2   /* ss */
+#define SSE_F2 3   /* sd */
+
+#define MXCSR_MASK 0x0000ffbfu  /* supported MXCSR bits (no DAZ) */
+
+static uint64_t ld_lin64(X86CPUState *s, uint32_t la)
+{
+    uint64_t lo = ld_lin(s, la, 4);
+    return lo | ((uint64_t)ld_lin(s, la + 4, 4) << 32);
+}
+static void st_lin64(X86CPUState *s, uint32_t la, uint64_t v)
+{
+    probe_write(s, la, 8);   /* both dwords must fault before either lands */
+    st_lin(s, la, (uint32_t)v, 4);
+    st_lin(s, la + 4, (uint32_t)(v >> 32), 4);
+}
+/* Aligned 128-bit operands (movaps, movdqa, and every packed op with a memory
+ * source) #GP(0) when not 16-byte aligned. */
+static void sse_ld128(X86CPUState *s, uint32_t la, int align, X86XMM *v)
+{
+    int i;
+    if (align && (la & 15)) raise_fault_err(s, EXC_GP, 0);
+    for (i = 0; i < 4; i++) v->d[i] = ld_lin(s, la + 4 * i, 4);
+}
+static void sse_st128(X86CPUState *s, uint32_t la, int align, const X86XMM *v)
+{
+    int i;
+    if (align && (la & 15)) raise_fault_err(s, EXC_GP, 0);
+    probe_write(s, la, 16);
+    for (i = 0; i < 4; i++) st_lin(s, la + 4 * i, v->d[i], 4);
+}
+
+/* The source operand: the XMM register itself, or `size` bytes (4, 8 or 16)
+ * loaded into *tmp with the rest zeroed. */
+static const X86XMM *sse_src(X86CPUState *s, const Modrm *rm, int size,
+                             X86XMM *tmp)
+{
+    if (rm->is_reg) return &s->xmm[rm->reg];
+    memset(tmp, 0, sizeof(*tmp));
+    if (size == 16) sse_ld128(s, rm->addr, 1, tmp);
+    else if (size == 8) tmp->q[0] = ld_lin64(s, rm->addr);
+    else tmp->d[0] = ld_lin(s, rm->addr, 4);
+    return tmp;
+}
+
+/* SSE use needs CR4.OSFXSR and !CR0.EM (#UD), then !CR0.TS (#NM). */
+static void sse_check(X86CPUState *s)
+{
+    if ((s->cr0 & CR0_EM) || !(s->cr4 & CR4_OSFXSR)) raise_fault(s, EXC_UD);
+    if (s->cr0 & CR0_TS) raise_fault(s, 7);
+}
+
+static float f32_bits(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }
+static uint32_t f32_u(float f) { union { uint32_t u; float f; } v; v.f = f; return v.u; }
+static double f64_bits(uint64_t u) { union { uint64_t u; double f; } v; v.u = u; return v.f; }
+static uint64_t f64_u(double f) { union { uint64_t u; double f; } v; v.f = f; return v.u; }
+
+/* Arithmetic op `op` (the 0F opcode: 51 sqrt, 58 add, 59 mul, 5C sub, 5D min,
+ * 5E div, 5F max) on a = destination lane, b = source lane. */
+static float sse_f32(int op, float a, float b)
+{
+    float r;
+    switch (op) {
+    case 0x5d: return (a < b) ? a : b;
+    case 0x5f: return (a > b) ? a : b;
+    case 0x51:
+        if (isnan(b)) return f32_bits(f32_u(b) | 0x00400000u);
+        return (b < 0) ? f32_bits(0xffc00000u) : sqrtf(b);
+    case 0x58: r = a + b; break;
+    case 0x59: r = a * b; break;
+    case 0x5c: r = a - b; break;
+    default:   r = a / b; break;
+    }
+    if (isnan(r)) {
+        if (isnan(a)) return f32_bits(f32_u(a) | 0x00400000u);
+        if (isnan(b)) return f32_bits(f32_u(b) | 0x00400000u);
+        return f32_bits(0xffc00000u);
+    }
+    return r;
+}
+static double sse_f64(int op, double a, double b)
+{
+    double r;
+    switch (op) {
+    case 0x5d: return (a < b) ? a : b;
+    case 0x5f: return (a > b) ? a : b;
+    case 0x51:
+        if (isnan(b)) return f64_bits(f64_u(b) | 0x0008000000000000ull);
+        return (b < 0) ? f64_bits(0xfff8000000000000ull) : sqrt(b);
+    case 0x58: r = a + b; break;
+    case 0x59: r = a * b; break;
+    case 0x5c: r = a - b; break;
+    default:   r = a / b; break;
+    }
+    if (isnan(r)) {
+        if (isnan(a)) return f64_bits(f64_u(a) | 0x0008000000000000ull);
+        if (isnan(b)) return f64_bits(f64_u(b) | 0x0008000000000000ull);
+        return f64_bits(0xfff8000000000000ull);
+    }
+    return r;
+}
+
+/* cmpps/cmpss/... predicate imm8[2:0] -> all-ones/zero lane mask */
+static int sse_cmp(int pred, double a, double b)
+{
+    switch (pred & 7) {
+    case 0: return a == b;
+    case 1: return a < b;
+    case 2: return a <= b;
+    case 3: return isnan(a) || isnan(b);
+    case 4: return !(a == b);
+    case 5: return !(a < b);
+    case 6: return !(a <= b);
+    default: return !isnan(a) && !isnan(b);
+    }
+}
+
+/* float/double -> int32 (cvt* rounds per MXCSR.RC via the host mode, cvtt*
+ * truncates); NaN and out-of-range give the "integer indefinite" 0x80000000. */
+static int32_t sse_cvt_i32(double v, int chop)
+{
+    if (isnan(v)) return INT32_MIN;
+    v = chop ? trunc(v) : nearbyint(v);
+    if (v >= 2147483648.0 || v < -2147483648.0) return INT32_MIN;
+    return (int32_t)v;
+}
+
+static int8_t   sat_s8(int v)  { return v > 127 ? 127 : v < -128 ? -128 : v; }
+static uint8_t  sat_u8(int v)  { return v > 255 ? 255 : v < 0 ? 0 : v; }
+static int16_t  sat_s16(int v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
+static uint16_t sat_u16(int v) { return v > 65535 ? 65535 : v < 0 ? 0 : v; }
+
+/* punpckl* / punpckh* (and unpcklps/pd...): interleave the low or high halves
+ * of d and s, element size `esz` bytes. */
+static void sse_unpack(X86XMM *r, const X86XMM *d, const X86XMM *s, int esz, int hi)
+{
+    int i, n = 8 / esz, off = hi ? 8 : 0;
+    for (i = 0; i < n; i++) {
+        memcpy(r->b + 2 * i * esz, d->b + off + i * esz, esz);
+        memcpy(r->b + (2 * i + 1) * esz, s->b + off + i * esz, esz);
+    }
+}
+
+/* Shift every `esz`-byte lane of *d by `cnt`: kind 2 logical right, 4
+ * arithmetic right, 6 left (the /reg encoding of the 71-73 groups). */
+static void sse_shift(X86XMM *d, int esz, int kind, uint64_t cnt)
+{
+    int i;
+    int bits = esz * 8;
+    if (cnt >= (uint64_t)bits) {
+        if (kind != 4) { memset(d, 0, sizeof(*d)); return; }
+        cnt = bits - 1;
+    }
+    for (i = 0; i < 16 / esz; i++) {
+        switch (esz) {
+        case 2: d->w[i] = kind == 2 ? d->w[i] >> cnt : kind == 4 ? (uint16_t)(d->sw[i] >> cnt) : (uint16_t)(d->w[i] << cnt); break;
+        case 4: d->d[i] = kind == 2 ? d->d[i] >> cnt : kind == 4 ? (uint32_t)(d->sd[i] >> cnt) : d->d[i] << cnt; break;
+        default: d->q[i] = kind == 2 ? d->q[i] >> cnt : d->q[i] << cnt; break;
+        }
+    }
+}
+
+/* comiss/ucomiss/comisd/ucomisd: ZF/PF/CF per the unordered/less/equal
+ * outcome, OF/SF/AF cleared. */
+static void sse_comi(X86CPUState *s, double a, double b)
+{
+    flags_sync(s);
+    s->eflags_ &= ~(uint32_t)(EFL_CF | EFL_PF | EFL_AF | EFL_ZF | EFL_SF | EFL_OF);
+    if (isnan(a) || isnan(b)) s->eflags_ |= EFL_ZF | EFL_PF | EFL_CF;
+    else if (a < b) s->eflags_ |= EFL_CF;
+    else if (a == b) s->eflags_ |= EFL_ZF;
+}
+
+/* FXSAVE/FXRSTOR 512-byte image: FCW, FSW (with TOP), abridged tag byte
+ * (bit i = physical register i is not empty), MXCSR, MXCSR_MASK, ST(0..7) in
+ * 16-byte slots, XMM0-7. FIP/FDP/FOP are not tracked and save as 0. */
+static void sse_fxsave(X86CPUState *s, uint32_t la)
+{
+    uint8_t buf[512];
+    int i;
+    if (la & 15) raise_fault_err(s, EXC_GP, 0);
+    memset(buf, 0, sizeof(buf));
+    buf[0] = s->fpu_cw; buf[1] = s->fpu_cw >> 8;
+    { uint16_t sw = s->fpu_sw | ((s->fpu_top & 7) << 11);
+      buf[2] = sw; buf[3] = sw >> 8; }
+    for (i = 0; i < 8; i++) if (s->fpu_tag[i] != 3) buf[4] |= 1 << i;
+    memcpy(buf + 24, &s->mxcsr, 4);
+    { uint32_t mask = MXCSR_MASK; memcpy(buf + 28, &mask, 4); }
+    for (i = 0; i < 8; i++) ld_to_f80(s->fpst[(s->fpu_top + i) & 7], buf + 32 + 16 * i);
+    memcpy(buf + 160, s->xmm, sizeof(s->xmm));
+    probe_write(s, la, 512);
+    for (i = 0; i < 512; i += 4) {
+        uint32_t v; memcpy(&v, buf + i, 4); st_lin(s, la + i, v, 4);
+    }
+}
+static void sse_fxrstor(X86CPUState *s, uint32_t la)
+{
+    uint8_t buf[512];
+    uint32_t mx;
+    uint16_t sw;
+    int i;
+    if (la & 15) raise_fault_err(s, EXC_GP, 0);
+    for (i = 0; i < 512; i += 4) {   /* every load before any state changes */
+        uint32_t v = ld_lin(s, la + i, 4); memcpy(buf + i, &v, 4);
+    }
+    memcpy(&mx, buf + 24, 4);
+    if (mx & ~MXCSR_MASK) raise_fault_err(s, EXC_GP, 0);
+    s->fpu_cw = buf[0] | (buf[1] << 8);
+    sw = buf[2] | (buf[3] << 8);
+    s->fpu_top = (sw >> 11) & 7;
+    s->fpu_sw = sw & ~0x3800;
+    for (i = 0; i < 8; i++) s->fpu_tag[i] = (buf[4] >> i) & 1 ? 0 : 3;
+    for (i = 0; i < 8; i++) s->fpst[(s->fpu_top + i) & 7] = f80_to_ld(buf + 32 + 16 * i);
+    s->mxcsr = mx;
+    memcpy(s->xmm, buf + 160, sizeof(s->xmm));
+}
+
+/* 0F AE: fxsave/fxrstor/ldmxcsr/stmxcsr/clflush, and with mod=3 the fences. */
+static void sse_group15(X86CPUState *s, int seg_override)
+{
+    uint8_t m = fetch8(s);
+    int reg;
+    Modrm rm;
+    decode_modrm(s, m, seg_override, &reg, &rm);
+    if (rm.is_reg) {
+        if (reg < 5) raise_fault(s, EXC_UD);
+        return;  /* lfence / mfence / sfence: accesses are already in order */
+    }
+    switch (reg) {
+    case 0: case 1:
+        if (s->cr0 & (CR0_EM | CR0_TS)) raise_fault(s, 7);
+        if (reg == 0) sse_fxsave(s, rm.addr); else sse_fxrstor(s, rm.addr);
+        break;
+    case 2: {
+        uint32_t v;
+        sse_check(s);
+        v = ld_lin(s, rm.addr, 4);
+        if (v & ~MXCSR_MASK) raise_fault_err(s, EXC_GP, 0);
+        s->mxcsr = v;
+    } break;
+    case 3:
+        sse_check(s);
+        st_lin(s, rm.addr, s->mxcsr, 4);
+        break;
+    case 7:  /* clflush: no caches to flush; still a memory reference */
+        (void)ld_lin(s, rm.addr, 1);
+        break;
+    default:
+        raise_fault(s, EXC_UD);
+    }
+}
+
+/* Execute 0F b2 (the opcode byte after 0F) with mandatory-prefix class `pc`;
+ * anything outside the implemented SSE/SSE2 map is #UD. */
+static void sse_exec_inner(X86CPUState *s, int b2, int pc, int seg_override)
+{
+    uint8_t m;
+    int reg, i;
+    Modrm rm;
+    X86XMM tmp, r, *d;
+    const X86XMM *src;
+
+    if (b2 == 0xae) { sse_group15(s, seg_override); return; }
+    if (b2 == 0xc3) {  /* movnti m32, r32: a plain store */
+        if (pc != SSE_NP) raise_fault(s, EXC_UD);
+        m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+        if (rm.is_reg) raise_fault(s, EXC_UD);
+        st_lin(s, rm.addr, s->regs[reg], 4);
+        return;
+    }
+
+    /* The 128-bit integer ops exist only with 66 (bare = MMX, not modelled);
+     * F3/F2 have a handful of their own forms, filtered per opcode below. */
+    if (((b2 >= 0x60 && b2 <= 0x7f) || b2 >= 0xd0 || (b2 >= 0xc4 && b2 <= 0xc5)) &&
+        pc == SSE_NP)
+        raise_fault(s, EXC_UD);
+    if (!((b2 >= 0x10 && b2 <= 0x17) || (b2 >= 0x28 && b2 <= 0x2f) ||
+          (b2 >= 0x50 && b2 <= 0x7f) || (b2 >= 0xc2 && b2 <= 0xc6) || b2 >= 0xd0))
+        raise_fault(s, EXC_UD);
+    if (b2 == 0x77) raise_fault(s, EXC_UD);  /* emms: MMX */
+
+    sse_check(s);
+    m = fetch8(s);
+    decode_modrm(s, m, seg_override, &reg, &rm);
+    d = &s->xmm[reg];
+
+    switch (b2) {
+    /* ---- moves ---- */
+    case 0x10: /* movups/movupd/movss/movsd xmm, xmm/m */
+        if (pc == SSE_F3) {
+            if (rm.is_reg) d->d[0] = s->xmm[rm.reg].d[0];
+            else { uint32_t v = ld_lin(s, rm.addr, 4); memset(d, 0, 16); d->d[0] = v; }
+        } else if (pc == SSE_F2) {
+            if (rm.is_reg) d->q[0] = s->xmm[rm.reg].q[0];
+            else { uint64_t v = ld_lin64(s, rm.addr); d->q[0] = v; d->q[1] = 0; }
+        } else if (rm.is_reg) *d = s->xmm[rm.reg];
+        else { sse_ld128(s, rm.addr, 0, &tmp); *d = tmp; }
+        break;
+    case 0x11: /* the stores */
+        if (pc == SSE_F3) {
+            if (rm.is_reg) s->xmm[rm.reg].d[0] = d->d[0];
+            else st_lin(s, rm.addr, d->d[0], 4);
+        } else if (pc == SSE_F2) {
+            if (rm.is_reg) s->xmm[rm.reg].q[0] = d->q[0];
+            else st_lin64(s, rm.addr, d->q[0]);
+        } else if (rm.is_reg) s->xmm[rm.reg] = *d;
+        else sse_st128(s, rm.addr, 0, d);
+        break;
+    case 0x12: case 0x13: case 0x16: case 0x17: { /* movlps/movhps/movlpd/movhpd */
+        int hi = b2 >= 0x16;
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        if (b2 & 1) {                      /* 13/17: store the half */
+            if (rm.is_reg) raise_fault(s, EXC_UD);
+            st_lin64(s, rm.addr, d->q[hi]);
+        } else if (rm.is_reg) {            /* movhlps / movlhps */
+            if (pc == SSE_66) raise_fault(s, EXC_UD);
+            d->q[hi] = s->xmm[rm.reg].q[!hi];
+        } else
+            d->q[hi] = ld_lin64(s, rm.addr);
+    } break;
+    case 0x28: /* movaps/movapd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp); *d = *src;
+        break;
+    case 0x29: case 0x2b: /* movaps/movapd store; movntps/movntpd */
+        if (pc > SSE_66 || (b2 == 0x2b && rm.is_reg)) raise_fault(s, EXC_UD);
+        if (rm.is_reg) s->xmm[rm.reg] = *d;
+        else sse_st128(s, rm.addr, 1, d);
+        break;
+    case 0x6e: /* movd xmm, r/m32 */
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        { uint32_t v = rm_read(s, &rm, 4); memset(d, 0, 16); d->d[0] = v; }
+        break;
+    case 0x7e:
+        if (pc == SSE_66)                  /* movd r/m32, xmm */
+            rm_write(s, &rm, d->d[0], 4);
+        else if (pc == SSE_F3) {           /* movq xmm, xmm/m64 */
+            uint64_t v = rm.is_reg ? s->xmm[rm.reg].q[0] : ld_lin64(s, rm.addr);
+            d->q[0] = v; d->q[1] = 0;
+        } else raise_fault(s, EXC_UD);
+        break;
+    case 0xd6: /* movq xmm/m64, xmm */
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        if (rm.is_reg) { s->xmm[rm.reg].q[0] = d->q[0]; s->xmm[rm.reg].q[1] = 0; }
+        else st_lin64(s, rm.addr, d->q[0]);
+        break;
+    case 0x6f: /* movdqa / movdqu load */
+        if (pc == SSE_F2) raise_fault(s, EXC_UD);
+        if (rm.is_reg) *d = s->xmm[rm.reg];
+        else { sse_ld128(s, rm.addr, pc == SSE_66, &tmp); *d = tmp; }
+        break;
+    case 0x7f: case 0xe7: /* movdqa / movdqu store; movntdq */
+        if (pc == SSE_F2 || (b2 == 0xe7 && (pc != SSE_66 || rm.is_reg)))
+            raise_fault(s, EXC_UD);
+        if (rm.is_reg) s->xmm[rm.reg] = *d;
+        else sse_st128(s, rm.addr, pc == SSE_66, d);
+        break;
+    case 0x50: /* movmskps / movmskpd r32, xmm */
+        if (pc > SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        src = &s->xmm[rm.reg];
+        s->regs[reg] = (pc == SSE_66) ? (uint32_t)((src->q[0] >> 63) | ((src->q[1] >> 63) << 1))
+                                      : (src->d[0] >> 31) | ((src->d[1] >> 31) << 1) |
+                                        ((src->d[2] >> 31) << 2) | ((src->d[3] >> 31) << 3);
+        break;
+    case 0xd7: { /* pmovmskb r32, xmm */
+        uint32_t v = 0;
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        for (i = 0; i < 16; i++) v |= (uint32_t)(s->xmm[rm.reg].b[i] >> 7) << i;
+        s->regs[reg] = v;
+    } break;
+    case 0xf7: { /* maskmovdqu xmm, xmm -> DS:[E]DI */
+        uint32_t la;
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        la = seg_base(s, seg_override, X86_CPU_SEG_DS) + adr_get(s, REG_EDI);
+        src = &s->xmm[rm.reg];
+        probe_write(s, la, 16);
+        for (i = 0; i < 16; i++)
+            if (src->b[i] & 0x80) st_lin(s, la + i, d->b[i], 1);
+    } break;
+
+    /* ---- floating point ---- */
+    case 0x51: case 0x58: case 0x59: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : pc == SSE_F2 ? 8 : 16, &tmp);
+        switch (pc) {
+        case SSE_NP: for (i = 0; i < 4; i++) d->f[i] = sse_f32(b2, d->f[i], src->f[i]); break;
+        case SSE_66: for (i = 0; i < 2; i++) d->fd[i] = sse_f64(b2, d->fd[i], src->fd[i]); break;
+        case SSE_F3: d->f[0] = sse_f32(b2, d->f[0], src->f[0]); break;
+        default:     d->fd[0] = sse_f64(b2, d->fd[0], src->fd[0]); break;
+        }
+        break;
+    case 0x52: case 0x53: /* rsqrtps/ss, rcpps/ss: exact values satisfy the
+                           * architected 1.5*2^-12 relative error bound */
+        if (pc != SSE_NP && pc != SSE_F3) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : 16, &tmp);
+        for (i = 0; i < (pc == SSE_F3 ? 1 : 4); i++)
+            d->f[i] = (b2 == 0x52) ? 1.0f / sqrtf(src->f[i]) : 1.0f / src->f[i];
+        break;
+    case 0x54: case 0x55: case 0x56: case 0x57: /* and/andn/or/xor ps/pd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        for (i = 0; i < 2; i++) {
+            uint64_t a = d->q[i], b = src->q[i];
+            d->q[i] = b2 == 0x54 ? a & b : b2 == 0x55 ? ~a & b : b2 == 0x56 ? a | b : a ^ b;
+        }
+        break;
+    case 0xc2: { /* cmpps/cmppd/cmpss/cmpsd xmm, xmm/m, imm8 */
+        int pred;
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : pc == SSE_F2 ? 8 : 16, &tmp);
+        pred = fetch8(s);
+        switch (pc) {
+        case SSE_NP: for (i = 0; i < 4; i++) d->d[i] = sse_cmp(pred, d->f[i], src->f[i]) ? ~0u : 0; break;
+        case SSE_66: for (i = 0; i < 2; i++) d->q[i] = sse_cmp(pred, d->fd[i], src->fd[i]) ? ~0ull : 0; break;
+        case SSE_F3: d->d[0] = sse_cmp(pred, d->f[0], src->f[0]) ? ~0u : 0; break;
+        default:     d->q[0] = sse_cmp(pred, d->fd[0], src->fd[0]) ? ~0ull : 0; break;
+        }
+    } break;
+    case 0x2e: case 0x2f: /* ucomiss/comiss, ucomisd/comisd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_66 ? 8 : 4, &tmp);
+        if (pc == SSE_66) sse_comi(s, d->fd[0], src->fd[0]);
+        else sse_comi(s, d->f[0], src->f[0]);
+        break;
+    case 0x14: case 0x15: /* unpcklps/unpckhps, unpcklpd/unpckhpd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        sse_unpack(&r, d, src, pc == SSE_66 ? 8 : 4, b2 == 0x15);
+        *d = r;
+        break;
+    case 0xc6: { /* shufps / shufpd */
+        int imm;
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        imm = fetch8(s);
+        if (pc == SSE_66) { r.q[0] = d->q[imm & 1]; r.q[1] = src->q[(imm >> 1) & 1]; }
+        else {
+            r.d[0] = d->d[imm & 3];          r.d[1] = d->d[(imm >> 2) & 3];
+            r.d[2] = src->d[(imm >> 4) & 3]; r.d[3] = src->d[(imm >> 6) & 3];
+        }
+        *d = r;
+    } break;
+
+    /* ---- conversions ---- */
+    case 0x2a: { /* cvtsi2ss / cvtsi2sd xmm, r/m32 (the MMX cvtpi2* are #UD) */
+        int32_t v;
+        if (pc < SSE_F3) raise_fault(s, EXC_UD);
+        v = (int32_t)rm_read(s, &rm, 4);
+        if (pc == SSE_F3) d->f[0] = (float)v; else d->fd[0] = (double)v;
+    } break;
+    case 0x2c: case 0x2d: { /* cvt(t)ss2si / cvt(t)sd2si r32, xmm/m */
+        if (pc < SSE_F3) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : 8, &tmp);
+        s->regs[reg] = (uint32_t)sse_cvt_i32(pc == SSE_F3 ? (double)src->f[0] : src->fd[0],
+                                             b2 == 0x2c);
+    } break;
+    case 0x5a: /* cvtps2pd / cvtpd2ps / cvtss2sd / cvtsd2ss */
+        src = sse_src(s, &rm, pc == SSE_NP ? 8 : pc == SSE_66 ? 16 : pc == SSE_F3 ? 4 : 8, &tmp);
+        switch (pc) {
+        case SSE_NP: r.fd[0] = src->f[0]; r.fd[1] = src->f[1]; *d = r; break;
+        case SSE_66: r.f[0] = (float)src->fd[0]; r.f[1] = (float)src->fd[1]; r.q[1] = 0; *d = r; break;
+        case SSE_F3: d->fd[0] = src->f[0]; break;
+        default:     d->f[0] = (float)src->fd[0]; break;
+        }
+        break;
+    case 0x5b: /* cvtdq2ps / cvtps2dq / cvttps2dq */
+        if (pc == SSE_F2) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        for (i = 0; i < 4; i++)
+            r.d[i] = (pc == SSE_NP) ? f32_u((float)src->sd[i])
+                                    : (uint32_t)sse_cvt_i32(src->f[i], pc == SSE_F3);
+        *d = r;
+        break;
+    case 0xe6: /* cvttpd2dq (66) / cvtdq2pd (F3) / cvtpd2dq (F2) */
+        if (pc == SSE_NP) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_F3 ? 8 : 16, &tmp);
+        if (pc == SSE_F3) { r.fd[0] = src->sd[0]; r.fd[1] = src->sd[1]; }
+        else {
+            r.d[0] = (uint32_t)sse_cvt_i32(src->fd[0], pc == SSE_66);
+            r.d[1] = (uint32_t)sse_cvt_i32(src->fd[1], pc == SSE_66);
+            r.q[1] = 0;
+        }
+        *d = r;
+        break;
+
+    /* ---- 128-bit integer (66 only, except the shuffles below) ---- */
+    case 0x70: { /* pshufd (66) / pshufhw (F3) / pshuflw (F2) */
+        int imm;
+        src = sse_src(s, &rm, 16, &tmp);
+        imm = fetch8(s);
+        r = *src;
+        if (pc == SSE_66)
+            for (i = 0; i < 4; i++) r.d[i] = src->d[(imm >> (2 * i)) & 3];
+        else {
+            int base = (pc == SSE_F3) ? 4 : 0;
+            for (i = 0; i < 4; i++) r.w[base + i] = src->w[base + ((imm >> (2 * i)) & 3)];
+        }
+        *d = r;
+    } break;
+    case 0x71: case 0x72: case 0x73: { /* shift groups by imm8 */
+        int imm, esz = (b2 == 0x71) ? 2 : (b2 == 0x72) ? 4 : 8;
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        imm = fetch8(s);
+        d = &s->xmm[rm.reg];
+        if (b2 == 0x73 && (reg == 3 || reg == 7)) { /* psrldq / pslldq: bytes */
+            int n = imm > 16 ? 16 : imm;
+            memset(&r, 0, sizeof(r));
+            if (reg == 3) memcpy(r.b, d->b + n, 16 - n);
+            else memcpy(r.b + n, d->b, 16 - n);
+            *d = r;
+        } else if (reg == 2 || reg == 6 || (reg == 4 && esz != 8))
+            sse_shift(d, esz, reg, imm);
+        else
+            raise_fault(s, EXC_UD);
+    } break;
+    case 0xc4: { /* pinsrw xmm, r32/m16, imm8 */
+        uint16_t v;
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        v = (uint16_t)rm_read(s, &rm, 2);
+        d->w[fetch8(s) & 7] = v;
+    } break;
+    case 0xc5: /* pextrw r32, xmm, imm8 */
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        s->regs[reg] = s->xmm[rm.reg].w[fetch8(s) & 7];
+        break;
+    default:
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        r = *d;
+        switch (b2) {
+        case 0x60: case 0x61: case 0x62: case 0x6c: /* punpckl{bw,wd,dq,qdq} */
+            sse_unpack(&r, d, src, b2 == 0x6c ? 8 : 1 << (b2 - 0x60), 0); break;
+        case 0x68: case 0x69: case 0x6a: case 0x6d: /* punpckh{bw,wd,dq,qdq} */
+            sse_unpack(&r, d, src, b2 == 0x6d ? 8 : 1 << (b2 - 0x68), 1); break;
+        case 0x63: /* packsswb */
+            for (i = 0; i < 8; i++) { r.sb[i] = sat_s8(d->sw[i]); r.sb[8 + i] = sat_s8(src->sw[i]); } break;
+        case 0x67: /* packuswb */
+            for (i = 0; i < 8; i++) { r.b[i] = sat_u8(d->sw[i]); r.b[8 + i] = sat_u8(src->sw[i]); } break;
+        case 0x6b: /* packssdw */
+            for (i = 0; i < 4; i++) { r.sw[i] = sat_s16(d->sd[i]); r.sw[4 + i] = sat_s16(src->sd[i]); } break;
+        case 0x64: for (i = 0; i < 16; i++) r.b[i] = d->sb[i] > src->sb[i] ? 0xff : 0; break;
+        case 0x65: for (i = 0; i < 8; i++) r.w[i] = d->sw[i] > src->sw[i] ? 0xffff : 0; break;
+        case 0x66: for (i = 0; i < 4; i++) r.d[i] = d->sd[i] > src->sd[i] ? ~0u : 0; break;
+        case 0x74: for (i = 0; i < 16; i++) r.b[i] = d->b[i] == src->b[i] ? 0xff : 0; break;
+        case 0x75: for (i = 0; i < 8; i++) r.w[i] = d->w[i] == src->w[i] ? 0xffff : 0; break;
+        case 0x76: for (i = 0; i < 4; i++) r.d[i] = d->d[i] == src->d[i] ? ~0u : 0; break;
+        case 0xd1: case 0xd2: case 0xd3: /* psrl{w,d,q} by xmm/m128 */
+            sse_shift(&r, 1 << (b2 - 0xd0), 2, src->q[0]); break;
+        case 0xe1: case 0xe2: /* psra{w,d} */
+            sse_shift(&r, 1 << (b2 - 0xe0), 4, src->q[0]); break;
+        case 0xf1: case 0xf2: case 0xf3: /* psll{w,d,q} */
+            sse_shift(&r, 1 << (b2 - 0xf0), 6, src->q[0]); break;
+        case 0xd4: for (i = 0; i < 2; i++) r.q[i] = d->q[i] + src->q[i]; break;  /* paddq */
+        case 0xfb: for (i = 0; i < 2; i++) r.q[i] = d->q[i] - src->q[i]; break;  /* psubq */
+        case 0xfc: for (i = 0; i < 16; i++) r.b[i] = d->b[i] + src->b[i]; break;
+        case 0xfd: for (i = 0; i < 8; i++) r.w[i] = d->w[i] + src->w[i]; break;
+        case 0xfe: for (i = 0; i < 4; i++) r.d[i] = d->d[i] + src->d[i]; break;
+        case 0xf8: for (i = 0; i < 16; i++) r.b[i] = d->b[i] - src->b[i]; break;
+        case 0xf9: for (i = 0; i < 8; i++) r.w[i] = d->w[i] - src->w[i]; break;
+        case 0xfa: for (i = 0; i < 4; i++) r.d[i] = d->d[i] - src->d[i]; break;
+        case 0xec: for (i = 0; i < 16; i++) r.sb[i] = sat_s8(d->sb[i] + src->sb[i]); break;
+        case 0xed: for (i = 0; i < 8; i++) r.sw[i] = sat_s16(d->sw[i] + src->sw[i]); break;
+        case 0xdc: for (i = 0; i < 16; i++) r.b[i] = sat_u8(d->b[i] + src->b[i]); break;
+        case 0xdd: for (i = 0; i < 8; i++) r.w[i] = sat_u16(d->w[i] + src->w[i]); break;
+        case 0xe8: for (i = 0; i < 16; i++) r.sb[i] = sat_s8(d->sb[i] - src->sb[i]); break;
+        case 0xe9: for (i = 0; i < 8; i++) r.sw[i] = sat_s16(d->sw[i] - src->sw[i]); break;
+        case 0xd8: for (i = 0; i < 16; i++) r.b[i] = sat_u8(d->b[i] - src->b[i]); break;
+        case 0xd9: for (i = 0; i < 8; i++) r.w[i] = sat_u16(d->w[i] - src->w[i]); break;
+        case 0xda: for (i = 0; i < 16; i++) r.b[i] = d->b[i] < src->b[i] ? d->b[i] : src->b[i]; break;
+        case 0xde: for (i = 0; i < 16; i++) r.b[i] = d->b[i] > src->b[i] ? d->b[i] : src->b[i]; break;
+        case 0xea: for (i = 0; i < 8; i++) r.sw[i] = d->sw[i] < src->sw[i] ? d->sw[i] : src->sw[i]; break;
+        case 0xee: for (i = 0; i < 8; i++) r.sw[i] = d->sw[i] > src->sw[i] ? d->sw[i] : src->sw[i]; break;
+        case 0xe0: for (i = 0; i < 16; i++) r.b[i] = (d->b[i] + src->b[i] + 1) >> 1; break;
+        case 0xe3: for (i = 0; i < 8; i++) r.w[i] = (d->w[i] + src->w[i] + 1) >> 1; break;
+        case 0xd5: for (i = 0; i < 8; i++) r.w[i] = (uint16_t)(d->sw[i] * src->sw[i]); break;
+        case 0xe5: for (i = 0; i < 8; i++) r.w[i] = (uint16_t)((d->sw[i] * src->sw[i]) >> 16); break;
+        case 0xe4: for (i = 0; i < 8; i++) r.w[i] = (uint16_t)(((uint32_t)d->w[i] * src->w[i]) >> 16); break;
+        case 0xf4: for (i = 0; i < 2; i++) r.q[i] = (uint64_t)d->d[2 * i] * src->d[2 * i]; break;
+        case 0xf5: /* pmaddwd: wraps only for the all-0x8000 case, as on hardware */
+            for (i = 0; i < 4; i++)
+                r.d[i] = (uint32_t)(d->sw[2 * i] * src->sw[2 * i]) +
+                         (uint32_t)(d->sw[2 * i + 1] * src->sw[2 * i + 1]);
+            break;
+        case 0xf6: /* psadbw */
+            for (i = 0; i < 2; i++) {
+                int k; uint32_t sum = 0;
+                for (k = 0; k < 8; k++) sum += abs(d->b[8 * i + k] - src->b[8 * i + k]);
+                r.q[i] = sum;
+            }
+            break;
+        case 0xdb: for (i = 0; i < 2; i++) r.q[i] = d->q[i] & src->q[i]; break;
+        case 0xdf: for (i = 0; i < 2; i++) r.q[i] = ~d->q[i] & src->q[i]; break;
+        case 0xeb: for (i = 0; i < 2; i++) r.q[i] = d->q[i] | src->q[i]; break;
+        case 0xef: for (i = 0; i < 2; i++) r.q[i] = d->q[i] ^ src->q[i]; break;
+        default: raise_fault(s, EXC_UD);
+        }
+        *d = r;
+        break;
+    }
+}
+
+/* MXCSR.RC wrapper: like fpu_exec, run with the host rounding mode set from
+ * the guest's; a fault longjmps out and the interp loop's landing restores
+ * round-to-nearest. */
+static void sse_exec(X86CPUState *s, int b2, int pc, int seg_override)
+{
+    static const int rc_fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    int rc = (s->mxcsr >> 13) & 3;
+    if (rc == 0) { sse_exec_inner(s, b2, pc, seg_override); return; }
+    fesetround(rc_fe[rc]);
+    sse_exec_inner(s, b2, pc, seg_override);
+    fesetround(FE_TONEAREST);
 }
 
 /* ---- interrupt / exception delivery (protected mode, 32-bit gates) ----- */
@@ -2262,6 +2972,9 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
         /* A fault/exception was raised mid-instruction; the restart/report point
          * is the faulting instruction. Vector it through the IDT. */
         s->eip = s->cur_eip;
+        /* An x87 escape that faulted may have longjmp'd out with the host FPU
+         * still in the guest's RC mode; restore temu's default (see fpu_exec). */
+        fesetround(FE_TONEAREST);
 #ifdef X86_UFAULT
         if (s->exc_intno == 14 && (s->seg[X86_CPU_SEG_CS].sel & 3) == 3 &&
             s->cr2 < 0x1000u)
@@ -2694,14 +3407,15 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                     break;
                 case 1:
                     /* Family 6, model 3. Feature set a PAE Linux needs, minus
-                     * things we don't emulate (no FPU: image uses math-emu; no
-                     * APIC/ACPI; no MMX/SSE). Bits: VME DE PSE TSC MSR PAE MCE
-                     * CX8 SEP MTRR PGE MCA CMOV PAT. */
+                     * things we don't emulate (no APIC/ACPI, no MMX). Bits: FPU
+                     * VME DE PSE TSC MSR PAE MCE CX8 SEP MTRR PGE MCA CMOV PAT,
+                     * FXSR SSE SSE2. SSE2 is the baseline of current i686
+                     * userlands (Alpine); FXSR makes the kernel set
+                     * CR4.OSFXSR and context-switch XMM state via fxsave. */
                     a = 0x00000633;
                     d = (1u<<0)|(1u<<1)|(1u<<2)|(1u<<3)|(1u<<4)|(1u<<5)|(1u<<6)|(1u<<7)|
-                        (1u<<8)|(1u<<11)|(1u<<12)|(1u<<13)|(1u<<14)|(1u<<15)|(1u<<16);
-                    /* FPU bit set; FXSR/SSE deliberately NOT advertised so the
-                     * kernel uses the simpler FSAVE/FRSTOR (108-byte) FPU state. */
+                        (1u<<8)|(1u<<11)|(1u<<12)|(1u<<13)|(1u<<14)|(1u<<15)|(1u<<16)|
+                        (1u<<24)|(1u<<25)|(1u<<26);
                     break;
                 case 0x80000000: /* max extended leaf */
                     a = 0x80000001;
@@ -2914,7 +3628,13 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             } else if (b2 == 0x0d || (b2 >= 0x18 && b2 <= 0x1f)) { /* hint nops */
                 uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
             } else {
-                x86_stop(s, "unimplemented opcode 0F %02x", b2);
+                /* SSE/SSE2, or #UD. This used to be x86_stop(), which only
+                 * halted until the next IRQ and then resumed *inside* the
+                 * instruction (EIP past 0F xx), running its ModRM byte as an
+                 * opcode -- how libpython's `movd %eax,%xmm0` became a stray
+                 * `c0 /1` shift through a garbage pointer. */
+                sse_exec(s, b2, (rep == 1) ? SSE_F3 : (rep == 2) ? SSE_F2 :
+                                (op_size != def_op) ? SSE_66 : SSE_NP, seg_override);
             }
         } break;
 
@@ -3609,6 +4329,7 @@ X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
     s->fetch_ptr = x86_fetch_none;
     s->fetch_end = x86_fetch_none;
     fpu_init(s);
+    s->mxcsr = 0x1f80;  /* all exceptions masked, round to nearest */
     /* Sane flat defaults; the machine overrides via set_reg/set_seg. */
     return s;
 }
