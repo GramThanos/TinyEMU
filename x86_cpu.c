@@ -2964,10 +2964,17 @@ static const uint8_t x86_is_prefix[256] = {
     [0x2e] = 1, [0x36] = 1, [0x3e] = 1, [0x26] = 1, [0x64] = 1, [0x65] = 1,
 };
 
+static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles);
+
+/* The fault landing (setjmp) and the instruction loop live in separate
+ * functions on purpose, and the loop must stay no_inline. Emscripten lowers
+ * setjmp by rewriting the whole function that calls it so a longjmp can land
+ * back in it; with the loop inside that function, the WASM build ran the
+ * microbenchmark at 9.5 Minstr/s against 48 with the loop split out (native
+ * is unaffected). A longjmp from a fault unwinds out of x86_interp_loop, the
+ * landing below vectors the exception, and the loop is entered again. */
 void x86_cpu_interp(X86CPUState *s, int max_cycles)
 {
-    int i;
-
     if (setjmp(s->excbuf)) {
         /* A fault/exception was raised mid-instruction; the restart/report point
          * is the faulting instruction. Vector it through the IDT. */
@@ -3015,6 +3022,14 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
                      s->exc_intno, s->exc_error);
         }
     }
+
+    /* As before the split, a fault restarts the loop with a fresh budget. */
+    x86_interp_loop(s, max_cycles);
+}
+
+static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
+{
+    int i;
 
     for (i = 0; i < max_cycles && !s->halted; i++) {
         int op_size, seg_override = -1, rep = 0;

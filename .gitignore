@@ -12,3 +12,5 @@
 /_bootcheck
 /web/_distro
 /web/agent/.cache
+x86-selftest
+temu
