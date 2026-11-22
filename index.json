@@ -1,0 +1,12 @@
+{
+  "versions": [
+    {
+      "version": "v2026-11-22",
+      "commit": "367f830fa9cbea9fd926e8272e8e4031bafcf830",
+      "date": "2026-11-22T14:01:30.881Z",
+      "engine": "engine/v2026-11-22/",
+      "bin": "bin/v2026-11-22/"
+    }
+  ],
+  "latest": "v2026-11-22"
+}

@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<!-- SPDX-License-Identifier: MIT -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TinyEMU builds</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
+  code, pre { font-family: ui-monospace, monospace; font-size: 0.9em; }
+  pre { background: #f4f4f4; padding: 0.8rem; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #ddd; }
+  @media (prefers-color-scheme: dark) {
+    body { background: #161616; color: #ddd; } pre { background: #252525; } th, td { border-color: #333; }
+    a { color: #8ab4f8; }
+  }
+</style>
+</head>
+<body>
+<h1>TinyEMU builds</h1>
+<p>Release builds of <a href="https://github.com/gramthanos/TinyEMU">TinyEMU</a>
+(MIT): a system emulator with a software x86 CPU and RISC-V that boots Linux,
+natively or in the browser as WebAssembly.</p>
+
+<h2>WebAssembly engine</h2>
+<p>One engine runs both the PC (x86) and RISC-V machines. Other sites can load
+it from here directly. Pin a version rather than <code>latest/</code>, since a
+release can change the engine's JS API:</p>
+<pre id="urls">engine/&lt;version&gt;/x86emu-wasm.js
+engine/&lt;version&gt;/x86emu-wasm.wasm</pre>
+<p>It needs WebAssembly exception handling: Chrome 95+, Safari 15.4+, Firefox 131+.
+The JavaScript runtime that drives it (VMs, volumes, snapshots, networking) is
+<a href="https://github.com/gramthanos/jsLab">jsLab</a>:</p>
+<pre id="usage">import { VMManager } from './jsLab/lib/vm/index.js';
+const vms = new VMManager({ urls: {
+  wasmJsUrl:  'https://gramthanos.github.io/TinyEMU/engine/&lt;version&gt;/x86emu-wasm.js',
+  wasmBinUrl: 'https://gramthanos.github.io/TinyEMU/engine/&lt;version&gt;/x86emu-wasm.wasm',
+} });</pre>
+
+<h2>Native binaries</h2>
+<p><code>temu-linux-x86_64.tar.gz</code> holds <code>temu-soft</code> (software x86 CPU + RISC-V)
+and <code>temu-kvm</code> (x86 through KVM). <code>temu-windows.zip</code> holds
+<code>temu.exe</code> with its DLLs. Guest images:
+<a href="https://github.com/gramthanos/TinyEMU-distros">TinyEMU-distros</a>.</p>
+
+<h2>Releases</h2>
+<table>
+  <thead><tr><th>Version</th><th>Date</th><th>Engine</th><th>Binaries</th></tr></thead>
+  <tbody id="releases"><tr><td colspan="4">Loading index.json…</td></tr></tbody>
+</table>
+<p>Each release directory has a <code>SHA256SUMS</code> file. Machine-readable list:
+<a href="index.json">index.json</a>.</p>
+
+<script>
+'use strict';
+fetch('index.json', { cache: 'no-cache' }).then((r) => r.json()).then((idx) => {
+  const body = document.getElementById('releases');
+  body.textContent = '';
+  for (const e of idx.versions || []) {
+    const tr = document.createElement('tr');
+    const cell = (text, href) => {
+      const td = document.createElement('td');
+      if (href) { const a = document.createElement('a'); a.href = href; a.textContent = text; td.append(a); }
+      else td.textContent = text;
+      tr.append(td);
+    };
+    cell(e.version + (e.version === idx.latest ? ' (latest)' : ''));
+    cell((e.date || '').slice(0, 10));
+    cell('x86emu-wasm.js', e.engine + 'x86emu-wasm.js');
+    const td = document.createElement('td');
+    for (const [t, f] of [['linux', 'temu-linux-x86_64.tar.gz'], ['windows', 'temu-windows.zip'], ['sums', 'SHA256SUMS']]) {
+      const a = document.createElement('a'); a.href = e.bin + f; a.textContent = t; td.append(a, ' ');
+    }
+    tr.append(td);
+    body.append(tr);
+  }
+  if (idx.latest) {
+    const base = new URL('engine/' + idx.latest + '/', location.href).href;
+    document.getElementById('usage').textContent = document.getElementById('usage').textContent
+      .replaceAll('https://gramthanos.github.io/TinyEMU/engine/<version>/', base);
+  }
+}).catch(() => {
+  document.getElementById('releases').innerHTML = '<tr><td colspan="4">No releases published yet.</td></tr>';
+});
+</script>
+</body>
+</html>
