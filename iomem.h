@@ -77,6 +77,9 @@ struct PhysMemoryMap {
     void *opaque;
     void (*flush_tlb_write_range)(void *opaque, uint8_t *ram_addr,
                                   size_t ram_size);
+    /* optional: a device is about to write RAM at paddr (DMA through
+       phys_mem_get_ram_ptr). The x86 JIT drops compiled code there. */
+    void (*notify_ram_write)(void *opaque, uint64_t paddr);
 };
 
 

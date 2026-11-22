@@ -236,6 +236,24 @@ struct X86CPUState {
     uint32_t  win_cs_base;      /* CS.base the live window was built against */
     int       fetch_dirty;      /* a TLB flush invalidated the window; force refill */
 
+    /* Set when a write dropped JIT-compiled code (x86_jit.c); a compiled block
+     * that stored leaves right after that instruction. */
+    int       jit_abort;
+    /* Instructions a compiled block had completed when it called a helper
+     * that may fault; the fault landing adds them to cycle_count. Every
+     * block exit clears it. */
+    uint32_t  jit_pending;
+    /* A compiled block stopped before an instruction the JIT does not handle:
+     * once the interpreter has run that one instruction, it asks the JIT
+     * again instead of interpreting on to the next branch. */
+    int       jit_poke;
+    /* x86_jit_step() is running one instruction for a compiled block: the
+     * interpreter loop then neither delivers interrupts nor asks the JIT. */
+    int       jit_step;
+    /* Instructions run by the page functions a chain went through before the
+     * current one (x86_jit_next, for run_chain to add up). */
+    int       jit_chain_n;
+
     /* Fault/exception unwinding (see raise_exception / interp loop) */
     uint32_t cur_eip;       /* EIP at the start of the current instruction */
     jmp_buf  excbuf;
@@ -261,5 +279,43 @@ struct X86CPUState {
     X86TLBEntry tlb_write[2][X86_TLB_SIZE];
     X86TLBEntry tlb_code[2][X86_TLB_SIZE];   /* instruction fetch (NX-checked) */
 };
+
+/* ---- WebAssembly block JIT (x86_jit.c) ----------------------------------
+ * Browser builds only: it emits WebAssembly modules at run time, which needs
+ * the JS side (wasm/x86jit.js). -DX86_NO_JIT leaves it out. The debug
+ * watches need every access on the interpreter's paths, so they do too. */
+#if defined(__EMSCRIPTEN__) && !defined(X86_NO_JIT) && !defined(X86_TLB_DISABLE) && \
+    !defined(X86_WATCH) && !defined(X86_PWATCH1) && !defined(X86_RWATCH) && \
+    !defined(X86_NO_TLB) && !defined(X86_TRACE) && !defined(X86_UFAULT) && \
+    !defined(X86_UWWATCH) && !defined(X86_OPHIST)
+#define X86_JIT 1
+#endif
+
+#ifdef X86_JIT
+extern uint32_t x86_jit_code_bits[];   /* one bit per 4 KB physical page */
+int  x86_jit_run(X86CPUState *s);
+#ifdef X86_JIT_STATS
+/* debug: which instructions the interpreter runs for compiled blocks */
+void x86_jit_note_stop(const uint8_t *p, const uint8_t *end);
+void x86_jit_note_step(const uint8_t *p, const uint8_t *end);
+extern uint64_t x86_jit_prof_interp;   /* instructions the interpreter ran */
+extern uint64_t x86_jit_prof_by[];     /* ... by why the JIT didn't (x86_jit.c) */
+extern int x86_jit_prof_cause;
+extern uint64_t x86_jit_prof_steps, x86_jit_prof_step_exits;
+#endif
+void x86_jit_invalidate_page(X86CPUState *s, uint32_t pa);
+
+/* A write to physical `pa` is about to land (CPU or DMA): drop compiled code
+ * on that page. */
+static inline void x86_jit_note_write(X86CPUState *s, uint32_t pa)
+{
+    if (x86_jit_code_bits[pa >> 17] & (1u << ((pa >> 12) & 31)))
+        x86_jit_invalidate_page(s, pa);
+}
+static inline int x86_jit_page_has_code(uint32_t pa)
+{
+    return (x86_jit_code_bits[pa >> 17] >> ((pa >> 12) & 31)) & 1;
+}
+#endif
 
 #endif /* X86_CPU_PRIV_H */

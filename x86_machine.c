@@ -42,6 +42,9 @@
 #include "ide.h"
 #include "ps2.h"
 #include "inflate.h"
+#if defined(X86_JIT_STATS) && defined(__EMSCRIPTEN__)
+#include <emscripten.h>
+#endif
 
 /* x86 backend selection provided by build system (USE_KVM, else software CPU) */
 
@@ -1960,6 +1963,12 @@ static void pc_flush_tlb_write_range(void *opaque, uint8_t *ram_addr,
     x86_cpu_flush_tlb_write_range_ram(s->cpu_state, ram_addr, ram_size);
 }
 
+static void pc_notify_ram_write(void *opaque, uint64_t paddr)
+{
+    PCMachine *s = opaque;
+    x86_cpu_note_ram_write(s->cpu_state, paddr);
+}
+
 static VirtMachine *pc_machine_init(const VirtMachineParams *p)
 {
     PCMachine *s;
@@ -2014,6 +2023,7 @@ static VirtMachine *pc_machine_init(const VirtMachineParams *p)
         /* needed to handle the RAM dirty bits */
         s->mem_map->opaque = s;
         s->mem_map->flush_tlb_write_range = pc_flush_tlb_write_range;
+        s->mem_map->notify_ram_write = pc_notify_ram_write;
     }
 
     /* set the RAM mapping and leave the VGA addresses empty */
@@ -2681,7 +2691,17 @@ static void pc_machine_interp(VirtMachine *s1, int max_exec_cycles)
         return;
     }
 #endif
+#if defined(X86_JIT_STATS) && defined(__EMSCRIPTEN__)
+    {
+        /* x86_jit.c's profile: time spent running the CPU */
+        extern double x86_jit_prof_cpu_ms;
+        double t0 = emscripten_get_now();
+        x86_cpu_interp(s->cpu_state, max_exec_cycles);
+        x86_jit_prof_cpu_ms += emscripten_get_now() - t0;
+    }
+#else
     x86_cpu_interp(s->cpu_state, max_exec_cycles);
+#endif
 }
 
 static int64_t pc_machine_get_cycles(VirtMachine *s1)

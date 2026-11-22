@@ -1,0 +1,114 @@
+# Publish a release to GitHub Pages, for other sites to load:
+#   engine/<version>/x86emu-wasm.{js,wasm}   engine/latest/ (the newest)
+#   bin/<version>/temu-linux-x86_64.tar.gz, temu-windows.zip
+#   index.json, index.html
+#
+# Releases accumulate on the gh-pages branch, so older versions stay online.
+# One-time setup: Settings -> Pages -> Source: "Deploy from a branch",
+# branch gh-pages, folder / (the branch is created by the first run).
+name: pages
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version directory name (default: the tag, or VERSION-<short sha>)'
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  native:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker compose build build
+      - name: Test and build the release binaries
+        run: |
+          docker compose run --rm -T --entrypoint bash build -c '
+            set -e
+            make clean
+            make x86-selftest && ./x86-selftest
+            make dist
+            make clean'
+      - uses: actions/upload-artifact@v4
+        with: { name: native, path: dist/ }
+
+  wasm:
+    runs-on: ubuntu-latest
+    container: emscripten/emsdk:3.1.74
+    steps:
+      - uses: actions/checkout@v4
+      - run: make -f Makefile.js
+      - run: sh tests/x86_jit_test.sh 500 1
+      - uses: actions/upload-artifact@v4
+        with: { name: wasm, path: dist/wasm/ }
+
+  publish:
+    needs: [native, wasm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { path: src }
+      - name: Version
+        id: v
+        run: |
+          v='${{ inputs.version }}'
+          if [ -z "$v" ] && [ "${GITHUB_REF_TYPE}" = tag ]; then v="${GITHUB_REF_NAME}"; fi
+          if [ -z "$v" ]; then v="$(tr -d ' \r\n' < src/VERSION)-$(git -C src rev-parse --short HEAD)"; fi
+          case "$v" in *[!A-Za-z0-9._-]*|''|latest) echo "bad version: $v"; exit 1;; esac
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        with: { path: art }
+      - name: Check out gh-pages (or start it)
+        run: |
+          url="https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git"
+          if git ls-remote --exit-code --heads "$url" gh-pages >/dev/null; then
+            git clone --depth 1 --branch gh-pages "$url" site
+          else
+            git init -b gh-pages site && git -C site remote add origin "$url"
+          fi
+      - name: Add the release
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          set -e
+          cd site
+          rm -rf "engine/$V" "bin/$V" engine/latest
+          mkdir -p "engine/$V" "bin/$V"
+          cp ../art/wasm/x86emu-wasm.js ../art/wasm/x86emu-wasm.wasm "engine/$V/"
+          tar -C ../art/native/linux -czf "bin/$V/temu-linux-x86_64.tar.gz" temu-soft temu-kvm
+          (cd ../art/native/windows && zip -qr "$OLDPWD/bin/$V/temu-windows.zip" .)
+          for d in "engine/$V" "bin/$V"; do (cd "$d" && sha256sum * > SHA256SUMS); done
+          cp -r "engine/$V" engine/latest
+          cp ../src/LICENSE LICENSE
+          cp ../src/pages/index.html index.html
+          touch .nojekyll
+          node - "$V" "$(git -C ../src rev-parse HEAD)" <<'EOF'
+          const fs = require('fs');
+          const [v, commit] = process.argv.slice(2);
+          let idx = { versions: [] };
+          try { idx = JSON.parse(fs.readFileSync('index.json', 'utf8')); } catch {}
+          idx.versions = idx.versions.filter((e) => e.version !== v);
+          idx.versions.unshift({ version: v, commit, date: new Date().toISOString(),
+            engine: `engine/${v}/`, bin: `bin/${v}/` });
+          idx.latest = v;
+          fs.writeFileSync('index.json', JSON.stringify(idx, null, 2) + '\n');
+          EOF
+      - name: Push gh-pages
+        env:
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          cd site
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m "Publish $V"
+          git push origin gh-pages

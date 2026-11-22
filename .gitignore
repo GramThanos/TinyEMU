@@ -1,16 +1,21 @@
-# Build objects / deps
+# Build objects / deps (native and Emscripten: *.js.o)
 *.o
 *.d
 
-# Distribution tree (Docker `make dist` output: dist/linux, dist/windows)
+# In-tree binaries
+/temu
+/temu.exe
+/build_filelist
+/build_filelist.exe
+/splitimg
+/splitimg.exe
+/x86-selftest
+/microbench
+/inflate-test
+*.exe
+*.dll
+
+# Build output:
+# - Docker `make dist` (dist/linux, dist/windows) and the
+# - WASM engine from `make -f Makefile.js` (dist/wasm)
 /dist
-
-/x86-docs
-
-# Phase-2 boot-validation scratch (large generated guest images; regenerate via
-# the distro pipeline in ../TinyEMU-distros). Not committed.
-/_bootcheck
-/web/_distro
-/web/agent/.cache
-x86-selftest
-temu

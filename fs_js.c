@@ -22,7 +22,7 @@
 #include "list.h"
 #include "fs.h"
 
-/* --- imports implemented in web/js/lib.js (all synchronous) --------------- */
+/* --- imports implemented in wasm/lib.js (all synchronous) --------------- */
 extern int js_fs_mount(const char *name);
 extern int js_fs_stat(int vol, const char *path,
                       uint32_t *pmode, uint32_t *pino,

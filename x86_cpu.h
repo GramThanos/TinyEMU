@@ -32,6 +32,7 @@ typedef struct X86CPUState X86CPUState;
 #define X86_CPU_REG_EIP 8
 #define X86_CPU_REG_CR0 9
 #define X86_CPU_REG_CR2 10
+#define X86_CPU_REG_EFLAGS 11   /* get only: the whole word, flags materialized */
 
 #define X86_CPU_SEG_ES 0
 #define X86_CPU_SEG_CS 1
@@ -71,5 +72,17 @@ int64_t x86_cpu_get_cycles(X86CPUState *s);
 BOOL x86_cpu_get_power_down(X86CPUState *s);
 void x86_cpu_flush_tlb_write_range_ram(X86CPUState *s,
                                        uint8_t *ram_ptr, size_t ram_size);
+
+/* A device is about to write guest RAM at physical paddr (DMA). */
+void x86_cpu_note_ram_write(X86CPUState *s, uint64_t paddr);
+/* Drop the JIT block table without freeing it: after a snapshot restore its
+ * function-table entries belong to another JS instance. No-op without JIT. */
+void x86_jit_forget(void);
+/* Start compiling the JIT's queued blocks; the run loop calls it at the end
+ * of each tick. No-op without the JIT. */
+void x86_jit_flush(void);
+/* Blocks the JIT has compiled since boot (a recompiled page counts its
+ * blocks again), or -1 when it is off. */
+double x86_jit_blocks(void);
 
 #endif /* X86_CPU_H */

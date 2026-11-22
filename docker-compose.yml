@@ -29,8 +29,6 @@ services:
         exit 1;
       fi &&
       echo 'Build artifacts present (temu-soft, temu-kvm, temu.exe).';
-      echo 'NOTE: the software x86 CPU (x86_cpu.c) is a work in progress,';
-      echo 'so an x86 guest boot is not yet part of the smoke test. RISC-V guests work.';
       echo 'Smoke test complete.';
       "
 
