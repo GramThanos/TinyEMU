@@ -2,7 +2,7 @@
  * JS-backed virtio-block device (persistent disks for the web runtime)
  *
  * Implements struct BlockDevice (virtio.h) on top of a JavaScript sector store
- * (Module.api.blk, backed by IndexedDB / OPFS — see web/js/lib.js and the
+ * (Module.api.blk, backed by IndexedDB / OPFS — see wasm/lib.js and the
  * volume backends). Unlike the 9p volume, block I/O keeps the virtio async
  * contract: read_async/write_async return 1 ("pending") and js_block_complete()
  * is invoked from JS when the backend promise resolves. No Asyncify needed, and
@@ -23,7 +23,7 @@
 
 #define SECTOR_SIZE 512
 
-/* --- imports implemented in web/js/lib.js -------------------------------- */
+/* --- imports implemented in wasm/lib.js -------------------------------- */
 extern int    js_block_mount(const char *name);       /* -> vol handle or -1 */
 extern double js_block_sectors(int vol);              /* sector count (sync) */
 extern void   js_block_read(void *dev, int vol, double sector,

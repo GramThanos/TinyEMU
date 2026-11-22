@@ -40,6 +40,9 @@
 #include "cutils.h"
 #include "x86_cpu.h"
 #include "x86_cpu_priv.h"
+#ifdef X86_JIT
+#include <emscripten.h>
+#endif
 
 /* ---- diagnostics ------------------------------------------------------- */
 
@@ -80,11 +83,18 @@ static uint32_t phys_read(X86CPUState *s, uint32_t addr, int size)
         case 2: return p[0] | (p[1] << 8);
         default: return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
         }
-    } else if (pr && pr->read_func) {
-        int sl = (size == 1) ? 0 : (size == 2) ? 1 : 2;
-        return pr->read_func(pr->opaque, (uint32_t)(addr - pr->addr), sl);
+    } else {
+        /* Always exactly `size` bytes, zero-extended: callers such as movzx
+         * rely on it. An unmapped address used to read 0xffffffff at every
+         * size, so `movzx r32, word [unmapped]` gave 0xffffffff instead of
+         * 0x0000ffff (found by tests/x86_jit_fuzz.c). */
+        uint32_t mask = (size == 1) ? 0xffu : (size == 2) ? 0xffffu : 0xffffffffu;
+        if (pr && pr->read_func) {
+            int sl = (size == 1) ? 0 : (size == 2) ? 1 : 2;
+            return pr->read_func(pr->opaque, (uint32_t)(addr - pr->addr), sl) & mask;
+        }
+        return mask;
     }
-    return 0xffffffff;
 }
 
 static void phys_write(X86CPUState *s, uint32_t addr, uint32_t val, int size)
@@ -111,6 +121,11 @@ static void phys_write(X86CPUState *s, uint32_t addr, uint32_t val, int size)
     if (pr && pr->is_ram) {
         if (pr->devram_flags & DEVRAM_FLAG_ROM)
             return;
+#ifdef X86_JIT
+        /* The write TLB never caches a page holding compiled code, so every
+         * CPU write to one ends up here. */
+        x86_jit_note_write(s, addr);
+#endif
         uint8_t *p = pr->phys_mem + (addr - pr->addr);
         switch (size) {
         case 1: p[0] = val; break;
@@ -430,6 +445,10 @@ static uint8_t *tlb_fill(X86CPUState *s, uint32_t la, uint32_t pa, int is_write)
         return NULL;
     if (is_write && pr->dirty_bits)
         return NULL;
+#ifdef X86_JIT
+    if (is_write && x86_jit_page_has_code(pa))
+        return NULL;   /* writes must reach phys_write() to drop the code */
+#endif
     /* The whole page must be inside this range for the addend to stay valid
      * across the page (RAM ranges are page-aligned in practice; check anyway). */
     if ((pa & ~0xfffu) < pr->addr || (uint64_t)(pa | 0xfffu) >= pr->addr + pr->size)
@@ -1990,14 +2009,21 @@ static void fpu_exec_inner(X86CPUState *s, int b, int seg_override)
  * fst/fist narrowing conversions, frndint, and the PC significand rounding --
  * follows the guest's selected mode, then restore it. A fault inside longjmps
  * past the restore; the interp loop's setjmp landing resets the host mode to
- * nearest (temu's default), so the host FPU is never left in the guest mode. */
+ * nearest (temu's default), so the host FPU is never left in the guest mode.
+ *
+ * Since the host mode is always nearest between escapes, RC=nearest -- what
+ * Linux and every libc leave in the control word -- needs no switch at all.
+ * Skipping it matters: fegetround/fesetround around every escape made the x87
+ * loop of the microbenchmark ~3x slower than the integer one natively (they
+ * rewrite the host x87 CW and MXCSR, which serializes). sse_exec does the same. */
 static void fpu_exec(X86CPUState *s, int b, int seg_override)
 {
     static const int rc_fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
-    int old = fegetround();
-    fesetround(rc_fe[(s->fpu_cw >> 10) & 3]);
+    int rc = (s->fpu_cw >> 10) & 3;
+    if (rc == 0) { fpu_exec_inner(s, b, seg_override); return; }
+    fesetround(rc_fe[rc]);
     fpu_exec_inner(s, b, seg_override);
-    fesetround(old);
+    fesetround(FE_TONEAREST);
 }
 
 /* ---- SSE / SSE2 ---------------------------------------------------------
@@ -2954,6 +2980,108 @@ static int g_ophist_atexit;
 static void ophist_atexit(void) { ophist_dump(); }
 #endif
 
+/* Group 3 mul/imul/div/idiv (reg 4..7) of `a` with EAX/EDX, shared by the
+ * interpreter and the JIT (x86_jit_muldiv) so both do exactly this. A divide
+ * error raises #DE. */
+static void group3_muldiv(X86CPUState *s, int reg, uint32_t a, int sz)
+{
+    switch (reg) {
+    case 4: { /* mul (unsigned) */
+        if (sz == 1) {
+            uint32_t r = (get_reg8(s, REG_EAX) & 0xff) * (a & 0xff);
+            set_regv(s, REG_EAX, r & 0xffff, 2);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if (r & 0xff00) s->eflags_ |= EFL_CF | EFL_OF;
+        } else if (sz == 2) {
+            uint32_t r = (s->regs[REG_EAX] & 0xffff) * (a & 0xffff);
+            set_regv(s, REG_EAX, r & 0xffff, 2);
+            set_regv(s, REG_EDX, (r >> 16) & 0xffff, 2);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if (r >> 16) s->eflags_ |= EFL_CF | EFL_OF;
+        } else {
+            uint64_t r = (uint64_t)s->regs[REG_EAX] * a;
+            s->regs[REG_EAX] = (uint32_t)r;
+            s->regs[REG_EDX] = (uint32_t)(r >> 32);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if (r >> 32) s->eflags_ |= EFL_CF | EFL_OF;
+        }
+    } break;
+    case 5: { /* imul (signed, one-operand) */
+        if (sz == 1) {
+            int32_t r = (int8_t)get_reg8(s, REG_EAX) * (int8_t)a;
+            set_regv(s, REG_EAX, (uint16_t)r, 2);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if (r != (int8_t)r) s->eflags_ |= EFL_CF | EFL_OF;
+        } else if (sz == 2) {
+            int32_t r = (int16_t)s->regs[REG_EAX] * (int16_t)a;
+            set_regv(s, REG_EAX, (uint16_t)r, 2);
+            set_regv(s, REG_EDX, (uint16_t)(r >> 16), 2);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if (r != (int16_t)r) s->eflags_ |= EFL_CF | EFL_OF;
+        } else {
+            int64_t r = (int64_t)(int32_t)s->regs[REG_EAX] * (int32_t)a;
+            s->regs[REG_EAX] = (uint32_t)r;
+            s->regs[REG_EDX] = (uint32_t)((uint64_t)r >> 32);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if (r != (int32_t)r) s->eflags_ |= EFL_CF | EFL_OF;
+        }
+    } break;
+    case 6: { /* div (unsigned) */
+        if (a == 0) raise_exception(s, EXC_DE);
+        if (sz == 1) {
+            uint32_t num = s->regs[REG_EAX] & 0xffff;
+            uint32_t q = num / (a & 0xff), r = num % (a & 0xff);
+            if (q > 0xff) raise_exception(s, EXC_DE);
+            set_reg8(s, REG_EAX, q); set_reg8(s, REG_EAX + 4, r); /* AL, AH */
+        } else if (sz == 2) {
+            uint32_t num = ((s->regs[REG_EDX] & 0xffff) << 16) | (s->regs[REG_EAX] & 0xffff);
+            uint32_t q = num / (a & 0xffff), r = num % (a & 0xffff);
+            if (q > 0xffff) raise_exception(s, EXC_DE);
+            set_regv(s, REG_EAX, q, 2); set_regv(s, REG_EDX, r, 2);
+        } else {
+            uint64_t num = ((uint64_t)s->regs[REG_EDX] << 32) | s->regs[REG_EAX];
+            uint64_t q = num / a, r = num % a;
+            if (q > 0xffffffffu) raise_exception(s, EXC_DE);
+            s->regs[REG_EAX] = (uint32_t)q; s->regs[REG_EDX] = (uint32_t)r;
+        }
+    } break;
+    case 7: { /* idiv (signed) */
+        if (a == 0) raise_exception(s, EXC_DE);
+        if (sz == 1) {
+            int32_t num = (int16_t)s->regs[REG_EAX];
+            int32_t q = num / (int8_t)a, r = num % (int8_t)a;
+            if (q != (int8_t)q) raise_exception(s, EXC_DE);
+            set_reg8(s, REG_EAX, (uint8_t)q); set_reg8(s, REG_EAX + 4, (uint8_t)r);
+        } else if (sz == 2) {
+            int32_t num = (int32_t)(((s->regs[REG_EDX] & 0xffff) << 16) | (s->regs[REG_EAX] & 0xffff));
+            int32_t d = (int16_t)a, q, r;
+            /* MIN/-1 overflows int32 (C UB -> host SIGFPE); it also can't
+             * fit the 16-bit quotient, so it is #DE either way. */
+            if (d == -1 && (uint32_t)num == 0x80000000u) raise_exception(s, EXC_DE);
+            q = num / d; r = num % d;
+            if (q != (int16_t)q) raise_exception(s, EXC_DE);
+            set_regv(s, REG_EAX, (uint16_t)q, 2); set_regv(s, REG_EDX, (uint16_t)r, 2);
+        } else {
+            int64_t num = (int64_t)(((uint64_t)s->regs[REG_EDX] << 32) | s->regs[REG_EAX]);
+            int32_t d = (int32_t)a;
+            int64_t q, r;
+            /* MIN/-1 overflows int64 (C UB) and overflows the 32-bit
+             * quotient -> #DE. */
+            if (d == -1 && (uint64_t)num == 0x8000000000000000ULL) raise_exception(s, EXC_DE);
+            q = num / d; r = num % d;
+            if (q != (int32_t)q) raise_exception(s, EXC_DE);
+            s->regs[REG_EAX] = (uint32_t)q; s->regs[REG_EDX] = (uint32_t)r;
+        }
+    } break;
+    }
+}
+
 /* 1 for every byte that is an x86 prefix (operand/address size, lock, rep/repne,
  * and the six segment overrides). Lets the interpreter gate the prefix-decode
  * chain on a single table lookup: prefix-free instructions -- the overwhelming
@@ -2975,10 +3103,23 @@ static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles);
  * landing below vectors the exception, and the loop is entered again. */
 void x86_cpu_interp(X86CPUState *s, int max_cycles)
 {
+    /* The budget covers the whole call, faults included. Each fault used to
+     * re-enter the loop with a fresh max_cycles, so a guest stuck faulting
+     * (a #PF handler whose own stack faults, say) never returned to the run
+     * loop: no timers, no input, and in a browser a frozen tab. `start` is
+     * not changed after setjmp, so it survives the longjmp; `faults` is. */
+    int64_t start = s->cycle_count;
+    volatile int faults = 0;
+
     if (setjmp(s->excbuf)) {
         /* A fault/exception was raised mid-instruction; the restart/report point
          * is the faulting instruction. Vector it through the IDT. */
         s->eip = s->cur_eip;
+        /* A fault inside a compiled block: count the instructions it had
+         * completed, as the interpreter would have. */
+        s->cycle_count += s->jit_pending;
+        s->jit_pending = 0;
+        s->jit_step = 0;        /* the fault was in x86_jit_step's instruction */
         /* An x87 escape that faulted may have longjmp'd out with the host FPU
          * still in the guest's RC mode; restore temu's default (see fpu_exec). */
         fesetround(FE_TONEAREST);
@@ -3021,10 +3162,12 @@ void x86_cpu_interp(X86CPUState *s, int max_cycles)
             x86_stop(s, "unhandled exception %d (err=0x%x)",
                      s->exc_intno, s->exc_error);
         }
+        /* a fault counts as one unit of the budget at least */
+        if (++faults >= max_cycles || s->cycle_count - start + faults >= max_cycles)
+            return;
     }
 
-    /* As before the split, a fault restarts the loop with a fresh budget. */
-    x86_interp_loop(s, max_cycles);
+    x86_interp_loop(s, max_cycles - faults - (int)(s->cycle_count - start));
 }
 
 static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
@@ -3086,8 +3229,42 @@ static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
         if (unlikely(s->fetch_dirty
                      || !(s->fetch_ptr < s->fetch_end)
                      || s->seg[X86_CPU_SEG_CS].base != s->win_cs_base
-                     || (uintptr_t)s->fetch_ptr != s->win_eip_addend + s->eip))
+                     || (uintptr_t)s->fetch_ptr != s->win_eip_addend + s->eip)) {
+#ifdef X86_JIT
+            /* A control transfer landed here (or the window ran out): run a
+             * compiled block for this target if there is one. It updates
+             * EIP and cycle_count itself and returns how many instructions
+             * it ran; the next iteration takes interrupts as usual. */
+            int n = s->jit_step ? 0 : x86_jit_run(s);
+            if (n > 0) {
+                i += n - 1;
+                /* Ask the JIT again at the next instruction even when the
+                 * block came back to where the window still points (a ret
+                 * to just after the call that left): otherwise everything
+                 * up to the next branch would be interpreted. */
+                s->fetch_dirty = 1;
+                continue;
+            }
+            if (unlikely(s->jit_poke)) {
+                /* A compiled block stopped before this instruction, which
+                 * the JIT doesn't handle: run it here, then mark the window
+                 * stale so the next instruction asks the JIT again instead
+                 * of being interpreted all the way to the next branch. */
+                s->jit_poke = 0;
+                fetch_refill(s);
+                s->fetch_dirty = 1;
+#ifdef X86_JIT_STATS
+                x86_jit_prof_cause = 7;     /* WHY_POKE */
+                x86_jit_note_stop(s->fetch_ptr, s->fetch_end);
+#endif
+            } else
+#endif
             fetch_refill(s);
+        }
+#ifdef X86_JIT_STATS
+        x86_jit_prof_interp++;      /* instructions the interpreter dispatches */
+        x86_jit_prof_by[x86_jit_prof_cause]++;
+#endif
 
         def_op = (s->seg[X86_CPU_SEG_CS].flags & 0x4000) ? 4 : 2; /* D/B bit */
         op_size = def_op;
@@ -3779,99 +3956,9 @@ static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
             case 3: /* neg */
                 rm_write(s, &rm, alu(s, 5, 0, a, sz), sz);
                 break;
-            case 4: { /* mul (unsigned) */
-                if (sz == 1) {
-                    uint32_t r = (get_reg8(s, REG_EAX) & 0xff) * (a & 0xff);
-                    set_regv(s, REG_EAX, r & 0xffff, 2);
-                    flags_sync(s);
-                    s->eflags_ &= ~(EFL_CF | EFL_OF);
-                    if (r & 0xff00) s->eflags_ |= EFL_CF | EFL_OF;
-                } else if (sz == 2) {
-                    uint32_t r = (s->regs[REG_EAX] & 0xffff) * (a & 0xffff);
-                    set_regv(s, REG_EAX, r & 0xffff, 2);
-                    set_regv(s, REG_EDX, (r >> 16) & 0xffff, 2);
-                    flags_sync(s);
-                    s->eflags_ &= ~(EFL_CF | EFL_OF);
-                    if (r >> 16) s->eflags_ |= EFL_CF | EFL_OF;
-                } else {
-                    uint64_t r = (uint64_t)s->regs[REG_EAX] * a;
-                    s->regs[REG_EAX] = (uint32_t)r;
-                    s->regs[REG_EDX] = (uint32_t)(r >> 32);
-                    flags_sync(s);
-                    s->eflags_ &= ~(EFL_CF | EFL_OF);
-                    if (r >> 32) s->eflags_ |= EFL_CF | EFL_OF;
-                }
-            } break;
-            case 5: { /* imul (signed, one-operand) */
-                if (sz == 1) {
-                    int32_t r = (int8_t)get_reg8(s, REG_EAX) * (int8_t)a;
-                    set_regv(s, REG_EAX, (uint16_t)r, 2);
-                    flags_sync(s);
-                    s->eflags_ &= ~(EFL_CF | EFL_OF);
-                    if (r != (int8_t)r) s->eflags_ |= EFL_CF | EFL_OF;
-                } else if (sz == 2) {
-                    int32_t r = (int16_t)s->regs[REG_EAX] * (int16_t)a;
-                    set_regv(s, REG_EAX, (uint16_t)r, 2);
-                    set_regv(s, REG_EDX, (uint16_t)(r >> 16), 2);
-                    flags_sync(s);
-                    s->eflags_ &= ~(EFL_CF | EFL_OF);
-                    if (r != (int16_t)r) s->eflags_ |= EFL_CF | EFL_OF;
-                } else {
-                    int64_t r = (int64_t)(int32_t)s->regs[REG_EAX] * (int32_t)a;
-                    s->regs[REG_EAX] = (uint32_t)r;
-                    s->regs[REG_EDX] = (uint32_t)((uint64_t)r >> 32);
-                    flags_sync(s);
-                    s->eflags_ &= ~(EFL_CF | EFL_OF);
-                    if (r != (int32_t)r) s->eflags_ |= EFL_CF | EFL_OF;
-                }
-            } break;
-            case 6: { /* div (unsigned) */
-                if (a == 0) raise_exception(s, EXC_DE);
-                if (sz == 1) {
-                    uint32_t num = s->regs[REG_EAX] & 0xffff;
-                    uint32_t q = num / (a & 0xff), r = num % (a & 0xff);
-                    if (q > 0xff) raise_exception(s, EXC_DE);
-                    set_reg8(s, REG_EAX, q); set_reg8(s, REG_EAX + 4, r); /* AL, AH */
-                } else if (sz == 2) {
-                    uint32_t num = ((s->regs[REG_EDX] & 0xffff) << 16) | (s->regs[REG_EAX] & 0xffff);
-                    uint32_t q = num / (a & 0xffff), r = num % (a & 0xffff);
-                    if (q > 0xffff) raise_exception(s, EXC_DE);
-                    set_regv(s, REG_EAX, q, 2); set_regv(s, REG_EDX, r, 2);
-                } else {
-                    uint64_t num = ((uint64_t)s->regs[REG_EDX] << 32) | s->regs[REG_EAX];
-                    uint64_t q = num / a, r = num % a;
-                    if (q > 0xffffffffu) raise_exception(s, EXC_DE);
-                    s->regs[REG_EAX] = (uint32_t)q; s->regs[REG_EDX] = (uint32_t)r;
-                }
-            } break;
-            case 7: { /* idiv (signed) */
-                if (a == 0) raise_exception(s, EXC_DE);
-                if (sz == 1) {
-                    int32_t num = (int16_t)s->regs[REG_EAX];
-                    int32_t q = num / (int8_t)a, r = num % (int8_t)a;
-                    if (q != (int8_t)q) raise_exception(s, EXC_DE);
-                    set_reg8(s, REG_EAX, (uint8_t)q); set_reg8(s, REG_EAX + 4, (uint8_t)r);
-                } else if (sz == 2) {
-                    int32_t num = (int32_t)(((s->regs[REG_EDX] & 0xffff) << 16) | (s->regs[REG_EAX] & 0xffff));
-                    int32_t d = (int16_t)a, q, r;
-                    /* MIN/-1 overflows int32 (C UB -> host SIGFPE); it also can't
-                     * fit the 16-bit quotient, so it is #DE either way. */
-                    if (d == -1 && (uint32_t)num == 0x80000000u) raise_exception(s, EXC_DE);
-                    q = num / d; r = num % d;
-                    if (q != (int16_t)q) raise_exception(s, EXC_DE);
-                    set_regv(s, REG_EAX, (uint16_t)q, 2); set_regv(s, REG_EDX, (uint16_t)r, 2);
-                } else {
-                    int64_t num = (int64_t)(((uint64_t)s->regs[REG_EDX] << 32) | s->regs[REG_EAX]);
-                    int32_t d = (int32_t)a;
-                    int64_t q, r;
-                    /* MIN/-1 overflows int64 (C UB) and overflows the 32-bit
-                     * quotient -> #DE. */
-                    if (d == -1 && (uint64_t)num == 0x8000000000000000ULL) raise_exception(s, EXC_DE);
-                    q = num / d; r = num % d;
-                    if (q != (int32_t)q) raise_exception(s, EXC_DE);
-                    s->regs[REG_EAX] = (uint32_t)q; s->regs[REG_EDX] = (uint32_t)r;
-                }
-            } break;
+            default: /* mul, imul, div, idiv */
+                group3_muldiv(s, reg, a, sz);
+                break;
             }
         } break;
 
@@ -4330,7 +4417,116 @@ static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
     }
 }
 
+/* ---- helpers called from JIT-compiled blocks (x86_jit.c) -------------- */
+#ifdef X86_JIT
+/* Exported from the module: wasm/x86jit.js imports them into every block.
+ * They are the interpreter's own accessors, so a TLB miss, a #PF or MMIO
+ * inside a compiled block behaves exactly as it does when interpreted. */
+EMSCRIPTEN_KEEPALIVE uint32_t x86_jit_ld(X86CPUState *s, uint32_t la, uint32_t size)
+{
+    /* Zero-extended to `size`, as the inline TLB-hit path loads it: a read
+     * with no device behind it returns all-ones at full width. */
+    uint32_t v = ld_lin(s, la, (int)size);
+    return size == 4 ? v : size == 2 ? (v & 0xffff) : (v & 0xff);
+}
+/* Returns nonzero when the store dropped compiled code, possibly the caller's. */
+EMSCRIPTEN_KEEPALIVE int x86_jit_st(X86CPUState *s, uint32_t la, uint32_t v, uint32_t size)
+{
+    s->jit_abort = 0;
+    st_lin(s, la, v, (int)size);
+    return s->jit_abort;
+}
+EMSCRIPTEN_KEEPALIVE int x86_jit_test_cc(X86CPUState *s, int cc)
+{
+    return test_cc(s, cc);
+}
+EMSCRIPTEN_KEEPALIVE int x86_jit_get_cf(X86CPUState *s)
+{
+    return get_cf(s);
+}
+/* group2 shift/rotate of v (already read): the interpreter's do_shift, flags
+ * and all. Returns the result for the block to store. */
+EMSCRIPTEN_KEEPALIVE uint32_t x86_jit_shift(X86CPUState *s, int op, uint32_t v,
+                                            int count, int size)
+{
+    return do_shift(s, op, v, count, size);
+}
+/* group3 mul/imul/div/idiv of a (already read); a divide error raises #DE */
+EMSCRIPTEN_KEEPALIVE int x86_jit_muldiv(X86CPUState *s, int reg, uint32_t a, int size)
+{
+    group3_muldiv(s, reg, a, size);
+    return 0;
+}
+/* Run the one instruction at EIP for a compiled block that doesn't handle
+ * it, then let the block go on at `next`. Returns nonzero when the block
+ * must leave instead (EIP stays where the instruction put it): a jump,
+ * a restarted `rep`, a TLB flush (the page's mapping may have changed),
+ * dropped code, HLT/x86_stop, or a newly opened interrupt window -- IF set
+ * or an interrupt shadow (sti, mov ss) -- so interrupts are taken on time.
+ *
+ * The interpreter loop runs it as usual, with two differences: jit_step
+ * keeps it from asking the JIT, and a preset interrupt shadow keeps it from
+ * delivering an interrupt before the instruction (the block was entered
+ * with the shadow clear, so a shadow afterwards is the instruction's own).
+ * The block counts the instruction itself, hence the cycle_count--. A fault
+ * longjmps to x86_cpu_interp's landing, as from the other helpers. */
+EMSCRIPTEN_KEEPALIVE int x86_jit_step(X86CPUState *s, uint32_t next)
+{
+    uint32_t fl = s->eflags_;
+#ifdef X86_JIT_STATS
+    {
+        uint32_t la = s->eip;
+        const X86TLBEntry *te = &s->tlb_code[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+        if ((la ^ te->vaddr) <= 0xfffu) {
+            const uint8_t *p = (const uint8_t *)(uintptr_t)(te->mem_addend + la);
+            x86_jit_note_step(p, p + (0x1000 - (la & 0xfff)));
+        }
+    }
+#endif
+    s->jit_abort = 0;
+    /* refill the fetch window: it was built before the block moved EIP, and
+     * maybe before a TLB flush; set again afterwards = flushed by this one */
+    s->fetch_dirty = 1;
+    s->int_shadow = 1;
+    s->jit_step = 1;
+    x86_interp_loop(s, 1);
+    s->jit_step = 0;
+    s->cycle_count--;
+#ifdef X86_JIT_STATS
+    x86_jit_prof_steps++;
+    if (s->eip != next || s->halted || s->int_shadow || s->jit_abort ||
+        s->fetch_dirty || (~fl & s->eflags_ & EFL_IF))
+        x86_jit_prof_step_exits++;
+#endif
+    return s->eip != next || s->halted || s->int_shadow || s->jit_abort ||
+           s->fetch_dirty || (~fl & s->eflags_ & EFL_IF);
+}
+/* the two- and three-operand 32-bit imul: product, with CF/OF as the
+ * interpreter sets them */
+EMSCRIPTEN_KEEPALIVE uint32_t x86_jit_imul(X86CPUState *s, uint32_t a, uint32_t b)
+{
+    int64_t r = (int64_t)(int32_t)a * (int32_t)b;
+    flags_sync(s);
+    s->eflags_ &= ~(EFL_CF | EFL_OF);
+    if (r != (int32_t)r)
+        s->eflags_ |= EFL_CF | EFL_OF;
+    return (uint32_t)r;
+}
+#endif
+
 /* ---- public interface -------------------------------------------------- */
+
+/* A device is about to write guest RAM at physical `paddr` (DMA): drop any
+ * compiled code there. A no-op without the JIT. */
+void x86_cpu_note_ram_write(X86CPUState *s, uint64_t paddr)
+{
+#ifdef X86_JIT
+    if (paddr < 0x100000000ull)
+        x86_jit_note_write(s, (uint32_t)paddr);
+#else
+    (void)s; (void)paddr;
+#endif
+}
 
 X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
 {
@@ -4378,6 +4574,20 @@ uint32_t x86_cpu_get_reg(X86CPUState *s, int reg)
     if (reg == X86_CPU_REG_EIP) return s->eip;
     if (reg == X86_CPU_REG_CR0) return s->cr0;
     if (reg == X86_CPU_REG_CR2) return s->cr2;
+    if (reg == X86_CPU_REG_EFLAGS) {
+        /* computed without materializing: reading must not change the state */
+        uint32_t f = s->eflags_;
+        if (s->cc_op != CC_OP_EFLAGS) {
+            f &= ~(uint32_t)(EFL_CF | EFL_PF | EFL_AF | EFL_ZF | EFL_SF | EFL_OF);
+            if (cc_cf(s)) f |= EFL_CF;
+            if (cc_pf(s)) f |= EFL_PF;
+            if (cc_af(s)) f |= EFL_AF;
+            if (cc_zf(s)) f |= EFL_ZF;
+            if (cc_sf(s)) f |= EFL_SF;
+            if (cc_of(s)) f |= EFL_OF;
+        }
+        return f;
+    }
     return 0;
 }
 

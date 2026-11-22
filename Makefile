@@ -204,7 +204,7 @@ install: $(PROGS)
 # clean removes build intermediates and the in-tree dev binaries. The dist/
 # tree (Docker release artifacts) is left alone; use distclean to remove it.
 clean:
-	rm -f *.o *.d *~ $(PROGS) x86-selftest slirp/*.o slirp/*.d slirp/*~
+	rm -f *.o *.d *~ $(PROGS) x86-selftest microbench inflate-test slirp/*.o slirp/*.d slirp/*~
 
 distclean: clean
 	rm -rf $(DIST_DIR)

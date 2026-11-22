@@ -249,8 +249,11 @@ uint8_t *phys_mem_get_ram_ptr(PhysMemoryMap *map, uint64_t paddr, BOOL is_rw)
     if (!pr || !pr->is_ram)
         return NULL;
     offset = paddr - pr->addr;
-    if (is_rw)
+    if (is_rw) {
         phys_mem_set_dirty_bit(pr, offset);
+        if (map->notify_ram_write)
+            map->notify_ram_write(map->opaque, paddr);
+    }
     return pr->phys_mem + (uintptr_t)offset;
 }
 

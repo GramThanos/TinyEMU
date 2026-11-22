@@ -297,6 +297,28 @@ static void test_pop_esp(void)
     x86_cpu_end(s);
 }
 
+/* A read where no RAM or device sits returns all-ones at the access width,
+ * zero-extended: movzx of an unmapped word is 0x0000ffff, not 0xffffffff
+ * (phys_read used to return 0xffffffff at every size). */
+static void test_unmapped_read_width(void)
+{
+    static const uint8_t p[] = {
+        0x0F,0xB7,0x1D,0x00,0x00,0x10,0x00,     /* movzx ebx, word [0x100000] */
+        0x0F,0xB6,0x0D,0x00,0x00,0x10,0x00,     /* movzx ecx, byte [0x100000] */
+        0x8B,0x15,0x00,0x00,0x10,0x00,          /* mov edx, [0x100000]        */
+        0xF4
+    };
+    PhysMemoryMap *map = mk_map(0x10000);       /* 64 KB: 1 MB is unmapped */
+    X86CPUState *s = mk_cpu(map, 0x8000);
+    memcpy(g_ram, p, sizeof(p));
+    x86_cpu_interp(s, 1000);
+    printf("  unmapped read: movzx word/byte zero-extend all-ones\n");
+    CHECK(s, 3, 0x0000ffff);
+    CHECK(s, 1, 0x000000ff);
+    CHECK(s, 2, 0xffffffff);
+    x86_cpu_end(s);
+}
+
 static void test_bswap(void)
 {
     static const uint8_t p[] = {
@@ -1868,6 +1890,144 @@ static void test_x87_transcendental(void)
     x86_cpu_end(s);
 }
 
+/* 80-bit extended precision + control-word RC/PC fields.
+ *
+ *  - retention: an integer > 2^53 round-trips fild m64 -> fistp m64 exactly.
+ *    A 53-bit (double) significand would drop the low bit; a 64-bit extended
+ *    significand keeps it.
+ *  - RC: frndint(0.5) is 0 under round-to-nearest-even but 1 under round-up,
+ *    proving the CW rounding-control field reaches the host rounding mode.
+ *  - PC: 1/3 computed with PC=24 (single) zeroes the low 40 bits of the stored
+ *    m80 significand; with PC=64 (extended) they are non-zero. */
+static uint64_t x87_run_u64(const uint8_t *prog, int plen,
+                            const void *data, int dlen, int dat_off, int out_off)
+{
+    PhysMemoryMap *map = mk_map(0x10000);
+    X86CPUState *s = mk_cpu(map, 0x8000);
+    uint64_t out;
+    memcpy(g_ram, prog, plen);
+    if (data) memcpy(g_ram + dat_off, data, dlen);
+    x86_cpu_interp(s, 200);
+    memcpy(&out, g_ram + out_off, 8);
+    x86_cpu_end(s);
+    return out;
+}
+
+static void test_x87_extended(void)
+{
+    /* --- retention: fild qword [0x2000]; fistp qword [0x2008] --- */
+    static const uint8_t p_ret[] = {
+        0xDF,0x2D,0x00,0x20,0x00,0x00,   /* fild  qword [0x2000] */
+        0xDF,0x3D,0x08,0x20,0x00,0x00,   /* fistp qword [0x2008] */
+        0xF4
+    };
+    uint64_t vin = 0x0020000000000001ULL;   /* 2^53 + 1 */
+    uint64_t vout = x87_run_u64(p_ret, sizeof(p_ret), &vin, 8, 0x2000, 0x2008);
+    printf("  x87 80-bit: fild/fistp 2^53+1 -> %#llx\n", (unsigned long long)vout);
+    if (vout != vin) { printf("    *** FAIL: lost the low bit (double-precision significand)\n"); g_fail = 1; }
+
+    /* --- RC: build 0.5 (=1/2), fldcw, frndint, fistp dword --- */
+    /*  D9 E8 fld1 ; DB 05 [0x2000] fild dword(=2) ; DE F9 fdivp st1,st0 (=0.5)
+     *  D9 2D [0x2004] fldcw ; D9 FC frndint ; DB 1D [0x2008] fistp dword    */
+    static const uint8_t p_rc[] = {
+        0xD9,0xE8,
+        0xDB,0x05,0x00,0x20,0x00,0x00,
+        0xDE,0xF9,
+        0xD9,0x2D,0x04,0x20,0x00,0x00,
+        0xD9,0xFC,
+        0xDB,0x1D,0x08,0x20,0x00,0x00,
+        0xF4
+    };
+    struct { int32_t two; uint16_t cw; } up   = { 2, 0x0B7F };  /* RC=10 round up */
+    struct { int32_t two; uint16_t cw; } near = { 2, 0x037F };  /* RC=00 nearest  */
+    int32_t r_up   = (int32_t)x87_run_u64(p_rc, sizeof(p_rc), &up,   6, 0x2000, 0x2008);
+    int32_t r_near = (int32_t)x87_run_u64(p_rc, sizeof(p_rc), &near, 6, 0x2000, 0x2008);
+    printf("  x87 RC: frndint(0.5) up=%d nearest=%d\n", r_up, r_near);
+    if (r_up != 1)   { printf("    *** FAIL: round-up frndint(0.5)!=1\n");   g_fail = 1; }
+    if (r_near != 0) { printf("    *** FAIL: nearest frndint(0.5)!=0\n");    g_fail = 1; }
+
+    /* --- PC: 1/3 with PC=24 vs PC=64, inspect stored m80 significand --- */
+    /*  D9 2D [0x2004] fldcw ; D9 E8 fld1 ; DB 05 [0x2000] fild(=3)
+     *  DE F9 fdivp (=1/3) ; DB 3D [0x2008] fstp tbyte [0x2008]              */
+    static const uint8_t p_pc[] = {
+        0xD9,0x2D,0x04,0x20,0x00,0x00,
+        0xD9,0xE8,
+        0xDB,0x05,0x00,0x20,0x00,0x00,
+        0xDE,0xF9,
+        0xDB,0x3D,0x08,0x20,0x00,0x00,
+        0xF4
+    };
+    struct { int32_t three; uint16_t cw; } pc24 = { 3, 0x007F };  /* PC=00 single */
+    struct { int32_t three; uint16_t cw; } pc64 = { 3, 0x037F };  /* PC=11 extended */
+    uint64_t m24 = x87_run_u64(p_pc, sizeof(p_pc), &pc24, 6, 0x2000, 0x2008);
+    uint64_t m64 = x87_run_u64(p_pc, sizeof(p_pc), &pc64, 6, 0x2000, 0x2008);
+    uint64_t lowmask = ((uint64_t)1 << 40) - 1;   /* bits below the 24th significand bit */
+    printf("  x87 PC: 1/3 significand pc24=%#llx pc64=%#llx\n",
+           (unsigned long long)m24, (unsigned long long)m64);
+    if ((m24 & lowmask) != 0) { printf("    *** FAIL: PC=24 left low significand bits set\n"); g_fail = 1; }
+    if ((m64 & lowmask) == 0) { printf("    *** FAIL: PC=64 dropped low significand bits\n");  g_fail = 1; }
+}
+
+/* SSE/SSE2. Regression for the python3 crash on Alpine 3.20: libpython's
+ * startup runs `movd %eax,%xmm0` (66 0F 6E C0). With no SSE the 0F fallback
+ * x86_stop()ed, resumed on the next IRQ with EIP *inside* the instruction,
+ * and ran the ModRM byte C0 as a shift through a garbage pointer. Each step
+ * below feeds the next, so a mis-sized instruction or a wrong lane shows up in
+ * the final registers: movd/pshufd/paddd/movdqu, the scalar-double path
+ * gcc -mfpmath=sse emits (cvtsi2sd, mulsd m64, cvttsd2si, cvtsd2si's
+ * round-half-even, ucomisd flags), and an fxsave/fxrstor round trip of XMM1. */
+static void test_sse(void)
+{
+    static const uint8_t p[] = {
+        0xB8,0x00,0x02,0x00,0x00,               /* mov eax,0x200 (OSFXSR)  */
+        0x0F,0x22,0xE0,                         /* mov cr4,eax             */
+        0xB8,0x78,0x56,0x34,0x12,               /* mov eax,0x12345678      */
+        0x66,0x0F,0x6E,0xC0,                    /* movd xmm0,eax           */
+        0x66,0x0F,0x70,0xC8,0x00,               /* pshufd xmm1,xmm0,0      */
+        0x66,0x0F,0xFE,0xC9,                    /* paddd xmm1,xmm1         */
+        0xF3,0x0F,0x7F,0x0D,0x00,0x30,0,0,      /* movdqu [0x3000],xmm1    */
+        0x66,0x0F,0x7E,0xC9,                    /* movd ecx,xmm1           */
+        0xB8,0x07,0x00,0x00,0x00,               /* mov eax,7               */
+        0xF2,0x0F,0x2A,0xD0,                    /* cvtsi2sd xmm2,eax       */
+        0xF2,0x0F,0x59,0x15,0x00,0x31,0,0,      /* mulsd xmm2,[0x3100]     */
+        0xF2,0x0F,0x2C,0xD2,                    /* cvttsd2si edx,xmm2      */
+        0xF2,0x0F,0x2D,0xF2,                    /* cvtsd2si esi,xmm2       */
+        0xBB,0x00,0x00,0x00,0x00,               /* mov ebx,0               */
+        0x66,0x0F,0x2E,0x15,0x00,0x31,0,0,      /* ucomisd xmm2,[0x3100]   */
+        0x0F,0x97,0xC3,                         /* seta bl                 */
+        0x0F,0xAE,0x05,0x00,0x40,0,0,           /* fxsave [0x4000]         */
+        0x66,0x0F,0xEF,0xC9,                    /* pxor xmm1,xmm1          */
+        0x0F,0xAE,0x0D,0x00,0x40,0,0,           /* fxrstor [0x4000]        */
+        0x66,0x0F,0x7E,0xCF,                    /* movd edi,xmm1           */
+        0xF4                                    /* hlt                     */
+    };
+    static const uint8_t onehalf[8] = { 0,0,0,0,0,0,0xF8,0x3F }; /* 1.5 */
+    PhysMemoryMap *map = mk_map(0x10000);
+    X86CPUState *s = mk_cpu(map, 0x8000);
+    uint32_t v;
+    int i, bad = 0;
+    memcpy(g_ram, p, sizeof(p));
+    memcpy(g_ram + 0x3100, onehalf, 8);
+    x86_cpu_interp(s, 1000);
+    printf("  sse: movd/pshufd/paddd, cvtsi2sd*1.5 -> cvt(t)sd2si, ucomisd, fxsave\n");
+    CHECK(s, 1, 0x2468ACF0);   /* movd ecx: (x+x) in lane 0               */
+    CHECK(s, 2, 10);           /* cvttsd2si(10.5) truncates               */
+    CHECK(s, 6, 10);           /* cvtsd2si(10.5) rounds half to even      */
+    CHECK(s, 3, 1);            /* ucomisd 10.5 vs 1.5: CF=ZF=0 -> seta    */
+    CHECK(s, 7, 0x2468ACF0);   /* fxrstor brought XMM1 back after pxor    */
+    CHECK(s, X86_CPU_REG_EIP, sizeof(p)); /* every length decoded right   */
+    for (i = 0; i < 4; i++) {  /* movdqu stored all four lanes            */
+        memcpy(&v, g_ram + 0x3000 + 4 * i, 4);
+        if (v != 0x2468ACF0) bad = 1;
+    }
+    memcpy(&v, g_ram + 0x4000 + 24, 4);   /* fxsave image: MXCSR default  */
+    if (v != 0x1f80) bad = 1;
+    memcpy(&v, g_ram + 0x4000 + 160 + 16, 4); /* XMM1 slot               */
+    if (v != 0x2468ACF0) bad = 1;
+    if (bad) { printf("    *** FAIL: movdqu / fxsave memory image\n"); g_fail = 1; }
+    x86_cpu_end(s);
+}
+
 /* NX/XD enforcement: with EFER.NXE and CR4.PAE, fetching from a page whose XD
  * bit is set raises #PF with the present+instruction-fetch error code, even
  * though the page is present and readable. Two 2 MB PAE identity mappings alias
@@ -1947,6 +2107,7 @@ int main(void)
     test_paging();
     test_pop_esp();
     test_bswap();
+    test_unmapped_read_width();
     test_call_indirect_pf_restart();
     test_page_cross();
     test_xadd_pf_restart();
@@ -1981,7 +2142,9 @@ int main(void)
     test_xlat();
     test_lar_lsl();
     test_x87_transcendental();
+    test_x87_extended();
     test_nx_exec();
+    test_sse();
     printf("%s\n", g_fail ? "SELFTEST FAILED" : "SELFTEST PASSED");
     return g_fail;
 }

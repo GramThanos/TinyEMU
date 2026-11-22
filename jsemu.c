@@ -40,6 +40,9 @@
 #include "machine.h"
 #include "list.h"
 #include "fbuf.h"
+#ifdef CONFIG_X86EMU
+#include "x86_cpu.h"
+#endif
 
 void virt_machine_run(void *opaque);
 
@@ -65,7 +68,7 @@ static BOOL global_carrier_state;
 /* Run-loop control. The emulator drives itself with a self-rescheduling
  * emscripten_async_call(virt_machine_run, ...) chain that JS cannot suspend from
  * outside, so pause/stop are implemented here and exported for the JS host
- * (see web/js/vm/EmulatorEngine.js, which cwraps these if present). */
+ * (see jsLab's lib/vm/EmulatorEngine.js, which cwraps these if present). */
 static BOOL global_paused;
 static BOOL global_stopped;
 /* A virt_machine_run call is pending. Pausing ends the chain only when that
@@ -162,7 +165,7 @@ void vm_resume(void)
         schedule_run(global_vm, 0);
 }
 
-/* Snapshots (see web/js/vm/EmulatorEngine.js). The page saves the whole WASM
+/* Snapshots (see jsLab's lib/vm/EmulatorEngine.js). The page saves the whole WASM
  * memory, which holds the machine, between two run-loop ticks, so no C code is
  * running. Restoring copies it into a fresh instance of the same build. */
 
@@ -188,6 +191,17 @@ double vm_disk_bytes(void)
     return (double)block_net_bytes_fetched;
 }
 
+/* blocks the x86 JIT has compiled since boot, counted again when their page
+ * is recompiled; -1 when it is off */
+double vm_jit_blocks(void)
+{
+#ifdef CONFIG_X86EMU
+    return x86_jit_blocks();
+#else
+    return -1;
+#endif
+}
+
 /* called from JS: the emulated timers' clock, saved with a snapshot */
 double vm_snapshot_clock(void)
 {
@@ -207,6 +221,10 @@ int vm_reserve_memory(double size)
 void vm_restore(double clock_ns)
 {
     host_clock_set((int64_t)clock_ns);
+#ifdef CONFIG_X86EMU
+    /* compiled x86 blocks live in the JS instance that saved the snapshot */
+    x86_jit_forget();
+#endif
     run_scheduled = FALSE;
     global_stopped = FALSE;
     global_paused = TRUE;
@@ -503,6 +521,10 @@ void virt_machine_run(void *opaque)
         i++;
     }
     
+#ifdef CONFIG_X86EMU
+    /* blocks that became hot this tick: compile them in the background */
+    x86_jit_flush();
+#endif
     last_tick_ns = host_clock_ns();
     schedule_run(m, delay == 0 ? 0 : MAX_SLEEP_TIME);
 }
