@@ -129,11 +129,11 @@ struct VirtMachineClass {
     void (*vm_send_mouse_event)(VirtMachine *s1, int dx, int dy, int dz,
                                 unsigned int buttons);
     void (*vm_send_key_event)(VirtMachine *s1, BOOL is_down, uint16_t key_code);
+    /* instructions (or cycles) the CPU has run; NULL if the machine can't say */
+    int64_t (*vm_get_cycles)(VirtMachine *s);
 };
 
-#ifndef CONFIG_X86EMU
 extern const VirtMachineClass riscv_machine_class;
-#endif
 #ifdef CONFIG_X86EMU
 extern const VirtMachineClass pc_machine_class;
 #endif
@@ -152,6 +152,12 @@ char *get_file_path(const char *base_filename, const char *filename);
 void virt_machine_free_config(VirtMachineParams *p);
 VirtMachine *virt_machine_init(const VirtMachineParams *p);
 void virt_machine_end(VirtMachine *s);
+
+/* Host monotonic clock in ns that the emulated timers (PIT, RTC, TSC) read.
+   Restoring a snapshot moves it with host_clock_set() so the guest's clocks
+   carry on from the moment the snapshot was taken. */
+int64_t host_clock_ns(void);
+void host_clock_set(int64_t ns);
 static inline int virt_machine_get_sleep_duration(VirtMachine *s, int delay)
 {
     return s->vmc->virt_machine_get_sleep_duration(s, delay);
@@ -198,3 +204,7 @@ BlockDevice *block_device_init_http(const char *url,
                                     int max_cache_size_kb,
                                     void (*start_cb)(void *opaque),
                                     void *start_opaque);
+#ifdef EMSCRIPTEN
+/* block_js.c — JS-backed persistent disk (synchronous init) */
+BlockDevice *block_device_init_js(const char *name);
+#endif

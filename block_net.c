@@ -38,6 +38,7 @@
 #include "list.h"
 #include "fbuf.h"
 #include "machine.h"
+#include "inflate.h"
 
 typedef enum {
     CBLOCK_LOADING,
@@ -106,6 +107,10 @@ typedef struct BlockDeviceHTTP {
 
     /* prefetch */
     int prefetch_group_len;
+
+    /* blk.txt "compression": "gzip": each chunk is blk%09u.bin.gz, a gzip of
+       the raw chunk (see bf_read_onload) */
+    BOOL gzip;
 } BlockDeviceHTTP;
 
 static void bf_update_block(CachedBlock *b, const uint8_t *data);
@@ -192,7 +197,8 @@ static void bf_start_load_block(BlockDevice *bs, int block_num)
            (int)(bf->n_write_sectors / 2),
            (int)(bf->n_allocated_clusters * bf->sectors_per_cluster / 2));
 #endif
-    snprintf(filename, sizeof(filename), BLK_FMT, bf->url, block_num);
+    snprintf(filename, sizeof(filename), BLK_FMT "%s", bf->url, block_num,
+             bf->gzip ? ".gz" : "");
     //    printf("wget %s\n", filename);
     fs_wget(filename, NULL, NULL, b, bf_read_onload, TRUE);
 }
@@ -353,16 +359,43 @@ static void bf_update_block(CachedBlock *b, const uint8_t *data)
     }
 }
 
+/* Disk chunks downloaded, and their bytes as fetched (compressed, for gzip
+   disks), for the page's statistics (jsemu.c, vm_disk_chunks/vm_disk_bytes). */
+int64_t block_net_chunks_fetched;
+int64_t block_net_bytes_fetched;
+
 static void bf_read_onload(void *opaque, int err, void *data, size_t size)
 {
     CachedBlock *b = opaque;
     BlockDeviceHTTP *bf = b->bf;
 
+    if (err >= 0) {
+        block_net_chunks_fetched++;
+        block_net_bytes_fetched += size;
+    }
+
     if (err < 0) {
         fprintf(stderr, "Could not load block %u\n", b->block_num);
         exit(1);
     }
-    
+
+    /* A gzip chunk is inflated here. One that arrives already raw is used as
+       is: a server may send the .gz with Content-Encoding: gzip, which the
+       browser (or curl) then decodes on the way in. */
+    if (bf->gzip && size >= 2 &&
+        ((const uint8_t *)data)[0] == 0x1f && ((const uint8_t *)data)[1] == 0x8b) {
+        size_t block_bytes = (size_t)bf->block_size * 512;
+        uint8_t *raw = malloc(block_bytes);
+        if (!raw || gzip_size(data, size) != (long)block_bytes ||
+            gzip_inflate(raw, block_bytes, data, size) < 0) {
+            fprintf(stderr, "Corrupt compressed block %u\n", b->block_num);
+            exit(1);
+        }
+        bf_update_block(b, raw);
+        free(raw);
+        return;
+    }
+
     assert(size == bf->block_size * 512);
     bf_update_block(b, data);
 }
@@ -488,9 +521,30 @@ static void bf_init_onload(void *opaque, int err, void *data, size_t size)
         vm_error("prefetch_group_len is too large");
         goto config_error;
     }
-    
+
+    /* optional: absent or "none" for raw chunks, "gzip" for gzipped ones */
+    {
+        JSONValue comp = json_object_get(cfg, "compression");
+        const char *name;
+        bf->gzip = FALSE;
+        if (!json_is_undefined(comp)) {
+            name = json_get_str(comp);
+            if (name && !strcmp(name, "gzip")) {
+                bf->gzip = TRUE;
+            } else if (!name || strcmp(name, "none") != 0) {
+                vm_error("unsupported block device compression\n");
+                goto config_error;
+            }
+        }
+    }
+
     array = json_object_get(cfg, "prefetch");
     if (!json_is_undefined(array)) {
+        if (bf->gzip && bf->prefetch_group_len > 1) {
+            /* a group file is several raw blocks back to back */
+            vm_error("prefetch groups are not supported with compression\n");
+            goto config_error;
+        }
         int idx, prefetch_len, l, i;
         JSONValue el;
         int tab_block_num[PREFETCH_GROUP_LEN_MAX];

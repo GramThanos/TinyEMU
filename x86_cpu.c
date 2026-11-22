@@ -1,25 +1,32 @@
 /*
- * x86 CPU emulator stub
- * 
+ * x86 CPU emulator - software interpreter
+ *
  * Copyright (c) 2011-2017 Fabrice Bellard
+ * Copyright (c) 2026 TinyEMU x86 software-CPU project
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
+ * in the Software without restriction ... (MIT, see LICENSE)
  *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
+ * A from-scratch, WASM-targetable interpreter covering the P6 (i686-class)
+ * integer ISA advertised by CPUID leaf 1, plus the x87 FPU. Implemented:
+ *   - 32-bit execution with two-level paging (4 KB + 4 MB pages) and a TLB
+ *   - ModR/M + SIB decode; 16- and 32-bit addressing (0x67); op sizes 8/16/32
+ *     (0x66); segment overrides; rep/repe/repne string ops
+ *   - full integer ISA: ALU family, mov/lea/xchg, shifts/rotates, shld/shrd,
+ *     mul/div/imul, bit ops (bt/bts/btr/btc, bsf/bsr), setcc/cmovcc, movzx,
+ *     xadd, cmpxchg(8b), bound/arpl, daa/das/aaa/aas/aam/aad, xlat
+ *   - control flow: jmp/Jcc/call/ret (near+far), loop*, enter/leave, int/iret
+ *   - protected mode: segment loads (mov/pop/les/lds/lss/lfs/lgs), lar/lsl,
+ *     verr/verw, sldt/str/lldt/ltr, [ls]gdt/[ls]idt/[ls]msw/invlpg,
+ *     interrupt/exception delivery (IDT), sysenter/sysexit
+ *   - system: cpuid, rdtsc, rd/wrmsr, mov cr/dr, clts, in/out
+ *   - x87 FPU: loads/stores (m32/m64/m80, int m16/m32/m64, BCD), arithmetic,
+ *     compares (incl. fcomi/fucomi), fcmovcc, transcendentals, fsave/frstor
+ *   - SSE/SSE2 on XMM registers, fxsave/fxrstor, ldmxcsr/stmxcsr, fences
+ * NOT MODELLED: MMX (not advertised via CPUID; its encodings #UD), SSE3+,
+ * SMM (rsm), and the WASM JIT. Unknown one-byte opcodes stop the CPU with a
+ * diagnostic; unknown 0F opcodes raise #UD.
  */
 #include <stdlib.h>
 #include <stdio.h>
@@ -27,70 +34,4406 @@
 #include <string.h>
 #include <inttypes.h>
 #include <assert.h>
+#include <math.h>
+#include <fenv.h>
 
 #include "cutils.h"
 #include "x86_cpu.h"
+#include "x86_cpu_priv.h"
+
+/* ---- diagnostics ------------------------------------------------------- */
+
+static void x86_stop(X86CPUState *s, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "x86_cpu: STOP at CS:EIP=%04x:%08x: ",
+            s->seg[X86_CPU_SEG_CS].sel, s->eip);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    va_end(ap);
+    s->halted = TRUE;
+}
+
+/* ---- physical / linear memory ----------------------------------------- */
+
+static uint32_t phys_read(X86CPUState *s, uint32_t addr, int size)
+{
+#ifdef X86_RWATCH
+    /* Optional physical read-watch: set X86_RWATCH_ADDR to a phys address to log
+     * 4-byte reads of it (debugging aid; unset by default). */
+#ifdef X86_RWATCH_ADDR
+    if (size == 4 && addr == (X86_RWATCH_ADDR)) {
+        PhysMemoryRange *rp = get_phys_mem_range(s->mem_map, addr);
+        uint32_t v = 0xffffffffu;
+        if (rp && rp->is_ram) { uint8_t *q = rp->phys_mem + (addr - rp->addr);
+            v = q[0] | (q[1]<<8) | (q[2]<<16) | ((uint32_t)q[3]<<24); }
+        fprintf(stderr, "[rwatch] rd %08x = %08x eip=%08x\n", addr, v, s->cur_eip);
+    }
+#endif
+#endif
+    PhysMemoryRange *pr = get_phys_mem_range(s->mem_map, addr);
+    if (pr && pr->is_ram) {
+        uint8_t *p = pr->phys_mem + (addr - pr->addr);
+        switch (size) {
+        case 1: return p[0];
+        case 2: return p[0] | (p[1] << 8);
+        default: return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24);
+        }
+    } else if (pr && pr->read_func) {
+        int sl = (size == 1) ? 0 : (size == 2) ? 1 : 2;
+        return pr->read_func(pr->opaque, (uint32_t)(addr - pr->addr), sl);
+    }
+    return 0xffffffff;
+}
+
+static void phys_write(X86CPUState *s, uint32_t addr, uint32_t val, int size)
+{
+#ifdef X86_WATCH
+    /* Optional physical write-watch: set X86_WATCH_ADDR to a phys address to log
+     * writes to it (debugging aid; unset by default). */
+#ifdef X86_WATCH_ADDR
+    if (addr == (X86_WATCH_ADDR))
+        fprintf(stderr, "[watch] wr %08x = %08x (size %d) eip=%08x\n",
+                addr, val, size, s->cur_eip);
+#endif
+#endif
+#ifdef X86_PWATCH1
+    /* Optional: set X86_PWATCH1_ADDR to a physical address to log all writes
+     * (any size, any CPL) to that dword — used to trace who corrupts a slot. */
+#ifdef X86_PWATCH1_ADDR
+    if ((addr >= (X86_PWATCH1_ADDR) - 3u) && (addr <= (X86_PWATCH1_ADDR) + 3u))
+        fprintf(stderr, "[pw1] wr phys=%08x val=%08x sz=%d eip=%08x cpl=%d\n",
+                addr, val, size, s->cur_eip, s->seg[X86_CPU_SEG_CS].sel & 3);
+#endif
+#endif
+    PhysMemoryRange *pr = get_phys_mem_range(s->mem_map, addr);
+    if (pr && pr->is_ram) {
+        if (pr->devram_flags & DEVRAM_FLAG_ROM)
+            return;
+        uint8_t *p = pr->phys_mem + (addr - pr->addr);
+        switch (size) {
+        case 1: p[0] = val; break;
+        case 2: p[0] = val; p[1] = val >> 8; break;
+        default: p[0] = val; p[1] = val >> 8; p[2] = val >> 16; p[3] = val >> 24; break;
+        }
+        phys_mem_set_dirty_bit(pr, (size_t)(addr - pr->addr));
+    } else if (pr && pr->write_func) {
+        int sl = (size == 1) ? 0 : (size == 2) ? 1 : 2;
+        pr->write_func(pr->opaque, (uint32_t)(addr - pr->addr), val, sl);
+    }
+}
+
+/* ---- exceptions -------------------------------------------------------- */
+
+#define EXC_DE  0    /* divide error            */
+#define EXC_UD  6    /* invalid opcode          */
+#define EXC_BR  5    /* BOUND range exceeded    */
+#define EXC_GP  13   /* general protection      */
+#define EXC_PF  14   /* page fault              */
+
+static void raise_exception_err(X86CPUState *s, int intno, uint32_t error)
+{
+    s->exc_intno = intno;
+    s->exc_error = error;
+    s->exc_has_error = 1;
+    longjmp(s->excbuf, 1);
+}
+static void raise_exception(X86CPUState *s, int intno)
+{
+    s->exc_intno = intno;
+    s->exc_error = 0;
+    s->exc_has_error = 0;
+    longjmp(s->excbuf, 1);
+}
+
+/* ---- linear -> physical (32-bit non-PAE paging; 4K & 4M pages) ---------- */
+
+#define PG_P  0x001
+#define PG_W  0x002
+#define PG_U  0x004
+#define PG_PS 0x080
+#define PG_A  0x020
+#define PG_D  0x040
+/* XD/NX is bit 63 of a 64-bit PAE entry, i.e. bit 31 of its high dword. */
+#define PG_XD_HI 0x80000000u
+
+/* Access kind for lin_to_phys(): read and write keep the values 0/1 the data
+ * paths already pass; fetch is distinct so the PAE walk can enforce NX. */
+#define ACC_READ  0
+#define ACC_WRITE 1
+#define ACC_FETCH 2
+
+#define MSR_EFER 0xC0000080u
+
+/* Enforce page R/W (with CR0.WP) and U/S protection. Raises #PF on violation. */
+static void pg_check(X86CPUState *s, uint32_t la, int is_write, int is_user,
+                     int pg_wr, int pg_us)
+{
+    int fault = 0;
+    if (is_user) {
+        if (!pg_us) fault = 1;                       /* user access to supervisor page */
+        else if (is_write && !pg_wr) fault = 1;      /* user write to read-only page   */
+    } else if (is_write && !pg_wr && (s->cr0 & CR0_WP)) {
+        fault = 1;                                   /* supervisor write to RO w/ WP=1 */
+    }
+    if (fault) {
+        s->cr2 = la;
+        raise_exception_err(s, EXC_PF, 1 | (is_write ? 2 : 0) | (is_user ? 4 : 0));
+    }
+}
+
+/* Set while the CPU (not the guest program) reads a segment/gate descriptor or a
+ * system table (GDT/LDT/IDT/TSS). Such accesses are always supervisor on real
+ * hardware, regardless of CPL — critical because Linux maps the GDT/IDT read-only
+ * in the supervisor fixmap, and `iret` loads the user CS (raising CPL to 3) before
+ * reading the SS descriptor. Without this the descriptor read would be treated as a
+ * user access to a supervisor page and #PF. */
+static int g_sys_access;
+
+static uint32_t lin_to_phys(X86CPUState *s, uint32_t la, int acc)
+{
+    uint32_t pde_addr, pde, pte_addr, pte, phys;
+    int is_user, is_write = (acc == ACC_WRITE), is_fetch = (acc == ACC_FETCH);
+
+    if (!(s->cr0 & CR0_PG))
+        return la;
+    is_user = !g_sys_access && ((s->seg[X86_CPU_SEG_CS].sel & 3) == 3);
+
+    if (s->cr4 & CR4_PAE) {
+        /* PAE: 3-level walk, 8-byte entries. The frame address needs only each
+         * entry's low dword (guest physical memory is 32-bit here), but the
+         * XD/NX bit lives in the high dword; that half is read only when NXE is
+         * on, keeping the common case a single 4-byte load per level. 2 MB
+         * large pages. */
+        uint32_t pdpte, pde2, pte2, pde2_addr, pte2_addr, need;
+        uint32_t pdpt_base = s->cr3 & ~0x1fu;
+        int nxe = (s->efer & EFER_NXE) != 0;
+        uint32_t xd = 0;   /* OR of the XD bit across the levels that apply */
+        pdpte = phys_read(s, pdpt_base + (((la >> 30) & 0x3) << 3), 4);
+        if (!(pdpte & PG_P)) { s->cr2 = la;
+            raise_exception_err(s, EXC_PF, (is_write ? 2 : 0) | (is_user ? 4 : 0)); }
+        /* A 32-bit PDPTE carries only the present bit -- no A/D, and XD is
+         * reserved (0) at this level in legacy PAE. */
+        pde2_addr = (pdpte & ~0xfffu) + (((la >> 21) & 0x1ff) << 3);
+        pde2 = phys_read(s, pde2_addr, 4);
+        if (!(pde2 & PG_P)) { s->cr2 = la;
+            raise_exception_err(s, EXC_PF, (is_write ? 2 : 0) | (is_user ? 4 : 0)); }
+        if (nxe) xd |= phys_read(s, pde2_addr + 4, 4);
+        if (pde2 & PG_PS) { /* 2 MB page: the PDE is the leaf entry */
+            if (is_fetch && (xd & PG_XD_HI)) { s->cr2 = la;   /* NX violation */
+                raise_exception_err(s, EXC_PF, 1 | (is_user ? 4 : 0) | 0x10); }
+            pg_check(s, la, is_write, is_user, (pde2 & PG_W) != 0, (pde2 & PG_U) != 0);
+            need = PG_A | (is_write ? PG_D : 0);
+            if ((pde2 & need) != need) phys_write(s, pde2_addr, pde2 | need, 4);
+            return (pde2 & ~0x1fffffu) | (la & 0x1fffffu);
+        }
+        pte2_addr = (pde2 & ~0xfffu) + (((la >> 12) & 0x1ff) << 3);
+        pte2 = phys_read(s, pte2_addr, 4);
+        if (!(pte2 & PG_P)) { s->cr2 = la;
+            raise_exception_err(s, EXC_PF, (is_write ? 2 : 0) | (is_user ? 4 : 0)); }
+        if (nxe) xd |= phys_read(s, pte2_addr + 4, 4);
+#ifdef X86_PF_DEBUG
+        if (is_write && !((pde2 & pte2) & PG_W)) { static int n; if (n++ < 4)
+            fprintf(stderr, "[wpfault] la=%08x pdpte=%08x pde2=%08x pte2=%08x cr0=%08x cpl=%d\n",
+                    la, pdpte, pde2, pte2, s->cr0, s->seg[X86_CPU_SEG_CS].sel & 3); }
+#endif
+        if (is_fetch && (xd & PG_XD_HI)) { s->cr2 = la;   /* NX: XD set at PDE or PTE */
+            raise_exception_err(s, EXC_PF, 1 | (is_user ? 4 : 0) | 0x10); }
+        pg_check(s, la, is_write, is_user, ((pde2 & pte2) & PG_W) != 0,
+                 ((pde2 & pte2) & PG_U) != 0);
+        /* Accessed on the leaf PTE (+ Dirty on write) and Accessed on the PDE. */
+        need = PG_A | (is_write ? PG_D : 0);
+        if ((pte2 & need) != need) phys_write(s, pte2_addr, pte2 | need, 4);
+        if (!(pde2 & PG_A)) phys_write(s, pde2_addr, pde2 | PG_A, 4);
+        return (pte2 & ~0xfffu) | (la & 0xfffu);
+    }
+
+    pde_addr = (s->cr3 & ~0xfffu) + (((la >> 22) & 0x3ff) << 2);
+    pde = phys_read(s, pde_addr, 4);
+    if (!(pde & PG_P)) {
+        s->cr2 = la;
+#ifdef X86_PF_DEBUG
+        { static int n; if (n++ < 8) fprintf(stderr,
+            "#PF la=%08x cr3=%08x [PDE@%08x=%08x not present] w=%d u=%d\n",
+            la, s->cr3, pde_addr, pde, is_write, is_user); }
+#endif
+        raise_exception_err(s, EXC_PF, (is_write ? 2 : 0) | (is_user ? 4 : 0));
+    }
+
+    if (pde & PG_PS) { /* 4 MB page: the PDE is the leaf entry (A + D on write) */
+        uint32_t need = PG_A | (is_write ? PG_D : 0);
+        pg_check(s, la, is_write, is_user, (pde & PG_W) != 0, (pde & PG_U) != 0);
+        if ((pde & need) != need) phys_write(s, pde_addr, pde | need, 4);
+        phys = (pde & 0xffc00000u) | (la & 0x003fffffu);
+    } else {
+        pte_addr = (pde & ~0xfffu) + (((la >> 12) & 0x3ff) << 2);
+        pte = phys_read(s, pte_addr, 4);
+        if (!(pte & PG_P)) {
+            s->cr2 = la;
+#ifdef X86_PF_DEBUG
+            { static int n; if (n++ < 8) fprintf(stderr,
+                "#PF la=%08x cr3=%08x PDE@%08x=%08x [PTE@%08x=%08x not present] w=%d u=%d\n",
+                la, s->cr3, pde_addr, pde, pte_addr, pte, is_write, is_user); }
+#endif
+            raise_exception_err(s, EXC_PF, (is_write ? 2 : 0) | (is_user ? 4 : 0));
+        }
+        pg_check(s, la, is_write, is_user, ((pde & pte) & PG_W) != 0,
+                 ((pde & pte) & PG_U) != 0);
+        {
+            uint32_t need = PG_A | (is_write ? PG_D : 0);
+            if ((pte & need) != need) phys_write(s, pte_addr, pte | need, 4);
+        }
+        if (!(pde & PG_A)) phys_write(s, pde_addr, pde | PG_A, 4);
+        phys = (pte & ~0xfffu) | (la & 0xfffu);
+    }
+    return phys;
+}
+
+/* True when a `size`-byte access at linear address `la` spans two pages. Such
+ * accesses must be translated per page: physical pages backing consecutive
+ * linear pages are unrelated, so translating only the first byte and then
+ * reading/writing `size` contiguous *physical* bytes silently touches the
+ * wrong page (and skips the second page's present/permission checks). */
+static int page_crosses(X86CPUState *s, uint32_t la, int size)
+{
+    /* With paging off, linear == physical, so a contiguous access is correct
+     * (and must stay unsplit so device MMIO still sees one access). */
+    if (!(s->cr0 & CR0_PG))
+        return 0;
+    return ((la & 0xfffu) + (uint32_t)size) > 0x1000u;
+}
+
+/* ---- software TLB ------------------------------------------------------- */
+
+/* The physical read/write watches live inside phys_read()/phys_write(), which
+ * a TLB hit bypasses entirely. Keep every access on the slow path while any of
+ * them is compiled in, so the debug builds still observe all traffic.
+ *
+ * -DX86_NO_TLB forces the same thing on demand: it restores the walk-every-
+ * access behaviour, for benchmarking the TLB's contribution or for bisecting a
+ * bug suspected to be a stale translation. */
+#if defined(X86_WATCH) || defined(X86_PWATCH1) || defined(X86_RWATCH) || \
+    defined(X86_NO_TLB)
+#define X86_TLB_DISABLE 1
+#endif
+
+/* MMU index of the access about to be performed: 1 for a user (CPL 3) access,
+ * 0 for a supervisor one. Computed live rather than cached in the CPU state so
+ * there is no invalidation to get wrong -- CPL changes on every interrupt,
+ * iret, sysenter and far transfer, and a stale cached index would silently hand
+ * a user access supervisor-tagged translations. The two loads it costs are
+ * noise against the page walk it replaces. */
+static inline int mmu_index(const X86CPUState *s)
+{
+    return !g_sys_access && ((s->seg[X86_CPU_SEG_CS].sel & 3) == 3);
+}
+
+static void tlb_flush_all(X86CPUState *s)
+{
+    int mi, i;
+    for (mi = 0; mi < 2; mi++) {
+        for (i = 0; i < X86_TLB_SIZE; i++) {
+            s->tlb_read[mi][i].vaddr = X86_TLB_EMPTY(i);
+            s->tlb_write[mi][i].vaddr = X86_TLB_EMPTY(i);
+            s->tlb_code[mi][i].vaddr = X86_TLB_EMPTY(i);
+        }
+    }
+    /* The carried fetch window is a raw host pointer built from tlb_code; a flush
+     * may have changed the linear->physical mapping of the current code page, so
+     * force the interp loop to re-derive it (see x86_cpu_priv.h). */
+    s->fetch_dirty = 1;
+}
+
+/* Invalidate one linear page in both MMU indexes (invlpg is not CPL-scoped). */
+static void tlb_flush_page(X86CPUState *s, uint32_t la)
+{
+    uint32_t i = (la >> 12) & (X86_TLB_SIZE - 1);
+    int mi;
+    for (mi = 0; mi < 2; mi++) {
+        s->tlb_read[mi][i].vaddr = X86_TLB_EMPTY(i);
+        s->tlb_write[mi][i].vaddr = X86_TLB_EMPTY(i);
+        s->tlb_code[mi][i].vaddr = X86_TLB_EMPTY(i);
+    }
+    s->fetch_dirty = 1;   /* window may map the flushed page; force a refill */
+}
+
+/* Flush after a CR0/CR4 write that changes how translation works: CR0.PG,
+ * CR0.WP, CR4.PAE. WP matters because tlb_write is only filled for accesses
+ * that were permitted, and changing WP changes what is permitted.
+ *
+ * CR3 is deliberately NOT handled here -- see the mov-to-CR3 site. Writing CR3
+ * flushes unconditionally, even when the value is unchanged, because
+ * `write_cr3(read_cr3())` is the standard way software (Linux included) asks
+ * for a TLB flush. */
+static void tlb_flush_on_cr_change(X86CPUState *s, uint32_t old_cr0,
+                                   uint32_t old_cr4)
+{
+    if (((s->cr0 ^ old_cr0) & (CR0_PG | CR0_WP)) != 0 ||
+        ((s->cr4 ^ old_cr4) & CR4_PAE) != 0)
+        tlb_flush_all(s);
+}
+
+/* Host-memory accessors. The host is assumed little-endian (as the RISC-V core
+ * already assumes); memcpy compiles to a single unaligned load/store on x86,
+ * ARM and wasm. */
+static inline uint32_t ld_host(const uint8_t *p, int size)
+{
+    if (size == 1) return p[0];
+    if (size == 2) { uint16_t v; memcpy(&v, p, 2); return v; }
+    { uint32_t v; memcpy(&v, p, 4); return v; }
+}
+static inline void st_host(uint8_t *p, uint32_t v, int size)
+{
+    if (size == 1) { p[0] = (uint8_t)v; return; }
+    if (size == 2) { uint16_t t = (uint16_t)v; memcpy(p, &t, 2); return; }
+    memcpy(p, &v, 4);
+}
+
+/* True when `la`+size lies wholly inside one page, i.e. the access is eligible
+ * for the TLB fast path. Note this is stricter than page_crosses(), which is
+ * deliberately false when paging is off; an unpaged crossing access falls to
+ * the slow path and is handled there as one contiguous access, as before. */
+static inline int tlb_ok(uint32_t la, int size)
+{
+    return ((la & 0xfffu) + (uint32_t)size) <= 0x1000u;
+}
+
+/* Fast-path test for a `size`-byte access at `la` against TLB entry `e`.
+ *
+ * Tags are page bases, so `la ^ e->vaddr` is the in-page offset when `la` is on
+ * the cached page, and is >= 0x1000 when it is not. One unsigned compare
+ * against `0x1000 - size` therefore decides "right page" and "does not run off
+ * the end of the page" together, replacing the separate tag equality and
+ * tlb_ok() bounds check. Empty slots can never match; see X86_TLB_EMPTY.
+ *
+ * Unlike the equivalent trick in the RISC-V core (riscv_cpu_priv.h), this does
+ * not force alignment: x86 misaligned accesses are legal and common, and they
+ * stay on the fast path as long as they do not cross a page. */
+#define TLB_HIT(e, la, size) \
+    (((la) ^ (e)->vaddr) <= (0x1000u - (uint32_t)(size)))
+
+/* Populate a TLB slot for `la` after a successful translation, when the target
+ * page is plain RAM. Returns the host pointer, or NULL when the page must keep
+ * going through the slow path (MMIO, ROM for writes, or dirty-bit-tracked
+ * framebuffer RAM whose writes must reach phys_mem_set_dirty_bit()). */
+static uint8_t *tlb_fill(X86CPUState *s, uint32_t la, uint32_t pa, int is_write)
+{
+    PhysMemoryRange *pr = get_phys_mem_range(s->mem_map, pa);
+    uint8_t *host;
+    uint32_t page;
+    int mi;
+
+    if (!pr || !pr->is_ram)
+        return NULL;
+    if (is_write && (pr->devram_flags & DEVRAM_FLAG_ROM))
+        return NULL;
+    if (is_write && pr->dirty_bits)
+        return NULL;
+    /* The whole page must be inside this range for the addend to stay valid
+     * across the page (RAM ranges are page-aligned in practice; check anyway). */
+    if ((pa & ~0xfffu) < pr->addr || (uint64_t)(pa | 0xfffu) >= pr->addr + pr->size)
+        return NULL;
+
+    host = pr->phys_mem + (pa - pr->addr);
+    page = la & ~0xfffu;
+    mi = mmu_index(s);
+    {
+        X86TLBEntry *e = is_write ? &s->tlb_write[mi][(la >> 12) & (X86_TLB_SIZE - 1)]
+                                  : &s->tlb_read[mi][(la >> 12) & (X86_TLB_SIZE - 1)];
+        e->vaddr = page;
+        e->mem_addend = (uintptr_t)host - la;   /* host = mem_addend + la */
+    }
+    return host;
+}
+
+static uint32_t ld_lin_slow(X86CPUState *s, uint32_t la, int size)
+{
+    uint32_t pa;
+    uint8_t *host;
+
+    if (page_crosses(s, la, size)) {
+        uint32_t v = 0;
+        int i;
+        for (i = 0; i < size; i++)
+            v |= (uint32_t)(phys_read(s, lin_to_phys(s, la + i, 0), 1) & 0xff) << (i * 8);
+        return v;
+    }
+    pa = lin_to_phys(s, la, 0);
+#ifndef X86_TLB_DISABLE
+    if (tlb_ok(la, size) && (host = tlb_fill(s, la, pa, 0)) != NULL)
+        return ld_host(host, size);
+#else
+    (void)host;
+#endif
+    return phys_read(s, pa, size);
+}
+
+/* 16-bit accesses keep their TLB fast path out of line. A 0x66 operand-size
+ * prefix is rare in the 32-bit code this core runs, so pasting a third arm into
+ * every call site would spend code size on a path that almost never executes --
+ * while still keeping 16-bit accesses off the page-walk slow path. */
+static no_inline uint32_t ld_lin16(X86CPUState *s, uint32_t la)
+{
+#ifndef X86_TLB_DISABLE
+    const X86TLBEntry *e =
+        &s->tlb_read[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+    if (likely(TLB_HIT(e, la, 2))) {
+        uint16_t v;
+        memcpy(&v, (const void *)(e->mem_addend + la), 2);
+        return v;
+    }
+#endif
+    return ld_lin_slow(s, la, 2);
+}
+
+/* The size split below (and the matching one in st_lin) is what makes `size`
+ * constant inside each arm. Callers overwhelmingly pass the interpreter's
+ * runtime `op_size` (2 or 4), which otherwise leaves the TLB_HIT bound and the
+ * width ladder in ld_host()/st_host() as runtime work on every single memory
+ * access. Branching once here specializes all ~100 call sites without touching
+ * any of them; where `size` is already a literal the branch folds away. */
+static inline uint32_t ld_lin(X86CPUState *s, uint32_t la, int size)
+{
+#ifndef X86_TLB_DISABLE
+    const X86TLBEntry *e =
+        &s->tlb_read[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+    if (size == 4) {
+        if (likely(TLB_HIT(e, la, 4))) {
+            uint32_t v;
+            memcpy(&v, (const void *)(e->mem_addend + la), 4);
+            return v;
+        }
+    } else if (size == 2) {
+        return ld_lin16(s, la);
+    } else {
+        if (likely(TLB_HIT(e, la, 1)))
+            return *(const uint8_t *)(e->mem_addend + la);
+    }
+#endif
+    return ld_lin_slow(s, la, size);
+}
+#ifdef X86_UWWATCH
+uint32_t g_uw_eip[4096], g_uw_la[4096], g_uw_val[4096];
+uint8_t  g_uw_sz[4096];
+int g_uw_i;
+#endif
+#ifdef X86_SYSLOG
+int g_sys_pending; uint32_t g_sys_nr;
+#endif
+static void st_lin_slow(X86CPUState *s, uint32_t la, uint32_t val, int size)
+{
+    uint32_t pa;
+    uint8_t *host;
+
+    if (page_crosses(s, la, size)) {
+        /* Translate every byte first: a #PF on the second page must be raised
+         * before any byte is committed, so the instruction restarts cleanly. */
+        uint32_t pab[4];
+        int i;
+        for (i = 0; i < size; i++)
+            pab[i] = lin_to_phys(s, la + i, 1);
+        for (i = 0; i < size; i++)
+            phys_write(s, pab[i], (val >> (i * 8)) & 0xff, 1);
+        return;
+    }
+    pa = lin_to_phys(s, la, 1);
+#ifndef X86_TLB_DISABLE
+    if (tlb_ok(la, size) && (host = tlb_fill(s, la, pa, 1)) != NULL) {
+        st_host(host, val, size);
+        return;
+    }
+#else
+    (void)host;
+#endif
+    phys_write(s, pa, val, size);
+}
+
+/* Store counterpart of ld_lin16; same reasoning. */
+static no_inline void st_lin16(X86CPUState *s, uint32_t la, uint32_t val)
+{
+#ifndef X86_TLB_DISABLE
+    const X86TLBEntry *e =
+        &s->tlb_write[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+    if (likely(TLB_HIT(e, la, 2))) {
+        uint16_t t = (uint16_t)val;
+        memcpy((void *)(e->mem_addend + la), &t, 2);
+        return;
+    }
+#endif
+    st_lin_slow(s, la, val, 2);
+}
+
+static inline void st_lin(X86CPUState *s, uint32_t la, uint32_t val, int size)
+{
+#ifdef X86_UWWATCH
+    if ((s->seg[X86_CPU_SEG_CS].sel & 3) == 3) {
+        g_uw_eip[g_uw_i & 4095] = s->cur_eip;
+        g_uw_la[g_uw_i & 4095]  = la;
+        g_uw_val[g_uw_i & 4095] = val;
+        g_uw_sz[g_uw_i & 4095]  = (uint8_t)size;
+        g_uw_i++;
+    }
+#endif
+#ifndef X86_TLB_DISABLE
+    {
+        const X86TLBEntry *e =
+            &s->tlb_write[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+        if (size == 4) {
+            if (likely(TLB_HIT(e, la, 4))) {
+                memcpy((void *)(e->mem_addend + la), &val, 4);
+                return;
+            }
+        } else if (size == 2) {
+            st_lin16(s, la, val);
+            return;
+        } else {
+            if (likely(TLB_HIT(e, la, 1))) {
+                *(uint8_t *)(e->mem_addend + la) = (uint8_t)val;
+                return;
+            }
+        }
+    }
+#endif
+    st_lin_slow(s, la, val, size);
+}
+
+/* Host pointer for `la` if -- and only if -- it is already cached, without
+ * walking or filling. Used by the bulk string path, which wants to know it can
+ * touch a run of bytes without any chance of faulting; a miss simply sends the
+ * caller back to the scalar path, which fills the entry on its way through. */
+static inline uint8_t *lin_host_ptr(X86CPUState *s, uint32_t la, int is_write)
+{
+#ifdef X86_TLB_DISABLE
+    (void)s; (void)la; (void)is_write;
+    return NULL;
+#else
+    const X86TLBEntry *e = is_write
+        ? &s->tlb_write[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)]
+        : &s->tlb_read[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+    /* Size 1 here is "is this byte's page cached": the caller clamps its own
+     * run to the page end, so no wider bound is wanted. */
+    if (likely(TLB_HIT(e, la, 1)))
+        return (uint8_t *)(e->mem_addend + la);
+    return NULL;
+#endif
+}
+
+/* Translate every page touched by a `size`-byte write at `la` without storing
+ * anything.  Instructions that commit more than one st_lin (cmpxchg8b, the
+ * 64/80-bit x87 stores, `enter`) must probe the whole range first: otherwise a
+ * #PF on a later page restarts the instruction after earlier bytes already
+ * landed, and the restart sees mutated memory. */
+static void probe_write(X86CPUState *s, uint32_t la, int size)
+{
+    uint32_t a = la, end = la + (uint32_t)size - 1;
+    if (!(s->cr0 & CR0_PG))
+        return;
+    for (;;) {
+        (void)lin_to_phys(s, a, 1);
+        if ((a | 0xfffu) >= end)
+            break;
+        a = (a | 0xfffu) + 1;
+    }
+}
+
+/* ---- instruction fetch ------------------------------------------------- */
+
+/* Parked in fetch_ptr/fetch_end when there is no window, so that
+ * `fetch_ptr < fetch_end` is a well-defined false rather than a comparison
+ * between null pointers. */
+static const uint8_t x86_fetch_none[1];
+
+/* Populate a tlb_code slot for a fetch of `la` (translated to `pa`) when the
+ * target page is plain RAM. Mirrors tlb_fill but writes the fetch-only TLB, so
+ * a data read never seeds a translation an NX fetch could then hit. */
+static uint8_t *tlb_fill_code(X86CPUState *s, uint32_t la, uint32_t pa)
+{
+    PhysMemoryRange *pr = get_phys_mem_range(s->mem_map, pa);
+    uint8_t *host;
+    int mi;
+
+    if (!pr || !pr->is_ram)
+        return NULL;
+    if ((pa & ~0xfffu) < pr->addr || (uint64_t)(pa | 0xfffu) >= pr->addr + pr->size)
+        return NULL;
+    host = pr->phys_mem + (pa - pr->addr);
+    mi = mmu_index(s);
+    {
+        X86TLBEntry *e = &s->tlb_code[mi][(la >> 12) & (X86_TLB_SIZE - 1)];
+        e->vaddr = la & ~0xfffu;
+        e->mem_addend = (uintptr_t)host - la;
+    }
+    return host;
+}
+
+/* Fetch one byte at linear address `la`, enforcing NX via ACC_FETCH and caching
+ * the translation in tlb_code. Used for the head byte(s) of an instruction whose
+ * page is not yet windowed, and for the tail of a page-straddling instruction. */
+static uint8_t fetch_ld8(X86CPUState *s, uint32_t la)
+{
+    uint32_t pa;
+#ifndef X86_TLB_DISABLE
+    const X86TLBEntry *e =
+        &s->tlb_code[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+    uint8_t *host;
+    if (likely(TLB_HIT(e, la, 1)))
+        return *(const uint8_t *)(e->mem_addend + la);
+#endif
+    pa = lin_to_phys(s, la, ACC_FETCH);
+#ifndef X86_TLB_DISABLE
+    if ((host = tlb_fill_code(s, la, pa)) != NULL)
+        return *host;
+#endif
+    return (uint8_t)phys_read(s, pa, 1);
+}
+
+/* Point the fetch window at CS.base + eip, or empty it when that page is not
+ * cached for fetching. Called once per instruction from the interpreter loop.
+ *
+ * The window is built only from tlb_code, so a page that is present but NX (or
+ * simply not yet fetch-translated) leaves the window empty and every byte goes
+ * through fetch_ld8(), which raises the NX #PF. The window stops at the guest
+ * page end, so an instruction that straddles two pages fetches its head from
+ * the window and the remainder through fetch8_slow() -- which translates the
+ * second page and faults there exactly as before. Once the window is exhausted
+ * it stays exhausted for the rest of the instruction (fetch8_slow does not
+ * advance it), so the "fetch_ptr tracks eip" invariant holds across the two
+ * paths. */
+static inline void fetch_refill(X86CPUState *s)
+{
+#ifndef X86_TLB_DISABLE
+    uint32_t la = s->seg[X86_CPU_SEG_CS].base + s->eip;
+    const X86TLBEntry *e =
+        &s->tlb_code[mmu_index(s)][(la >> 12) & (X86_TLB_SIZE - 1)];
+    if (likely(TLB_HIT(e, la, 1))) {
+        const uint8_t *p = (const uint8_t *)(e->mem_addend + la);
+        s->fetch_ptr = p;
+        s->fetch_end = p + (0x1000u - (la & 0xfffu));
+        /* Record what this window maps so the loop can tell, next instruction,
+         * whether it still serves CS.base+eip (see the priv-header comment). */
+        s->win_eip_addend = (uintptr_t)p - s->eip;
+        s->win_cs_base = s->seg[X86_CPU_SEG_CS].base;
+        s->fetch_dirty = 0;
+        return;
+    }
+#endif
+    s->fetch_ptr = x86_fetch_none;
+    s->fetch_end = x86_fetch_none;
+    s->fetch_dirty = 0;
+}
+
+static uint8_t fetch8_slow(X86CPUState *s)
+{
+    uint32_t la = s->seg[X86_CPU_SEG_CS].base + s->eip;
+    s->eip++;
+    return fetch_ld8(s, la);
+}
+
+static no_inline uint8_t fetch8(X86CPUState *s)
+{
+    if (likely(s->fetch_ptr < s->fetch_end)) {
+        s->eip++;
+        return *s->fetch_ptr++;
+    }
+    return fetch8_slow(s);
+}
+/* Inlined twin of fetch8's fast path, for the two byte fetches every
+ * instruction pays: the opcode byte in the interp loop and the ModR/M byte in
+ * decode_modrm. fetch8 is deliberately noinline to keep its ~50 immediate call
+ * sites from each pasting the fast path, but those two sites run once per
+ * instruction, so folding the window-hit case inline there removes a call/ret
+ * from the hottest path. The window-miss case defers to the out-of-line fetch8. */
+static inline uint8_t fetch8_fast(X86CPUState *s)
+{
+    if (likely(s->fetch_ptr < s->fetch_end)) {
+        s->eip++;
+        return *s->fetch_ptr++;
+    }
+    return fetch8(s);
+}
+/* The byte-at-a-time fallbacks are kept out of line on purpose. They only run
+ * for an instruction that straddles a page boundary or whose page is not
+ * cached, but inlining them would paste fetch8's own fast path two or four
+ * times into every one of the ~50 fetch16/fetch32 call sites -- which cost far
+ * more in code size than the cold path can ever repay. */
+static no_inline uint16_t fetch16_slow(X86CPUState *s)
+{
+    uint16_t v = fetch8(s);
+    v |= (uint16_t)fetch8(s) << 8;
+    return v;
+}
+static no_inline uint16_t fetch16(X86CPUState *s)
+{
+    if (likely((size_t)(s->fetch_end - s->fetch_ptr) >= 2)) {
+        uint16_t v;
+        memcpy(&v, s->fetch_ptr, 2);
+        s->fetch_ptr += 2;
+        s->eip += 2;
+        return v;
+    }
+    return fetch16_slow(s);
+}
+static no_inline uint32_t fetch32_slow(X86CPUState *s)
+{
+    uint32_t v = fetch16(s);
+    v |= (uint32_t)fetch16(s) << 16;
+    return v;
+}
+static no_inline uint32_t fetch32(X86CPUState *s)
+{
+    if (likely((size_t)(s->fetch_end - s->fetch_ptr) >= 4)) {
+        uint32_t v;
+        memcpy(&v, s->fetch_ptr, 4);
+        s->fetch_ptr += 4;
+        s->eip += 4;
+        return v;
+    }
+    return fetch32_slow(s);
+}
+static uint32_t fetch_imm(X86CPUState *s, int size)
+{
+    if (size == 1) return (uint8_t)fetch8(s);
+    if (size == 2) return fetch16(s);
+    return fetch32(s);
+}
+
+/* ---- register access --------------------------------------------------- */
+
+static uint32_t get_reg8(X86CPUState *s, int r)
+{
+    return (r < 4) ? (s->regs[r] & 0xff) : ((s->regs[r - 4] >> 8) & 0xff);
+}
+static void set_reg8(X86CPUState *s, int r, uint8_t v)
+{
+    if (r < 4)
+        s->regs[r] = (s->regs[r] & ~0xffu) | v;
+    else
+        s->regs[r - 4] = (s->regs[r - 4] & ~0xff00u) | ((uint32_t)v << 8);
+}
+static uint32_t get_regv(X86CPUState *s, int r, int size)
+{
+    if (size == 1) return get_reg8(s, r);
+    if (size == 2) return s->regs[r] & 0xffff;
+    return s->regs[r];
+}
+static void set_regv(X86CPUState *s, int r, uint32_t v, int size)
+{
+    if (size == 1) set_reg8(s, r, (uint8_t)v);
+    else if (size == 2) s->regs[r] = (s->regs[r] & ~0xffffu) | (v & 0xffff);
+    else s->regs[r] = v;
+}
+
+/* ---- flags -------------------------------------------------------------
+ *
+ * Reconstruction side of the deferred-flag scheme; see the long comment in
+ * x86_cpu_priv.h for the invariants. alu() records what it did, everything
+ * here turns that record back into flag bits, either one flag at a time
+ * (cc_*) or all six at once (flags_sync).
+ */
+
+static int parity8(uint8_t v)
+{
+    v ^= v >> 4; v ^= v >> 2; v ^= v >> 1;
+    return (~v) & 1;
+}
+
+static uint32_t cc_sbit(const X86CPUState *s)
+{
+    return (s->cc_size == 1) ? 0x80u :
+           (s->cc_size == 2) ? 0x8000u : 0x80000000u;
+}
+
+/* --- single-flag derivations from a pending record ---------------------- *
+ *
+ * Each of these is only valid while cc_op != CC_OP_EFLAGS; the get_*()
+ * wrappers below pick between the record and the materialized word. cc_a,
+ * cc_b and cc_r are stored already masked to cc_size, so nothing here has to
+ * mask again.
+ */
+static int cc_cf(const X86CPUState *s)
+{
+    switch (s->cc_op) {
+    case CC_OP_ADD:   return s->cc_r < s->cc_a;
+    /* With a carry in, a + b + 1 wrapping to exactly a is still a carry. */
+    case CC_OP_ADC:   return s->cc_cin ? (s->cc_r <= s->cc_a)
+                                       : (s->cc_r <  s->cc_a);
+    case CC_OP_SUB:   return s->cc_a < s->cc_b;
+    case CC_OP_SBB:   return (uint64_t)s->cc_a < (uint64_t)s->cc_b + s->cc_cin;
+    case CC_OP_LOGIC: return 0;
+    default:          return s->cc_cin;   /* INC/DEC preserve the old CF */
+    }
+}
+static int cc_of(const X86CPUState *s)
+{
+    uint32_t sbit = cc_sbit(s);
+    switch (s->cc_op) {
+    /* INC/DEC carry cc_b == 1, so they share the add/sub derivations. */
+    case CC_OP_ADD: case CC_OP_ADC: case CC_OP_INC:
+        return ((~(s->cc_a ^ s->cc_b)) & (s->cc_a ^ s->cc_r) & sbit) != 0;
+    case CC_OP_SUB: case CC_OP_SBB: case CC_OP_DEC:
+        return ((s->cc_a ^ s->cc_b) & (s->cc_a ^ s->cc_r) & sbit) != 0;
+    default:
+        return 0;                          /* LOGIC clears OF */
+    }
+}
+static int cc_af(const X86CPUState *s)
+{
+    if (s->cc_op == CC_OP_LOGIC)
+        return 0;                          /* architecturally undefined; we clear */
+    return ((s->cc_a ^ s->cc_b ^ s->cc_r) & 0x10) != 0;
+}
+#define cc_zf(s) ((s)->cc_r == 0)
+#define cc_sf(s) (((s)->cc_r & cc_sbit(s)) != 0)
+#define cc_pf(s) (parity8((uint8_t)(s)->cc_r))
+
+/* --- accessors valid in any state --------------------------------------- */
+static int get_cf(X86CPUState *s)
+{ return (s->cc_op == CC_OP_EFLAGS) ? ((s->eflags_ & EFL_CF) != 0) : cc_cf(s); }
+static int get_zf(X86CPUState *s)
+{ return (s->cc_op == CC_OP_EFLAGS) ? ((s->eflags_ & EFL_ZF) != 0) : cc_zf(s); }
+static int get_sf(X86CPUState *s)
+{ return (s->cc_op == CC_OP_EFLAGS) ? ((s->eflags_ & EFL_SF) != 0) : cc_sf(s); }
+static int get_of(X86CPUState *s)
+{ return (s->cc_op == CC_OP_EFLAGS) ? ((s->eflags_ & EFL_OF) != 0) : cc_of(s); }
+static int get_pf(X86CPUState *s)
+{ return (s->cc_op == CC_OP_EFLAGS) ? ((s->eflags_ & EFL_PF) != 0) : cc_pf(s); }
+
+/* Materialize every pending arithmetic flag into eflags_. Must be called by
+ * anything that reads eflags_ as a whole, or that writes an arithmetic bit
+ * into it directly -- otherwise the still-pending record would win later. */
+static void flags_sync(X86CPUState *s)
+{
+    uint32_t f;
+
+    if (s->cc_op == CC_OP_EFLAGS)
+        return;
+    f = s->eflags_ & ~(uint32_t)(EFL_CF | EFL_PF | EFL_AF |
+                                 EFL_ZF | EFL_SF | EFL_OF);
+    if (cc_cf(s)) f |= EFL_CF;
+    if (cc_pf(s)) f |= EFL_PF;
+    if (cc_af(s)) f |= EFL_AF;
+    if (cc_zf(s)) f |= EFL_ZF;
+    if (cc_sf(s)) f |= EFL_SF;
+    if (cc_of(s)) f |= EFL_OF;
+    s->eflags_ = f;
+    s->cc_op = CC_OP_EFLAGS;
+}
+static uint32_t get_eflags(X86CPUState *s)
+{
+    flags_sync(s);
+    return s->eflags_;
+}
+/* Full architectural write (popf/iret/init): the record is dead afterwards. */
+static void set_eflags(X86CPUState *s, uint32_t v)
+{
+    s->eflags_ = v;
+    s->cc_op = CC_OP_EFLAGS;
+}
+
+/* Eager SF/ZF/PF, for the producers that do not defer (shifts, BCD).
+ * Callers must have called flags_sync() first. */
+static void set_szp(X86CPUState *s, uint32_t r, int size)
+{
+    uint32_t sbit = (size == 1) ? 0x80 : (size == 2) ? 0x8000 : 0x80000000u;
+    s->eflags_ &= ~(EFL_SF | EFL_ZF | EFL_PF);
+    if (r & sbit) s->eflags_ |= EFL_SF;
+    if (r == 0)   s->eflags_ |= EFL_ZF;
+    if (parity8((uint8_t)r)) s->eflags_ |= EFL_PF;
+}
+
+/* ALU op codes 0..7 = add,or,adc,sbb,and,sub,xor,cmp.
+ *
+ * The hot path: compute the result, stash the operands, return. No flag bit
+ * is produced here -- see the deferred-flag comment in x86_cpu_priv.h.
+ *
+ * force_inline: this is the single hottest helper (add/sub/cmp dominate the
+ * scalar mix), but at -O2 gcc leaves it out of line, so every ALU instruction
+ * paid a real call/ret. Inlining it at its handful of call sites lets the
+ * size-branch fold and the operands stay in registers; +~6% on an integer/
+ * branch microbenchmark, for ~1KB of code growth. */
+static force_inline uint32_t alu(X86CPUState *s, int op, uint32_t a, uint32_t b, int size)
+{
+    uint32_t mask = (size == 1) ? 0xff : (size == 2) ? 0xffff : 0xffffffffu;
+    uint32_t r;
+    int cin = 0;
+
+    a &= mask;
+    b &= mask;
+
+    switch (op) {
+    case 0: /* add */ r = (a + b) & mask; s->cc_op = CC_OP_ADD; break;
+    case 5: /* sub */
+    case 7: /* cmp */ r = (a - b) & mask; s->cc_op = CC_OP_SUB; break;
+    case 1: /* or  */ r = (a | b) & mask; s->cc_op = CC_OP_LOGIC; break;
+    case 4: /* and */ r = (a & b) & mask; s->cc_op = CC_OP_LOGIC; break;
+    case 6: /* xor */ r = (a ^ b) & mask; s->cc_op = CC_OP_LOGIC; break;
+    case 2: /* adc */
+        cin = get_cf(s);
+        r = (a + b + cin) & mask; s->cc_op = CC_OP_ADC;
+        break;
+    case 3: /* sbb */
+        cin = get_cf(s);
+        r = (a - b - cin) & mask; s->cc_op = CC_OP_SBB;
+        break;
+    default: r = 0; s->cc_op = CC_OP_LOGIC; break;
+    }
+
+    s->cc_a = a;
+    s->cc_b = b;
+    s->cc_r = r;
+    s->cc_size = (uint8_t)size;
+    s->cc_cin = (uint8_t)cin;
+    return r;
+}
+
+/* inc/dec: an add/sub of 1 that leaves CF alone. Carrying the old CF in the
+ * record keeps them on the deferred path instead of forcing a sync to save
+ * and restore CF around a plain alu() call. force_inline for the same reason
+ * as alu(): inc/dec are hot loop-counter ops and gcc kept it out of line. */
+static force_inline uint32_t alu_incdec(X86CPUState *s, int dec, uint32_t a, int size)
+{
+    uint32_t mask = (size == 1) ? 0xff : (size == 2) ? 0xffff : 0xffffffffu;
+    int cf = get_cf(s);
+    uint32_t r;
+
+    a &= mask;
+    r = (dec ? (a - 1) : (a + 1)) & mask;
+    s->cc_a = a;
+    s->cc_b = 1;
+    s->cc_r = r;
+    s->cc_op = (uint8_t)(dec ? CC_OP_DEC : CC_OP_INC);
+    s->cc_size = (uint8_t)size;
+    s->cc_cin = (uint8_t)cf;
+    return r;
+}
+
+/* ---- ModR/M (32-bit addressing) --------------------------------------- */
+
+typedef struct {
+    int      is_reg;
+    int      reg;      /* register index (rm), when is_reg */
+    int      esp_base; /* ESP was the SIB base register of the address */
+    uint32_t addr;     /* linear address, when memory */
+    uint32_t ea;       /* effective address (segment offset), when memory */
+} Modrm;
+
+/* Address-size aware access to an address/count register (ESI/EDI/ECX): with a
+ * 0x67 prefix the string ops and loop/jcxz use the 16-bit halves and wrap. */
+static uint32_t adr_get(X86CPUState *s, int r)
+{
+    return (s->addr_size == 2) ? (s->regs[r] & 0xffffu) : s->regs[r];
+}
+static void adr_add(X86CPUState *s, int r, int32_t d)
+{
+    if (s->addr_size == 2)
+        s->regs[r] = (s->regs[r] & ~0xffffu) | ((s->regs[r] + (uint32_t)d) & 0xffffu);
+    else
+        s->regs[r] += (uint32_t)d;
+}
+
+static uint32_t seg_base(X86CPUState *s, int seg_override, int default_seg)
+{
+    int seg = (seg_override >= 0) ? seg_override : default_seg;
+    return s->seg[seg].base;
+}
+
+/* decode ModR/M byte (already fetched into m). reg field returned via *reg. */
+static void decode_modrm(X86CPUState *s, uint8_t m, int seg_override,
+                         int *reg, Modrm *rm)
+{
+    int mod = m >> 6, rmf = m & 7;
+    *reg = (m >> 3) & 7;
+
+    if (mod == 3) {
+        rm->is_reg = 1;
+        rm->reg = rmf;
+        rm->esp_base = 0;
+        return;
+    }
+    rm->is_reg = 0;
+    rm->esp_base = 0;
+
+    uint32_t ea = 0;
+    int def_seg = X86_CPU_SEG_DS;
+
+    if (s->addr_size == 2) {
+        /* 16-bit addressing (0x67 in 32-bit code): no SIB, fixed base/index
+         * pairs, and the offset wraps within 64K. */
+        static const uint8_t bse[8] = { REG_EBX, REG_EBX, REG_EBP, REG_EBP,
+                                        REG_ESI, REG_EDI, REG_EBP, REG_EBX };
+        static const int8_t  idx[8] = { REG_ESI, REG_EDI, REG_ESI, REG_EDI,
+                                        -1, -1, -1, -1 };
+        if (rmf == 6 && mod == 0) {
+            ea = fetch16(s);
+        } else {
+            ea = s->regs[bse[rmf]];
+            if (idx[rmf] >= 0) ea += s->regs[idx[rmf]];
+            if (bse[rmf] == REG_EBP) def_seg = X86_CPU_SEG_SS;
+        }
+        if (mod == 1) ea += (int32_t)(int8_t)fetch8(s);
+        else if (mod == 2) ea += fetch16(s);
+        ea &= 0xffffu;
+        rm->ea = ea;
+        rm->addr = seg_base(s, seg_override, def_seg) + ea;
+        return;
+    }
+
+    if (rmf == 4) { /* SIB */
+        uint8_t sib = fetch8_fast(s);
+        int scale = sib >> 6, index = (sib >> 3) & 7, base = sib & 7;
+        if (index != 4)
+            ea += s->regs[index] << scale;
+        if (base == 5 && mod == 0) {
+            ea += fetch32(s);
+        } else {
+            ea += s->regs[base];
+            if (base == 4) rm->esp_base = 1;
+            if (base == 4 || base == 5) def_seg = X86_CPU_SEG_SS;
+        }
+    } else if (rmf == 5 && mod == 0) {
+        ea = fetch32(s);
+    } else {
+        ea = s->regs[rmf];
+        if (rmf == 5) def_seg = X86_CPU_SEG_SS; /* [ebp] */
+    }
+
+    if (mod == 1) ea += (int32_t)(int8_t)fetch8_fast(s);
+    else if (mod == 2) ea += fetch32(s);
+
+    rm->ea = ea;
+    rm->addr = seg_base(s, seg_override, def_seg) + ea;
+}
+
+static uint32_t rm_read(X86CPUState *s, const Modrm *rm, int size)
+{
+    if (rm->is_reg) return get_regv(s, rm->reg, size);
+    return ld_lin(s, rm->addr, size);
+}
+static void rm_write(X86CPUState *s, const Modrm *rm, uint32_t v, int size)
+{
+    if (rm->is_reg) set_regv(s, rm->reg, v, size);
+    else st_lin(s, rm->addr, v, size);
+}
+
+/* ---- stack ------------------------------------------------------------- */
+
+static void push_val(X86CPUState *s, uint32_t v, int size)
+{
+    /* Compute the new stack pointer but commit it only after the memory write
+     * succeeds. If the write faults (e.g. a not-present stack page that the
+     * kernel will demand-page), the instruction must restart cleanly: ESP must
+     * be unchanged so the push is not applied twice. */
+    uint32_t nsp = s->regs[REG_ESP] - size;
+    st_lin(s, s->seg[X86_CPU_SEG_SS].base + nsp, v, size);
+    s->regs[REG_ESP] = nsp;
+}
+static uint32_t pop_val(X86CPUState *s, int size)
+{
+    uint32_t v = ld_lin(s, s->seg[X86_CPU_SEG_SS].base + s->regs[REG_ESP], size);
+    s->regs[REG_ESP] += size;
+    return v;
+}
+
+/* ---- condition codes for Jcc ------------------------------------------ */
+
+/* Goes through the single-flag accessors rather than materializing the whole
+ * word: the overwhelmingly common `cmp` + `jne` then costs one zero-test,
+ * with no parity fold and no AF/OF derivation. Every get_*() returns 0 or 1,
+ * so the != comparisons below are sound. */
+/* force_inline: consumed by every jcc/setcc/cmovcc; the conditional branches
+ * are hot and gcc left this out of line. Inlining lets the flag derivation for
+ * the taken condition collapse against the pending-record state. */
+static force_inline int test_cc(X86CPUState *s, int cc)
+{
+    int res;
+    switch (cc >> 1) {
+    case 0: res = get_of(s); break;                             /* O  */
+    case 1: res = get_cf(s); break;                             /* B  */
+    case 2: res = get_zf(s); break;                             /* Z  */
+    case 3: res = get_cf(s) || get_zf(s); break;                /* BE */
+    case 4: res = get_sf(s); break;                             /* S  */
+    case 5: res = get_pf(s); break;                             /* P  */
+    case 6: res = get_sf(s) != get_of(s); break;                /* L  */
+    default: res = (get_sf(s) != get_of(s)) || get_zf(s); break;/* LE */
+    }
+    return (cc & 1) ? !res : res;
+}
+
+/* ---- segment loading (GDT/LDT descriptor lookup) ----------------------- */
+
+static void load_seg(X86CPUState *s, int seg, uint16_t sel)
+{
+    X86Seg *sc = &s->seg[seg];
+    uint32_t table_base, desc_addr, lo, hi, base, limit;
+    uint16_t flags;
+#ifdef X86_PROGRESS
+    if (seg == X86_CPU_SEG_CS && (sel & 3) == 3 && (sc->sel & 3) != 3) {
+        static int n; if (n++ < 4) {
+            uint32_t pa = (s->cur_eip - 0xc0000000u) - 8; int k;
+            fprintf(stderr, "[cs0->3] newcs=%04x @cur_eip=%08x oldcs=%04x ss=%04x esp=%08x\n  code@%08x:",
+                    sel, s->cur_eip, sc->sel, s->seg[X86_CPU_SEG_SS].sel, s->regs[REG_ESP], pa);
+            for (k = 0; k < 24; k++) fprintf(stderr, " %02x", phys_read(s, pa + k, 1));
+            fprintf(stderr, "\n  stack@esp:");
+            for (k = 0; k < 6; k++) fprintf(stderr, " %08x",
+                phys_read(s, (s->seg[X86_CPU_SEG_SS].base + s->regs[REG_ESP]) + k*4, 4));
+            fprintf(stderr, "\n");
+        }
+    }
+#endif
+
+    if ((sel & 0xfffc) == 0) {
+        /* null selector: permitted for data segments (not enforced further yet) */
+        sc->sel = sel; sc->base = 0; sc->limit = 0; sc->flags = 0;
+        return;
+    }
+    table_base = (sel & 4) ? s->seg[X86_CPU_SEG_LDT].base
+                           : s->seg[X86_CPU_SEG_GDT].base;
+    desc_addr = table_base + (sel & 0xfff8);
+    { int sv = g_sys_access; g_sys_access = 1;   /* descriptor read is supervisor */
+      lo = ld_lin(s, desc_addr, 4);
+      hi = ld_lin(s, desc_addr + 4, 4);
+      g_sys_access = sv; }
+    base  = (lo >> 16) | ((hi & 0xff) << 16) | (hi & 0xff000000u);
+    limit = (lo & 0xffff) | (hi & 0x000f0000u);
+    if (hi & 0x00800000u) /* G */ limit = (limit << 12) | 0xfff;
+    flags = ((hi >> 8) & 0xff) | (((hi >> 20) & 0xf) << 12);
+    sc->sel = sel; sc->base = base; sc->limit = limit; sc->flags = flags;
+#ifdef X86_PROGRESS
+    if (seg == X86_CPU_SEG_FS || seg == X86_CPU_SEG_GS) {
+        static int n; if (n++ < 20)
+            fprintf(stderr, "[loadseg] %s sel=%04x base=%08x limit=%08x @eip=%08x\n",
+                    seg == X86_CPU_SEG_FS ? "FS" : "GS", sel, base, limit, s->cur_eip);
+    }
+#endif
+}
+
+/* Read (and discard) the descriptor `sel` refers to.  load_seg() can only fault
+ * on that read, so probing it first lets an instruction take the fault before
+ * committing any side effect (push, ESP update) and restart cleanly. */
+static void probe_seg(X86CPUState *s, uint16_t sel)
+{
+    uint32_t table_base, desc_addr;
+    int sv;
+    if ((sel & 0xfffc) == 0)
+        return;
+    table_base = (sel & 4) ? s->seg[X86_CPU_SEG_LDT].base
+                           : s->seg[X86_CPU_SEG_GDT].base;
+    desc_addr = table_base + (sel & 0xfff8);
+    sv = g_sys_access; g_sys_access = 1;
+    (void)ld_lin(s, desc_addr, 4);
+    (void)ld_lin(s, desc_addr + 4, 4);
+    g_sys_access = sv;
+}
+
+/* VERR/VERW (0F 00 /4, /5): can the segment `sel` be read (want_write=0) or
+ * written (want_write=1) at the current privilege?  Sets no state -- the caller
+ * reflects the answer in ZF.  A bad selector never faults here; it just answers
+ * "no".  Used by the kernel's MDS mitigation, which issues `verw` on a data
+ * selector to flush store buffers. */
+static int verify_seg(X86CPUState *s, uint16_t sel, int want_write)
+{
+    uint32_t table_base, table_limit, desc_addr, hi;
+    uint32_t ab;
+    int type, s_bit, dpl, present, cpl, rpl, sv;
+
+    if ((sel & 0xfffc) == 0) return 0;                 /* null selector */
+    table_base  = (sel & 4) ? s->seg[X86_CPU_SEG_LDT].base
+                            : s->seg[X86_CPU_SEG_GDT].base;
+    table_limit = (sel & 4) ? s->seg[X86_CPU_SEG_LDT].limit
+                            : s->seg[X86_CPU_SEG_GDT].limit;
+    if ((uint32_t)(sel & 0xfff8) + 7 > table_limit) return 0; /* outside table */
+    desc_addr = table_base + (sel & 0xfff8);
+    sv = g_sys_access; g_sys_access = 1;               /* descriptor read is sup. */
+    hi = ld_lin(s, desc_addr + 4, 4);
+    g_sys_access = sv;
+
+    ab      = (hi >> 8) & 0xff;
+    s_bit   = (ab >> 4) & 1;                            /* 1 = code/data segment */
+    type    = ab & 0xf;
+    dpl     = (hi >> 13) & 3;
+    present = (hi >> 15) & 1;
+    cpl     = s->seg[X86_CPU_SEG_CS].sel & 3;
+    rpl     = sel & 3;
+
+    if (!s_bit || !present) return 0;                  /* system seg / not present */
+    if (type & 0x8) {                                  /* code segment */
+        if (want_write) return 0;                      /* code is never writable */
+        if (!(type & 0x2)) return 0;                   /* execute-only: unreadable */
+        if (!(type & 0x4) && (dpl < cpl || dpl < rpl)) return 0; /* non-conforming */
+        return 1;
+    }
+    /* data segment: always readable, writable only if the write bit is set */
+    if (dpl < cpl || dpl < rpl) return 0;
+    if (want_write && !(type & 0x2)) return 0;
+    return 1;
+}
+
+/* Pop a segment selector: the descriptor is probed before ESP is committed so a
+ * faulting descriptor read does not leave the stack popped. */
+static void pop_seg(X86CPUState *s, int seg, int op_size)
+{
+    uint32_t osp = s->regs[REG_ESP];
+    uint16_t sel = (uint16_t)ld_lin(s, s->seg[X86_CPU_SEG_SS].base + osp, op_size);
+    probe_seg(s, sel);
+    s->regs[REG_ESP] = osp + op_size;
+    load_seg(s, seg, sel);
+    if (seg == X86_CPU_SEG_SS)
+        s->int_shadow = 1;      /* no IRQ on the transiently invalid SS:ESP */
+}
+
+/* LES/LDS/LSS/LFS/LGS: load a far pointer m16:off into a segment register and a
+ * GP register.  The offset and selector are read first and the descriptor is
+ * probed before any state changes, so a faulting access restarts cleanly. */
+static void load_far_ptr(X86CPUState *s, int seg, int reg, uint32_t addr, int op_size)
+{
+    uint32_t off = ld_lin(s, addr, op_size);
+    uint16_t sel = (uint16_t)ld_lin(s, addr + op_size, 2);
+    probe_seg(s, sel);
+    load_seg(s, seg, sel);
+    set_regv(s, reg, off, op_size);
+    if (seg == X86_CPU_SEG_SS)
+        s->int_shadow = 1;      /* no IRQ on the transiently invalid SS:ESP */
+}
+
+/* LAR/LSL (0F 02 / 0F 03): fetch the descriptor `sel` refers to and, if it is
+ * present and accessible at the current privilege, return its access-rights
+ * dword (LAR) or scaled limit (LSL) via *out and answer 1; otherwise answer 0
+ * and leave *out untouched.  Never faults on a bad selector -- the caller
+ * reflects success in ZF. */
+static int desc_query(X86CPUState *s, uint16_t sel, int want_limit, uint32_t *out)
+{
+    uint32_t table_base, table_limit, desc_addr, lo, hi, ar, limit;
+    int type, s_bit, dpl, present, cpl, rpl, sv, ok;
+
+    if ((sel & 0xfffc) == 0) return 0;                 /* null selector */
+    table_base  = (sel & 4) ? s->seg[X86_CPU_SEG_LDT].base
+                            : s->seg[X86_CPU_SEG_GDT].base;
+    table_limit = (sel & 4) ? s->seg[X86_CPU_SEG_LDT].limit
+                            : s->seg[X86_CPU_SEG_GDT].limit;
+    if ((uint32_t)(sel & 0xfff8) + 7 > table_limit) return 0;
+    desc_addr = table_base + (sel & 0xfff8);
+    sv = g_sys_access; g_sys_access = 1;               /* descriptor read is sup. */
+    lo = ld_lin(s, desc_addr, 4);
+    hi = ld_lin(s, desc_addr + 4, 4);
+    g_sys_access = sv;
+
+    ar      = (hi >> 8) & 0xff;
+    s_bit   = (ar >> 4) & 1;
+    type    = ar & 0xf;
+    dpl     = (hi >> 13) & 3;
+    present = (hi >> 15) & 1;
+    cpl     = s->seg[X86_CPU_SEG_CS].sel & 3;
+    rpl     = sel & 3;
+    if (!present) return 0;
+
+    /* Privilege check applies to data segments and non-conforming code; a
+     * conforming code segment (type>=0xc when it is a code seg) is exempt. */
+    ok = 1;
+    if (!s_bit) {
+        /* Only certain system/gate types are valid operands for LAR/LSL; keep
+         * it permissive here (LDT/TSS/call gates) and reject the clearly
+         * invalid ones. */
+        if (type == 0 || type == 8 || type == 0xa || type == 0xd) ok = 0;
+    }
+    if (s_bit && !(type & 0x8)) {                      /* data segment */
+        if (dpl < cpl || dpl < rpl) ok = 0;
+    } else if (s_bit && (type & 0x8) && !(type & 0x4)) { /* non-conforming code */
+        if (dpl < cpl || dpl < rpl) ok = 0;
+    }
+    if (!ok) return 0;
+
+    if (want_limit) {
+        limit = (lo & 0xffff) | (hi & 0x000f0000u);
+        if (hi & 0x00800000u) /* G */ limit = (limit << 12) | 0xfff;
+        *out = limit;
+    } else {
+        /* LAR returns the access-rights dword: the second descriptor doubleword
+         * masked to the AR bits, low byte cleared. */
+        *out = hi & 0x00ffff00u;
+    }
+    return 1;
+}
+
+/* Take a relative near branch.  With a 16-bit operand size the target is
+ * truncated to IP: the top half of EIP is cleared (SDM, JMP/Jcc/CALL/LOOP). */
+static void jmp_rel(X86CPUState *s, int32_t d, int op_size)
+{
+    uint32_t t = s->eip + (uint32_t)d;
+    s->eip = (op_size == 2) ? (t & 0xffffu) : t;
+}
+
+/* Raise a fault whose saved EIP must point at the current instruction (a fault,
+ * not a trap), undoing the fetches the decoder already did. */
+static void raise_fault(X86CPUState *s, int intno)
+{
+    s->eip = s->cur_eip;
+    raise_exception(s, intno);
+}
+static void raise_fault_err(X86CPUState *s, int intno, uint32_t err)
+{
+    s->eip = s->cur_eip;
+    raise_exception_err(s, intno, err);
+}
+
+/* IOPL-sensitive instructions (cli/sti, in/out) #GP(0) at CPL > IOPL.
+ * The TSS I/O permission bitmap is not modelled, so a port access above IOPL
+ * always faults rather than consulting the bitmap. */
+static void check_iopl(X86CPUState *s)
+{
+    int cpl = s->seg[X86_CPU_SEG_CS].sel & 3;
+    int iopl = (s->eflags_ >> 12) & 3;
+    if (cpl > iopl)
+        raise_fault_err(s, EXC_GP, 0);
+}
+
+/* ---- shifts / rotates (group2) ---------------------------------------- */
+/* op: 0 rol,1 ror,2 rcl,3 rcr,4 shl,5 shr,6 sal(=shl),7 sar */
+static uint32_t do_shift(X86CPUState *s, int op, uint32_t v, int count, int size)
+{
+    uint32_t mask = (size == 1) ? 0xff : (size == 2) ? 0xffff : 0xffffffffu;
+    uint32_t sbit = (size == 1) ? 0x80 : (size == 2) ? 0x8000 : 0x80000000u;
+    int bits = size * 8;
+    uint32_t res;
+    int cf = 0, of = 0;
+
+    count &= 0x1f;
+    if (count == 0) return v & mask;   /* a zero shift leaves flags alone */
+    v &= mask;
+    res = v;
+
+    /* Shifts set flags eagerly (set_szp and the CF/OF writes below both go
+     * straight to eflags_), so any deferred ALU record must be cashed in
+     * first or it would overwrite them on the next read. */
+    flags_sync(s);
+
+    switch (op) {
+    case 4: case 6: /* shl */
+        cf = (count <= bits) ? ((v >> (bits - count)) & 1) : 0;
+        res = (count < bits) ? ((v << count) & mask) : 0;
+        of = ((res & sbit) != 0) ^ (cf != 0);
+        set_szp(s, res, size);
+        break;
+    case 5: /* shr */
+        cf = (v >> (count - 1)) & 1;
+        res = v >> count;
+        of = (v & sbit) != 0;
+        set_szp(s, res, size);
+        break;
+    case 7: { /* sar */
+        int32_t sv = (size == 1) ? (int8_t)v : (size == 2) ? (int16_t)v : (int32_t)v;
+        cf = (sv >> (count - 1)) & 1;
+        res = (uint32_t)(sv >> count) & mask;
+        of = 0;
+        set_szp(s, res, size);
+    } break;
+    case 0: /* rol */
+        count %= bits;
+        if (count == 0) {   /* rotate by a multiple of the width: the value is
+                             * unchanged, but CF is still defined (= LSB) because
+                             * the 5-bit count was nonzero. */
+            res = v; cf = v & 1; break;
+        }
+        res = ((v << count) | (v >> (bits - count))) & mask;
+        cf = res & 1;
+        of = ((res & sbit) != 0) ^ (cf != 0);
+        break;
+    case 1: /* ror */
+        count %= bits;
+        if (count == 0) {   /* CF = MSB (the bit that a further ror would emit) */
+            res = v; cf = (v & sbit) != 0; break;
+        }
+        res = ((v >> count) | (v << (bits - count))) & mask;
+        cf = (res & sbit) != 0;
+        of = ((res & sbit) != 0) ^ ((res & (sbit >> 1)) != 0);
+        break;
+    case 2: case 3: { /* rcl / rcr */
+        int cin = (s->eflags_ & EFL_CF) ? 1 : 0, k, newc;
+        for (k = 0; k < count; k++) {
+            if (op == 2) { newc = (v & sbit) != 0; v = ((v << 1) | cin) & mask; cin = newc; }
+            else { newc = v & 1; v = (v >> 1) | ((uint32_t)cin << (bits - 1)); v &= mask; cin = newc; }
+        }
+        res = v; cf = cin;
+        of = ((res & sbit) != 0) ^ (cf != 0);
+    } break;
+    }
+
+    s->eflags_ &= ~(EFL_CF | EFL_OF);
+    if (cf) s->eflags_ |= EFL_CF;
+    if (count == 1 && of) s->eflags_ |= EFL_OF;
+    return res;
+}
+
+/* ---- string operations ------------------------------------------------ */
+/* op: 0 movs, 1 stos, 2 lods, 3 scas, 4 cmps */
+static void string_step(X86CPUState *s, int op, int size, int seg_override)
+{
+    int delta = (s->eflags_ & EFL_DF) ? -size : size;
+    uint32_t sbase = seg_base(s, seg_override, X86_CPU_SEG_DS);
+    uint32_t ebase = s->seg[X86_CPU_SEG_ES].base;
+    uint32_t si = adr_get(s, REG_ESI), di = adr_get(s, REG_EDI);
+    switch (op) {
+    case 0: /* movs */
+        st_lin(s, ebase + di, ld_lin(s, sbase + si, size), size);
+        adr_add(s, REG_ESI, delta); adr_add(s, REG_EDI, delta);
+        break;
+    case 1: /* stos */
+        st_lin(s, ebase + di, get_regv(s, REG_EAX, size), size);
+        adr_add(s, REG_EDI, delta);
+        break;
+    case 2: /* lods */
+        set_regv(s, REG_EAX, ld_lin(s, sbase + si, size), size);
+        adr_add(s, REG_ESI, delta);
+        break;
+    case 3: /* scas: eAX - [ES:EDI] */
+        (void)alu(s, 7, get_regv(s, REG_EAX, size), ld_lin(s, ebase + di, size), size);
+        adr_add(s, REG_EDI, delta);
+        break;
+    case 4: /* cmps: [DS:ESI] - [ES:EDI] */
+        (void)alu(s, 7, ld_lin(s, sbase + si, size), ld_lin(s, ebase + di, size), size);
+        adr_add(s, REG_ESI, delta); adr_add(s, REG_EDI, delta);
+        break;
+    }
+}
+
+/* Bulk path for `rep movs` / `rep stos`. Once the TLB holds the source and
+ * destination pages, a run of elements that stays inside both can be moved with
+ * memcpy/memset instead of translating every element -- which is what makes the
+ * guest's memcpy/memset run at host speed rather than interpreter speed.
+ *
+ * Returns the number of elements handled; 0 means the caller must fall back to
+ * the scalar step (which is also what primes the TLB). Because every byte
+ * touched is already cached, the bulk path cannot fault: a page that would
+ * fault is simply never in the TLB, so it goes scalar and raises #PF there with
+ * ESI/EDI/ECX already reflecting the elements that completed. */
+static uint32_t string_bulk(X86CPUState *s, int op, int size, int seg_override,
+                            uint32_t max)
+{
+    uint32_t count, n, nbytes, si, di, dla;
+    uint8_t *sp = NULL, *dp;
+
+    if (op != 0 && op != 1)   return 0;   /* movs / stos only                 */
+    if (s->eflags_ & EFL_DF)  return 0;   /* forward only                     */
+    if (s->addr_size != 4)    return 0;   /* 16-bit wrap stays on the scalar  */
+
+    count = s->regs[REG_ECX];
+    if (count > max) count = max;
+    if (count < 2)            return 0;   /* not worth the setup              */
+
+    si = s->regs[REG_ESI];
+    di = s->regs[REG_EDI];
+
+    /* Clamp to whole elements remaining in the destination page. */
+    dla = s->seg[X86_CPU_SEG_ES].base + di;
+    n = (0x1000u - (dla & 0xfffu)) / (uint32_t)size;
+    if (n == 0)               return 0;   /* element straddles a page         */
+    if (n > count) n = count;
+    dp = lin_host_ptr(s, dla, 1);
+    if (!dp)                  return 0;
+
+    if (op == 0) {                        /* movs: clamp to the source page   */
+        uint32_t sla = seg_base(s, seg_override, X86_CPU_SEG_DS) + si;
+        uint32_t left = (0x1000u - (sla & 0xfffu)) / (uint32_t)size;
+        if (left == 0)        return 0;
+        if (n > left) n = left;
+        sp = lin_host_ptr(s, sla, 0);
+        if (!sp)              return 0;
+    }
+    nbytes = n * (uint32_t)size;
+
+    if (op == 0) {
+        /* x86 moves element by element in increasing order. When the host
+         * ranges overlap that is not memcpy's semantics -- `rep movsb` with
+         * EDI = ESI+1 is the classic byte-propagating fill -- so hand overlap
+         * back to the scalar path rather than get it subtly wrong. */
+        if (sp < dp + nbytes && dp < sp + nbytes)
+            return 0;
+        memcpy(dp, sp, nbytes);
+        s->regs[REG_ESI] = si + nbytes;
+    } else {
+        uint32_t v = get_regv(s, REG_EAX, size);
+        if (size == 1) {
+            memset(dp, (int)(v & 0xff), nbytes);
+        } else {
+            uint32_t k;
+            for (k = 0; k < n; k++)
+                st_host(dp + k * (uint32_t)size, v, size);
+        }
+    }
+    s->regs[REG_EDI] = di + nbytes;
+    s->regs[REG_ECX] -= n;
+    return n;
+}
+
+static void string_op(X86CPUState *s, int op, int size, int seg_override, int rep)
+{
+    /* Work done before handing control back to the interpreter loop. A `rep`
+     * with a huge ECX would otherwise run to completion inside one "cycle",
+     * blocking interrupt delivery and overshooting the cycle slice (visible in
+     * the browser as a stalled VM). ESI/EDI/ECX carry the progress, so
+     * restarting the instruction resumes exactly where it stopped -- which is
+     * how `rep` stays interruptible on real hardware too. */
+    uint32_t budget = 1u << 16;
+
+    if (!rep) { string_step(s, op, size, seg_override); return; }
+
+    while (adr_get(s, REG_ECX) != 0) {
+        uint32_t n;
+        if (budget == 0) {
+            s->eip = s->cur_eip;    /* restart, re-decoding the prefixes */
+            return;
+        }
+        n = string_bulk(s, op, size, seg_override, budget);
+        if (n != 0) {
+            budget -= n;
+            s->cycle_count += n;    /* charge the work actually done */
+            continue;
+        }
+        string_step(s, op, size, seg_override);
+        adr_add(s, REG_ECX, -1);
+        budget--;
+        s->cycle_count++;
+        if (op == 3 || op == 4) { /* scas/cmps honor ZF for repe/repne */
+            int zf = get_zf(s);
+            if (rep == 1 && !zf) break;   /* repe:  stop when ZF=0 */
+            if (rep == 2 && zf) break;    /* repne: stop when ZF=1 */
+        }
+    }
+}
+
+/* ---- x87 FPU ----------------------------------------------------------- */
+/* Modelled with C `long double` on an 8-entry register stack. ST(i) is the
+ * logical register i from the top of stack. On the x86/x86-64 hosts this build
+ * targets, `long double` *is* the 80-bit extended format (64-bit significand,
+ * 15-bit exponent), so the register file, arithmetic, and the fld/fstp m80
+ * memory format all carry the full hardware precision -- no reduction to the
+ * 53-bit double significand as before. The control word's rounding-control (RC)
+ * and precision-control (PC) fields are honored: RC by setting the host
+ * rounding mode around each x87 instruction (see fpu_exec), PC by rounding each
+ * basic-arithmetic result's significand to 24/53/64 bits (see fpu_pc_round).
+ * (Where the host maps `long double` to a wider type, e.g. 128-bit on wasm,
+ * results are more precise than hardware rather than less, and the m80 memory
+ * format still round-trips through a true 64-bit significand.) */
+
+#define FPU_C0 0x0100
+#define FPU_C1 0x0200
+#define FPU_C2 0x0400
+#define FPU_C3 0x4000
+
+static long double fpu_get(X86CPUState *s, int i) { return s->fpst[(s->fpu_top + i) & 7]; }
+static void   fpu_set(X86CPUState *s, int i, long double v) { s->fpst[(s->fpu_top + i) & 7] = v; }
+static void   fpu_push(X86CPUState *s, long double v)
+{
+    s->fpu_top = (s->fpu_top - 1) & 7;
+    s->fpst[s->fpu_top] = v;
+    s->fpu_tag[s->fpu_top] = 0;
+}
+static void fpu_pop(X86CPUState *s)
+{
+    s->fpu_tag[s->fpu_top] = 3;
+    s->fpu_top = (s->fpu_top + 1) & 7;
+}
+static void fpu_init(X86CPUState *s)
+{
+    int i;
+    s->fpu_cw = 0x037f; s->fpu_sw = 0; s->fpu_top = 0;
+    for (i = 0; i < 8; i++) { s->fpst[i] = 0.0L; s->fpu_tag[i] = 3; }
+}
+static void fpu_setcc(X86CPUState *s, long double a, long double b)
+{
+    s->fpu_sw &= ~(FPU_C0 | FPU_C2 | FPU_C3);
+    if (isnan(a) || isnan(b)) s->fpu_sw |= FPU_C0 | FPU_C2 | FPU_C3;
+    else if (a < b) s->fpu_sw |= FPU_C0;
+    else if (a == b) s->fpu_sw |= FPU_C3;
+}
+
+/* long double <-> 80-bit extended byte layout (10 bytes: 64-bit significand
+ * with explicit integer bit, then a 15-bit biased exponent + sign). Done via
+ * frexpl/ldexpl so it is exact and host-layout-independent: on a native 80-bit
+ * `long double` it round-trips bit-for-bit; on a wider one the encode rounds the
+ * significand to 64 bits (the format's width) and the decode is exact. */
+static void ld_to_f80(long double x, uint8_t *p)
+{
+    uint64_t mant; uint16_t se; int sign = 0, e80;
+    if (signbit(x)) { sign = 1; x = -x; }
+    if (isnan(x))      { mant = 0xC000000000000000ULL; e80 = 0x7fff; }  /* QNaN */
+    else if (isinf(x)) { mant = 0x8000000000000000ULL; e80 = 0x7fff; }
+    else if (x == 0.0L){ mant = 0; e80 = 0; }
+    else {
+        int e; long double m = frexpl(x, &e);  /* x = m*2^e, m in [0.5,1)   */
+        e80 = e - 1 + 16383;                    /* integer-bit form: m*2 in [1,2) */
+        if (e80 >= 0x7fff) { mant = 0x8000000000000000ULL; e80 = 0x7fff; } /* ovf->inf */
+        else if (e80 <= 0) {                    /* subnormal / underflow      */
+            mant = (uint64_t)ldexpl(m, 64 + e80); /* shift significand down    */
+            e80 = 0;
+        } else {
+            mant = (uint64_t)ldexpl(m, 64);     /* m in [0.5,1) -> [2^63,2^64) */
+        }
+    }
+    { int i; for (i = 0; i < 8; i++) p[i] = (mant >> (8 * i)) & 0xff; }
+    se = ((uint16_t)sign << 15) | (uint16_t)(e80 & 0x7fff);
+    p[8] = se & 0xff; p[9] = se >> 8;
+}
+static long double f80_to_ld(const uint8_t *p)
+{
+    uint64_t mant = 0; int i;
+    for (i = 0; i < 8; i++) mant |= (uint64_t)p[i] << (8 * i);
+    uint16_t se = p[8] | (p[9] << 8);
+    int sign = (se >> 15) & 1, e80 = se & 0x7fff;
+    long double x;
+    if (e80 == 0)            /* zero or subnormal: value = mant * 2^(1-16383-63) */
+        x = (mant == 0) ? 0.0L : ldexpl((long double)mant, 1 - 16383 - 63);
+    else if (e80 == 0x7fff)  /* inf / NaN (explicit-int-bit nuance ignored) */
+        x = ((mant << 1) == 0) ? (long double)INFINITY : (long double)NAN;
+    else                     /* normal: value = (mant/2^63) * 2^(e80-16383) */
+        x = ldexpl((long double)mant, e80 - 16383 - 63);
+    return sign ? -x : x;
+}
+
+/* load/store a 32/64-bit float from linear memory (widened to/narrowed from the
+ * extended register). The narrowing cast honors the host rounding mode, which
+ * fpu_exec has set from the control word's RC field. */
+static long double fpu_ld_mem(X86CPUState *s, uint32_t la, int size)
+{
+    if (size == 4) { union { float f; uint32_t u; } u; u.u = ld_lin(s, la, 4); return (long double)u.f; }
+    { union { double d; uint64_t u; } u;
+      u.u = (uint64_t)ld_lin(s, la, 4) | ((uint64_t)ld_lin(s, la + 4, 4) << 32);
+      return (long double)u.d; }
+}
+static void fpu_st_mem(X86CPUState *s, uint32_t la, long double v, int size)
+{
+    if (size == 4) { union { float f; uint32_t u; } u; u.f = (float)v; st_lin(s, la, u.u, 4); }
+    else { union { double d; uint64_t u; } u; u.d = (double)v;
+           probe_write(s, la, 8);   /* both dwords must fault before either lands */
+           st_lin(s, la, (uint32_t)u.u, 4); st_lin(s, la + 4, (uint32_t)(u.u >> 32), 4); }
+}
+
+/* Precision control: round a basic-arithmetic result's significand to 24-bit
+ * (single) or 53-bit (double) per CW[9:8], keeping the extended exponent range.
+ * PC=11 (64-bit extended, the reset default) is a no-op. rintl honors the host
+ * rounding mode, so RC applies to this rounding step too. */
+static long double fpu_pc_round(X86CPUState *s, long double r)
+{
+    int pc = (s->fpu_cw >> 8) & 3, bits;
+    int e; long double m, scale;
+    if (pc == 0) bits = 24; else if (pc == 2) bits = 53; else return r; /* 64-bit */
+    if (!isfinite(r) || r == 0.0L) return r;
+    m = frexpl(r, &e);                        /* m in [0.5,1)            */
+    scale = ldexpl(1.0L, bits);
+    m = rintl(m * scale) / scale;             /* round significand to `bits` */
+    if (m == 1.0L || m == -1.0L) { m *= 0.5L; e += 1; } /* rounding carried out */
+    return ldexpl(m, e);
+}
+
+/* FSAVE/FRSTOR 32-bit (108-byte) image */
+static void fpu_save(X86CPUState *s, uint32_t la)
+{
+    uint8_t buf[10]; int i;
+    uint16_t tw = 0;
+    probe_write(s, la, 108);        /* the whole 108-byte image, before any store */
+    st_lin(s, la + 0, s->fpu_cw, 4);
+    st_lin(s, la + 4, s->fpu_sw | ((s->fpu_top & 7) << 11), 4);
+    for (i = 0; i < 8; i++) tw |= (uint16_t)(s->fpu_tag[i] & 3) << (i * 2);
+    st_lin(s, la + 8, tw, 4);
+    for (i = 12; i < 28; i += 4) st_lin(s, la + i, 0, 4);
+    for (i = 0; i < 8; i++) {
+        int k;
+        ld_to_f80(s->fpst[(s->fpu_top + i) & 7], buf);
+        for (k = 0; k < 10; k++) st_lin(s, la + 28 + i * 10 + k, buf[k], 1);
+    }
+    fpu_init(s); /* FSAVE reinitializes the FPU */
+}
+static void fpu_restore(X86CPUState *s, uint32_t la)
+{
+    uint8_t buf[10]; int i, k;
+    uint16_t sw, tw;
+    s->fpu_cw = ld_lin(s, la + 0, 2);
+    sw = ld_lin(s, la + 4, 2);
+    s->fpu_top = (sw >> 11) & 7;
+    s->fpu_sw = sw & ~0x3800;
+    tw = ld_lin(s, la + 8, 2);
+    for (i = 0; i < 8; i++) {
+        for (k = 0; k < 10; k++) buf[k] = ld_lin(s, la + 28 + i * 10 + k, 1);
+        s->fpst[(s->fpu_top + i) & 7] = f80_to_ld(buf);
+    }
+    for (i = 0; i < 8; i++) s->fpu_tag[i] = (tw >> (i * 2)) & 3;
+}
+
+/* Execute an x87 escape opcode (0xD8..0xDF). `b` is the opcode byte. Wrapped by
+ * fpu_exec below, which sets the host rounding mode from the control word's RC
+ * field for the duration of the op (and restores it after / on fault). */
+static void fpu_exec_inner(X86CPUState *s, int b, int seg_override)
+{
+    uint8_t modrm = fetch8(s);
+    int reg, mod = modrm >> 6;
+    Modrm rm;
+
+    if ((s->cr0 & (CR0_EM | CR0_TS))) { /* fault before touching state */
+        s->eip = s->cur_eip; raise_exception(s, 7);
+    }
+    decode_modrm(s, modrm, seg_override, &reg, &rm);
+
+    if (mod != 3) {
+        uint32_t la = rm.addr;
+        switch (b) {
+        case 0xd9: /* m32 real + control */
+            switch (reg) {
+            case 0: fpu_push(s, fpu_ld_mem(s, la, 4)); return;          /* fld m32  */
+            case 2: fpu_st_mem(s, la, fpu_get(s, 0), 4); return;        /* fst m32  */
+            case 3: fpu_st_mem(s, la, fpu_get(s, 0), 4); fpu_pop(s); return; /* fstp m32 */
+            case 5: s->fpu_cw = ld_lin(s, la, 2); return;               /* fldcw    */
+            case 6: return;                                             /* fnstenv (ignore) */
+            case 7: st_lin(s, la, s->fpu_cw, 2); return;                /* fnstcw   */
+            case 4: return;                                             /* fldenv (ignore) */
+            }
+            break;
+        case 0xdd: /* m64 real + state */
+            switch (reg) {
+            case 0: fpu_push(s, fpu_ld_mem(s, la, 8)); return;          /* fld m64  */
+            case 2: fpu_st_mem(s, la, fpu_get(s, 0), 8); return;        /* fst m64  */
+            case 3: fpu_st_mem(s, la, fpu_get(s, 0), 8); fpu_pop(s); return; /* fstp m64 */
+            case 4: fpu_restore(s, la); return;                         /* frstor   */
+            case 6: fpu_save(s, la); return;                            /* fnsave   */
+            case 7: st_lin(s, la, s->fpu_sw | ((s->fpu_top & 7) << 11), 2); return; /* fnstsw */
+            }
+            break;
+        case 0xdb: /* m32 int + m80 */
+            switch (reg) {
+            case 0: fpu_push(s, (long double)(int32_t)ld_lin(s, la, 4)); return; /* fild m32 */
+            case 2: st_lin(s, la, (int32_t)llrintl(fpu_get(s, 0)), 4); return; /* fist m32 */
+            case 3: st_lin(s, la, (int32_t)llrintl(fpu_get(s, 0)), 4); fpu_pop(s); return;
+            case 5: { uint8_t buf[10]; int k; for (k=0;k<10;k++) buf[k]=ld_lin(s,la+k,1);
+                      fpu_push(s, f80_to_ld(buf)); return; }            /* fld m80  */
+            case 7: { uint8_t buf[10]; int k; ld_to_f80(fpu_get(s,0),buf);
+                      probe_write(s, la, 10);
+                      for (k=0;k<10;k++) st_lin(s,la+k,buf[k],1);
+                      fpu_pop(s); return; } /* fstp m80 */
+            }
+            break;
+        case 0xdf: /* m16 int + m64 int */
+            switch (reg) {
+            case 0: fpu_push(s, (long double)(int16_t)ld_lin(s, la, 2)); return; /* fild m16 */
+            case 2: st_lin(s, la, (int16_t)llrintl(fpu_get(s, 0)), 2); return;
+            case 3: st_lin(s, la, (int16_t)llrintl(fpu_get(s, 0)), 2); fpu_pop(s); return;
+            case 5: { int64_t v = (int64_t)ld_lin(s,la,4) | ((int64_t)ld_lin(s,la+4,4)<<32);
+                      fpu_push(s, (long double)v); return; }            /* fild m64 */
+            case 4: { uint8_t buf[10]; int k; long double v = 0, scale = 1; /* fbld m80bcd */
+                      for (k = 0; k < 10; k++) buf[k] = ld_lin(s, la+k, 1);
+                      for (k = 0; k < 9; k++) {
+                          v += (buf[k] & 0xf) * scale;  scale *= 10;
+                          v += (buf[k] >> 4)  * scale;  scale *= 10;
+                      }
+                      if (buf[9] & 0x80) v = -v;
+                      fpu_push(s, v); return; }
+            case 6: { uint8_t buf[10]; int k; long double v = fpu_get(s, 0); /* fbstp m80bcd */
+                      int neg = signbit(v);
+                      int64_t iv = (int64_t)llrintl(fabsl(v));
+                      for (k = 0; k < 9; k++) {
+                          buf[k]  = (uint8_t)(iv % 10);  iv /= 10;
+                          buf[k] |= (uint8_t)((iv % 10) << 4);  iv /= 10;
+                      }
+                      buf[9] = neg ? 0x80 : 0;
+                      probe_write(s, la, 10);
+                      for (k = 0; k < 10; k++) st_lin(s, la+k, buf[k], 1);
+                      fpu_pop(s); return; }
+            case 7: { int64_t v = (int64_t)llrintl(fpu_get(s,0));
+                      probe_write(s, la, 8);
+                      st_lin(s,la,(uint32_t)v,4); st_lin(s,la+4,(uint32_t)(v>>32),4);
+                      fpu_pop(s); return; }                             /* fistp m64 */
+            }
+            break;
+        case 0xda: case 0xd8: case 0xdc: case 0xde: { /* arithmetic with memory operand */
+            long double m = (b == 0xd8) ? fpu_ld_mem(s, la, 4)
+                     : (b == 0xdc) ? fpu_ld_mem(s, la, 8)
+                     : (b == 0xda) ? (long double)(int32_t)ld_lin(s, la, 4)  /* m32int */
+                     : (long double)(int16_t)ld_lin(s, la, 2); /* 0xde: m16int */
+            long double st0 = fpu_get(s, 0), r = st0;
+            switch (reg) {
+            case 0: r = st0 + m; break;
+            case 1: r = st0 * m; break;
+            case 2: fpu_setcc(s, st0, m); return;               /* fcom  */
+            case 3: fpu_setcc(s, st0, m); fpu_pop(s); return;   /* fcomp */
+            case 4: r = st0 - m; break;
+            case 5: r = m - st0; break;
+            case 6: r = st0 / m; break;
+            case 7: r = m / st0; break;
+            }
+            fpu_set(s, 0, fpu_pc_round(s, r)); return;
+        }
+        }
+        x86_stop(s, "x87 mem opcode %02x /%d", b, reg);
+        return;
+    }
+
+    /* mod == 3: register / no-operand forms */
+    {
+        int rr = modrm & 7;
+        switch (b) {
+        case 0xd9:
+            if (modrm >= 0xc0 && modrm <= 0xc7) { fpu_push(s, fpu_get(s, rr)); return; } /* fld st(i) */
+            if (modrm >= 0xc8 && modrm <= 0xcf) { long double t = fpu_get(s,0); fpu_set(s,0,fpu_get(s,rr)); fpu_set(s,rr,t); return; } /* fxch */
+            switch (modrm) {
+            case 0xd0: return;                                  /* fnop */
+            case 0xe0: fpu_set(s, 0, -fpu_get(s, 0)); return;   /* fchs */
+            case 0xe1: fpu_set(s, 0, fabsl(fpu_get(s, 0))); return; /* fabs */
+            case 0xe4: fpu_setcc(s, fpu_get(s, 0), 0.0L); return; /* ftst */
+            case 0xe5: { long double v = fpu_get(s,0); s->fpu_sw &= ~(FPU_C0|FPU_C1|FPU_C2|FPU_C3); /* fxam */
+                         if (isnan(v)) s->fpu_sw |= FPU_C0;
+                         else if (isinf(v)) s->fpu_sw |= FPU_C0|FPU_C2;
+                         else if (v==0) s->fpu_sw |= FPU_C3;
+                         else s->fpu_sw |= FPU_C2;
+                         if (signbit(v)) s->fpu_sw |= FPU_C1; return; }
+            case 0xe8: fpu_push(s, 1.0L); return;                       /* fld1 */
+            case 0xe9: fpu_push(s, 3.32192809488736234787L); return;    /* fldl2t log2(10) */
+            case 0xea: fpu_push(s, 1.44269504088896340736L); return;    /* fldl2e log2(e)  */
+            case 0xeb: fpu_push(s, 3.14159265358979323846L); return;    /* fldpi  pi       */
+            case 0xec: fpu_push(s, 0.30102999566398119521L); return;    /* fldlg2 log10(2) */
+            case 0xed: fpu_push(s, 0.69314718055994530942L); return;    /* fldln2 ln(2)    */
+            case 0xee: fpu_push(s, 0.0L); return;                       /* fldz */
+            case 0xfa: fpu_set(s, 0, fpu_pc_round(s, sqrtl(fpu_get(s, 0)))); return; /* fsqrt */
+            case 0xfc: fpu_set(s, 0, rintl(fpu_get(s, 0))); return; /* frndint (honors RC) */
+            case 0xfe: fpu_set(s, 0, sinl(fpu_get(s, 0))); return;  /* fsin */
+            case 0xff: fpu_set(s, 0, cosl(fpu_get(s, 0))); return;  /* fcos */
+            case 0xf1: { long double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,y*log2l(x)); fpu_pop(s); return; } /* fyl2x */
+            case 0xf0: fpu_set(s, 0, exp2l(fpu_get(s, 0)) - 1.0L); return; /* f2xm1 */
+            case 0xf2: { long double x=fpu_get(s,0); fpu_set(s,0,tanl(x)); fpu_push(s,1.0L); s->fpu_sw&=~FPU_C2; return; } /* fptan */
+            case 0xf3: { long double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,atan2l(y,x)); fpu_pop(s); return; } /* fpatan */
+            case 0xf4: { long double v=fpu_get(s,0), e=logbl(v); fpu_set(s,0,e); fpu_push(s, scalbnl(v,-(int)e)); return; } /* fxtract */
+            case 0xf5: { long double a=fpu_get(s,0),bb=fpu_get(s,1); fpu_set(s,0,remainderl(a,bb)); s->fpu_sw&=~FPU_C2; return; } /* fprem1 */
+            case 0xf9: { long double y=fpu_get(s,1),x=fpu_get(s,0); fpu_set(s,1,y*log2l(x+1.0L)); fpu_pop(s); return; } /* fyl2xp1 */
+            case 0xfb: { long double x=fpu_get(s,0); fpu_set(s,0,sinl(x)); fpu_push(s,cosl(x)); s->fpu_sw&=~FPU_C2; return; } /* fsincos */
+            case 0xf8: { long double a=fpu_get(s,0),bb=fpu_get(s,1); fpu_set(s,0,fmodl(a,bb)); s->fpu_sw&=~FPU_C2; return; } /* fprem */
+            case 0xfd: { long double st0=fpu_get(s,0),st1=fpu_get(s,1); fpu_set(s,0, st0*powl(2.0L, truncl(st1))); return; } /* fscale */
+            case 0xf6: s->fpu_top = (s->fpu_top+1)&7; return;   /* fdecstp (approx) */
+            case 0xf7: s->fpu_top = (s->fpu_top-1)&7; return;   /* fincstp (approx) */
+            }
+            break;
+        case 0xda:
+            if (modrm == 0xe9) { fpu_setcc(s, fpu_get(s,0), fpu_get(s,1)); fpu_pop(s); fpu_pop(s); return; } /* fucompp */
+            { int cond = -1;
+              if (modrm >= 0xc0 && modrm <= 0xc7) cond = get_cf(s);                      /* fcmovb  */
+              else if (modrm >= 0xc8 && modrm <= 0xcf) cond = get_zf(s);                   /* fcmove  */
+              else if (modrm >= 0xd0 && modrm <= 0xd7) cond = get_cf(s) || get_zf(s);      /* fcmovbe */
+              else if (modrm >= 0xd8 && modrm <= 0xdf) cond = get_pf(s);                   /* fcmovu  */
+              if (cond >= 0) { if (cond) fpu_set(s, 0, fpu_get(s, rr)); return; } }
+            break;
+        case 0xdb:
+            switch (modrm) {
+            case 0xe2: s->fpu_sw &= ~0x80ffu; return;           /* fnclex: clear exc/ES/B */
+            case 0xe0: case 0xe1: case 0xe4: return;            /* fneni/fndisi/fnsetpm */
+            case 0xe3: fpu_init(s); return;                     /* fninit */
+            }
+            { int cond = -1; /* fcmovNcc */
+              if (modrm >= 0xc0 && modrm <= 0xc7) cond = !get_cf(s);
+              else if (modrm >= 0xc8 && modrm <= 0xcf) cond = !get_zf(s);
+              else if (modrm >= 0xd0 && modrm <= 0xd7) cond = !(get_cf(s) || get_zf(s));
+              else if (modrm >= 0xd8 && modrm <= 0xdf) cond = !get_pf(s);
+              if (cond >= 0) { if (cond) fpu_set(s, 0, fpu_get(s, rr)); return; } }
+            if (modrm >= 0xe8 && modrm <= 0xf7) { /* fcomi/fucomi -> set EFLAGS */
+                long double a = fpu_get(s, 0), c = fpu_get(s, rr);
+                flags_sync(s);
+                s->eflags_ &= ~(EFL_ZF | EFL_PF | EFL_CF);
+                if (isnan(a) || isnan(c)) s->eflags_ |= EFL_ZF | EFL_PF | EFL_CF;
+                else if (a < c) s->eflags_ |= EFL_CF;
+                else if (a == c) s->eflags_ |= EFL_ZF;
+                return;
+            }
+            break;
+        case 0xdf:
+            if (modrm == 0xe0) { set_regv(s, REG_EAX, s->fpu_sw | ((s->fpu_top & 7) << 11), 2); return; } /* fnstsw ax */
+            if (modrm >= 0xe8 && modrm <= 0xf7) { /* fcomip/fucomip */
+                long double a = fpu_get(s, 0), c = fpu_get(s, rr);
+                flags_sync(s);
+                s->eflags_ &= ~(EFL_ZF | EFL_PF | EFL_CF);
+                if (isnan(a) || isnan(c)) s->eflags_ |= EFL_ZF | EFL_PF | EFL_CF;
+                else if (a < c) s->eflags_ |= EFL_CF;
+                else if (a == c) s->eflags_ |= EFL_ZF;
+                fpu_pop(s); return;
+            }
+            break;
+        case 0xdd:
+            if (modrm >= 0xc0 && modrm <= 0xc7) { s->fpu_tag[(s->fpu_top+rr)&7] = 3; return; } /* ffree */
+            if (modrm >= 0xd0 && modrm <= 0xd7) { fpu_set(s, rr, fpu_get(s, 0)); return; }     /* fst st(i) */
+            if (modrm >= 0xd8 && modrm <= 0xdf) { fpu_set(s, rr, fpu_get(s, 0)); fpu_pop(s); return; } /* fstp st(i) */
+            if (modrm >= 0xe0 && modrm <= 0xe7) { fpu_setcc(s, fpu_get(s,0), fpu_get(s,rr)); return; } /* fucom */
+            if (modrm >= 0xe8 && modrm <= 0xef) { fpu_setcc(s, fpu_get(s,0), fpu_get(s,rr)); fpu_pop(s); return; } /* fucomp */
+            break;
+        case 0xd8: case 0xdc: case 0xde: { /* register arithmetic */
+            /* D8: st0 op= st(i);  DC: st(i) op= st0;  DE: st(i) op= st0 then pop */
+            int dst = (b == 0xd8) ? 0 : rr;
+            long double a = fpu_get(s, dst), c = (b == 0xd8) ? fpu_get(s, rr) : fpu_get(s, 0), r = a;
+            int grp = (modrm >> 3) & 7;
+            if ((b == 0xde && modrm == 0xd9)) { /* fcompp */
+                fpu_setcc(s, fpu_get(s,0), fpu_get(s,1)); fpu_pop(s); fpu_pop(s); return;
+            }
+            switch (grp) {
+            case 0: r = a + c; break;                            /* fadd  */
+            case 1: r = a * c; break;                            /* fmul  */
+            case 2: fpu_setcc(s, fpu_get(s,0), fpu_get(s,rr)); return;              /* fcom  */
+            case 3: fpu_setcc(s, fpu_get(s,0), fpu_get(s,rr)); fpu_pop(s); return;  /* fcomp */
+            case 4: r = (b == 0xd8) ? a - c : c - a; break;      /* fsub(D8)/fsubr(DC/DE) */
+            case 5: r = (b == 0xd8) ? c - a : a - c; break;      /* fsubr(D8)/fsub(DC/DE) */
+            case 6: r = (b == 0xd8) ? a / c : c / a; break;      /* fdiv / fdivr */
+            case 7: r = (b == 0xd8) ? c / a : a / c; break;      /* fdivr / fdiv */
+            }
+            fpu_set(s, dst, fpu_pc_round(s, r));
+            if (b == 0xde) fpu_pop(s);                           /* the P (pop) forms */
+            return;
+        }
+        }
+        x86_stop(s, "x87 reg opcode %02x modrm=%02x", b, modrm);
+    }
+}
+
+/* RC (rounding-control) wrapper: set the host rounding mode from CW[11:10] for
+ * the duration of the escape, so every rounding step -- basic arithmetic, the
+ * fst/fist narrowing conversions, frndint, and the PC significand rounding --
+ * follows the guest's selected mode, then restore it. A fault inside longjmps
+ * past the restore; the interp loop's setjmp landing resets the host mode to
+ * nearest (temu's default), so the host FPU is never left in the guest mode. */
+static void fpu_exec(X86CPUState *s, int b, int seg_override)
+{
+    static const int rc_fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    int old = fegetround();
+    fesetround(rc_fe[(s->fpu_cw >> 10) & 3]);
+    fpu_exec_inner(s, b, seg_override);
+    fesetround(old);
+}
+
+/* ---- SSE / SSE2 ---------------------------------------------------------
+ *
+ * The XMM half of SSE and SSE2: moves, packed/scalar single and double
+ * arithmetic, compares, conversions, the 128-bit integer ops, shuffles, and
+ * fxsave/fxrstor/ldmxcsr/stmxcsr plus the fences. The 64-bit MMX forms (the
+ * same opcodes with no mandatory prefix in the integer space) are #UD, since
+ * CPUID does not advertise MMX.
+ *
+ * Userland needs this even though early kernels ran without it: Alpine's
+ * i686 build targets an SSE2 baseline, and libpython's interpreter setup
+ * runs `movd %eax,%xmm0` before any Python code.
+ *
+ * Restart-safety follows the rest of the file: every memory operand is
+ * loaded (and every store target probed) before an XMM register or memory
+ * byte changes, so a #PF restarts the instruction cleanly.
+ *
+ * Floating point is done in host float/double, which is IEEE single/double
+ * on every target. Results that differ by host are pinned to the x86
+ * answers: a NaN result takes the first NaN operand (quieted), or the
+ * negative "default NaN" when an invalid operation produced it from
+ * non-NaN inputs. min/max return the second operand on NaN or on equal
+ * zeros, and float->int conversions that overflow give 0x80000000. MXCSR.RC
+ * is applied through the host rounding mode, as fpu_exec does for the x87
+ * RC. The exception flags are never accumulated and FTZ/DAZ are ignored;
+ * all exceptions behave as masked. */
+
+#define SSE_NP 0   /* no mandatory prefix: ps forms */
+#define SSE_66 1   /* pd and the 128-bit integer forms */
+#define SSE_F3 2   /* ss */
+#define SSE_F2 3   /* sd */
+
+#define MXCSR_MASK 0x0000ffbfu  /* supported MXCSR bits (no DAZ) */
+
+static uint64_t ld_lin64(X86CPUState *s, uint32_t la)
+{
+    uint64_t lo = ld_lin(s, la, 4);
+    return lo | ((uint64_t)ld_lin(s, la + 4, 4) << 32);
+}
+static void st_lin64(X86CPUState *s, uint32_t la, uint64_t v)
+{
+    probe_write(s, la, 8);   /* both dwords must fault before either lands */
+    st_lin(s, la, (uint32_t)v, 4);
+    st_lin(s, la + 4, (uint32_t)(v >> 32), 4);
+}
+/* Aligned 128-bit operands (movaps, movdqa, and every packed op with a memory
+ * source) #GP(0) when not 16-byte aligned. */
+static void sse_ld128(X86CPUState *s, uint32_t la, int align, X86XMM *v)
+{
+    int i;
+    if (align && (la & 15)) raise_fault_err(s, EXC_GP, 0);
+    for (i = 0; i < 4; i++) v->d[i] = ld_lin(s, la + 4 * i, 4);
+}
+static void sse_st128(X86CPUState *s, uint32_t la, int align, const X86XMM *v)
+{
+    int i;
+    if (align && (la & 15)) raise_fault_err(s, EXC_GP, 0);
+    probe_write(s, la, 16);
+    for (i = 0; i < 4; i++) st_lin(s, la + 4 * i, v->d[i], 4);
+}
+
+/* The source operand: the XMM register itself, or `size` bytes (4, 8 or 16)
+ * loaded into *tmp with the rest zeroed. */
+static const X86XMM *sse_src(X86CPUState *s, const Modrm *rm, int size,
+                             X86XMM *tmp)
+{
+    if (rm->is_reg) return &s->xmm[rm->reg];
+    memset(tmp, 0, sizeof(*tmp));
+    if (size == 16) sse_ld128(s, rm->addr, 1, tmp);
+    else if (size == 8) tmp->q[0] = ld_lin64(s, rm->addr);
+    else tmp->d[0] = ld_lin(s, rm->addr, 4);
+    return tmp;
+}
+
+/* SSE use needs CR4.OSFXSR and !CR0.EM (#UD), then !CR0.TS (#NM). */
+static void sse_check(X86CPUState *s)
+{
+    if ((s->cr0 & CR0_EM) || !(s->cr4 & CR4_OSFXSR)) raise_fault(s, EXC_UD);
+    if (s->cr0 & CR0_TS) raise_fault(s, 7);
+}
+
+static float f32_bits(uint32_t u) { union { uint32_t u; float f; } v; v.u = u; return v.f; }
+static uint32_t f32_u(float f) { union { uint32_t u; float f; } v; v.f = f; return v.u; }
+static double f64_bits(uint64_t u) { union { uint64_t u; double f; } v; v.u = u; return v.f; }
+static uint64_t f64_u(double f) { union { uint64_t u; double f; } v; v.f = f; return v.u; }
+
+/* Arithmetic op `op` (the 0F opcode: 51 sqrt, 58 add, 59 mul, 5C sub, 5D min,
+ * 5E div, 5F max) on a = destination lane, b = source lane. */
+static float sse_f32(int op, float a, float b)
+{
+    float r;
+    switch (op) {
+    case 0x5d: return (a < b) ? a : b;
+    case 0x5f: return (a > b) ? a : b;
+    case 0x51:
+        if (isnan(b)) return f32_bits(f32_u(b) | 0x00400000u);
+        return (b < 0) ? f32_bits(0xffc00000u) : sqrtf(b);
+    case 0x58: r = a + b; break;
+    case 0x59: r = a * b; break;
+    case 0x5c: r = a - b; break;
+    default:   r = a / b; break;
+    }
+    if (isnan(r)) {
+        if (isnan(a)) return f32_bits(f32_u(a) | 0x00400000u);
+        if (isnan(b)) return f32_bits(f32_u(b) | 0x00400000u);
+        return f32_bits(0xffc00000u);
+    }
+    return r;
+}
+static double sse_f64(int op, double a, double b)
+{
+    double r;
+    switch (op) {
+    case 0x5d: return (a < b) ? a : b;
+    case 0x5f: return (a > b) ? a : b;
+    case 0x51:
+        if (isnan(b)) return f64_bits(f64_u(b) | 0x0008000000000000ull);
+        return (b < 0) ? f64_bits(0xfff8000000000000ull) : sqrt(b);
+    case 0x58: r = a + b; break;
+    case 0x59: r = a * b; break;
+    case 0x5c: r = a - b; break;
+    default:   r = a / b; break;
+    }
+    if (isnan(r)) {
+        if (isnan(a)) return f64_bits(f64_u(a) | 0x0008000000000000ull);
+        if (isnan(b)) return f64_bits(f64_u(b) | 0x0008000000000000ull);
+        return f64_bits(0xfff8000000000000ull);
+    }
+    return r;
+}
+
+/* cmpps/cmpss/... predicate imm8[2:0] -> all-ones/zero lane mask */
+static int sse_cmp(int pred, double a, double b)
+{
+    switch (pred & 7) {
+    case 0: return a == b;
+    case 1: return a < b;
+    case 2: return a <= b;
+    case 3: return isnan(a) || isnan(b);
+    case 4: return !(a == b);
+    case 5: return !(a < b);
+    case 6: return !(a <= b);
+    default: return !isnan(a) && !isnan(b);
+    }
+}
+
+/* float/double -> int32 (cvt* rounds per MXCSR.RC via the host mode, cvtt*
+ * truncates); NaN and out-of-range give the "integer indefinite" 0x80000000. */
+static int32_t sse_cvt_i32(double v, int chop)
+{
+    if (isnan(v)) return INT32_MIN;
+    v = chop ? trunc(v) : nearbyint(v);
+    if (v >= 2147483648.0 || v < -2147483648.0) return INT32_MIN;
+    return (int32_t)v;
+}
+
+static int8_t   sat_s8(int v)  { return v > 127 ? 127 : v < -128 ? -128 : v; }
+static uint8_t  sat_u8(int v)  { return v > 255 ? 255 : v < 0 ? 0 : v; }
+static int16_t  sat_s16(int v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
+static uint16_t sat_u16(int v) { return v > 65535 ? 65535 : v < 0 ? 0 : v; }
+
+/* punpckl* / punpckh* (and unpcklps/pd...): interleave the low or high halves
+ * of d and s, element size `esz` bytes. */
+static void sse_unpack(X86XMM *r, const X86XMM *d, const X86XMM *s, int esz, int hi)
+{
+    int i, n = 8 / esz, off = hi ? 8 : 0;
+    for (i = 0; i < n; i++) {
+        memcpy(r->b + 2 * i * esz, d->b + off + i * esz, esz);
+        memcpy(r->b + (2 * i + 1) * esz, s->b + off + i * esz, esz);
+    }
+}
+
+/* Shift every `esz`-byte lane of *d by `cnt`: kind 2 logical right, 4
+ * arithmetic right, 6 left (the /reg encoding of the 71-73 groups). */
+static void sse_shift(X86XMM *d, int esz, int kind, uint64_t cnt)
+{
+    int i;
+    int bits = esz * 8;
+    if (cnt >= (uint64_t)bits) {
+        if (kind != 4) { memset(d, 0, sizeof(*d)); return; }
+        cnt = bits - 1;
+    }
+    for (i = 0; i < 16 / esz; i++) {
+        switch (esz) {
+        case 2: d->w[i] = kind == 2 ? d->w[i] >> cnt : kind == 4 ? (uint16_t)(d->sw[i] >> cnt) : (uint16_t)(d->w[i] << cnt); break;
+        case 4: d->d[i] = kind == 2 ? d->d[i] >> cnt : kind == 4 ? (uint32_t)(d->sd[i] >> cnt) : d->d[i] << cnt; break;
+        default: d->q[i] = kind == 2 ? d->q[i] >> cnt : d->q[i] << cnt; break;
+        }
+    }
+}
+
+/* comiss/ucomiss/comisd/ucomisd: ZF/PF/CF per the unordered/less/equal
+ * outcome, OF/SF/AF cleared. */
+static void sse_comi(X86CPUState *s, double a, double b)
+{
+    flags_sync(s);
+    s->eflags_ &= ~(uint32_t)(EFL_CF | EFL_PF | EFL_AF | EFL_ZF | EFL_SF | EFL_OF);
+    if (isnan(a) || isnan(b)) s->eflags_ |= EFL_ZF | EFL_PF | EFL_CF;
+    else if (a < b) s->eflags_ |= EFL_CF;
+    else if (a == b) s->eflags_ |= EFL_ZF;
+}
+
+/* FXSAVE/FXRSTOR 512-byte image: FCW, FSW (with TOP), abridged tag byte
+ * (bit i = physical register i is not empty), MXCSR, MXCSR_MASK, ST(0..7) in
+ * 16-byte slots, XMM0-7. FIP/FDP/FOP are not tracked and save as 0. */
+static void sse_fxsave(X86CPUState *s, uint32_t la)
+{
+    uint8_t buf[512];
+    int i;
+    if (la & 15) raise_fault_err(s, EXC_GP, 0);
+    memset(buf, 0, sizeof(buf));
+    buf[0] = s->fpu_cw; buf[1] = s->fpu_cw >> 8;
+    { uint16_t sw = s->fpu_sw | ((s->fpu_top & 7) << 11);
+      buf[2] = sw; buf[3] = sw >> 8; }
+    for (i = 0; i < 8; i++) if (s->fpu_tag[i] != 3) buf[4] |= 1 << i;
+    memcpy(buf + 24, &s->mxcsr, 4);
+    { uint32_t mask = MXCSR_MASK; memcpy(buf + 28, &mask, 4); }
+    for (i = 0; i < 8; i++) ld_to_f80(s->fpst[(s->fpu_top + i) & 7], buf + 32 + 16 * i);
+    memcpy(buf + 160, s->xmm, sizeof(s->xmm));
+    probe_write(s, la, 512);
+    for (i = 0; i < 512; i += 4) {
+        uint32_t v; memcpy(&v, buf + i, 4); st_lin(s, la + i, v, 4);
+    }
+}
+static void sse_fxrstor(X86CPUState *s, uint32_t la)
+{
+    uint8_t buf[512];
+    uint32_t mx;
+    uint16_t sw;
+    int i;
+    if (la & 15) raise_fault_err(s, EXC_GP, 0);
+    for (i = 0; i < 512; i += 4) {   /* every load before any state changes */
+        uint32_t v = ld_lin(s, la + i, 4); memcpy(buf + i, &v, 4);
+    }
+    memcpy(&mx, buf + 24, 4);
+    if (mx & ~MXCSR_MASK) raise_fault_err(s, EXC_GP, 0);
+    s->fpu_cw = buf[0] | (buf[1] << 8);
+    sw = buf[2] | (buf[3] << 8);
+    s->fpu_top = (sw >> 11) & 7;
+    s->fpu_sw = sw & ~0x3800;
+    for (i = 0; i < 8; i++) s->fpu_tag[i] = (buf[4] >> i) & 1 ? 0 : 3;
+    for (i = 0; i < 8; i++) s->fpst[(s->fpu_top + i) & 7] = f80_to_ld(buf + 32 + 16 * i);
+    s->mxcsr = mx;
+    memcpy(s->xmm, buf + 160, sizeof(s->xmm));
+}
+
+/* 0F AE: fxsave/fxrstor/ldmxcsr/stmxcsr/clflush, and with mod=3 the fences. */
+static void sse_group15(X86CPUState *s, int seg_override)
+{
+    uint8_t m = fetch8(s);
+    int reg;
+    Modrm rm;
+    decode_modrm(s, m, seg_override, &reg, &rm);
+    if (rm.is_reg) {
+        if (reg < 5) raise_fault(s, EXC_UD);
+        return;  /* lfence / mfence / sfence: accesses are already in order */
+    }
+    switch (reg) {
+    case 0: case 1:
+        if (s->cr0 & (CR0_EM | CR0_TS)) raise_fault(s, 7);
+        if (reg == 0) sse_fxsave(s, rm.addr); else sse_fxrstor(s, rm.addr);
+        break;
+    case 2: {
+        uint32_t v;
+        sse_check(s);
+        v = ld_lin(s, rm.addr, 4);
+        if (v & ~MXCSR_MASK) raise_fault_err(s, EXC_GP, 0);
+        s->mxcsr = v;
+    } break;
+    case 3:
+        sse_check(s);
+        st_lin(s, rm.addr, s->mxcsr, 4);
+        break;
+    case 7:  /* clflush: no caches to flush; still a memory reference */
+        (void)ld_lin(s, rm.addr, 1);
+        break;
+    default:
+        raise_fault(s, EXC_UD);
+    }
+}
+
+/* Execute 0F b2 (the opcode byte after 0F) with mandatory-prefix class `pc`;
+ * anything outside the implemented SSE/SSE2 map is #UD. */
+static void sse_exec_inner(X86CPUState *s, int b2, int pc, int seg_override)
+{
+    uint8_t m;
+    int reg, i;
+    Modrm rm;
+    X86XMM tmp, r, *d;
+    const X86XMM *src;
+
+    if (b2 == 0xae) { sse_group15(s, seg_override); return; }
+    if (b2 == 0xc3) {  /* movnti m32, r32: a plain store */
+        if (pc != SSE_NP) raise_fault(s, EXC_UD);
+        m = fetch8(s); decode_modrm(s, m, seg_override, &reg, &rm);
+        if (rm.is_reg) raise_fault(s, EXC_UD);
+        st_lin(s, rm.addr, s->regs[reg], 4);
+        return;
+    }
+
+    /* The 128-bit integer ops exist only with 66 (bare = MMX, not modelled);
+     * F3/F2 have a handful of their own forms, filtered per opcode below. */
+    if (((b2 >= 0x60 && b2 <= 0x7f) || b2 >= 0xd0 || (b2 >= 0xc4 && b2 <= 0xc5)) &&
+        pc == SSE_NP)
+        raise_fault(s, EXC_UD);
+    if (!((b2 >= 0x10 && b2 <= 0x17) || (b2 >= 0x28 && b2 <= 0x2f) ||
+          (b2 >= 0x50 && b2 <= 0x7f) || (b2 >= 0xc2 && b2 <= 0xc6) || b2 >= 0xd0))
+        raise_fault(s, EXC_UD);
+    if (b2 == 0x77) raise_fault(s, EXC_UD);  /* emms: MMX */
+
+    sse_check(s);
+    m = fetch8(s);
+    decode_modrm(s, m, seg_override, &reg, &rm);
+    d = &s->xmm[reg];
+
+    switch (b2) {
+    /* ---- moves ---- */
+    case 0x10: /* movups/movupd/movss/movsd xmm, xmm/m */
+        if (pc == SSE_F3) {
+            if (rm.is_reg) d->d[0] = s->xmm[rm.reg].d[0];
+            else { uint32_t v = ld_lin(s, rm.addr, 4); memset(d, 0, 16); d->d[0] = v; }
+        } else if (pc == SSE_F2) {
+            if (rm.is_reg) d->q[0] = s->xmm[rm.reg].q[0];
+            else { uint64_t v = ld_lin64(s, rm.addr); d->q[0] = v; d->q[1] = 0; }
+        } else if (rm.is_reg) *d = s->xmm[rm.reg];
+        else { sse_ld128(s, rm.addr, 0, &tmp); *d = tmp; }
+        break;
+    case 0x11: /* the stores */
+        if (pc == SSE_F3) {
+            if (rm.is_reg) s->xmm[rm.reg].d[0] = d->d[0];
+            else st_lin(s, rm.addr, d->d[0], 4);
+        } else if (pc == SSE_F2) {
+            if (rm.is_reg) s->xmm[rm.reg].q[0] = d->q[0];
+            else st_lin64(s, rm.addr, d->q[0]);
+        } else if (rm.is_reg) s->xmm[rm.reg] = *d;
+        else sse_st128(s, rm.addr, 0, d);
+        break;
+    case 0x12: case 0x13: case 0x16: case 0x17: { /* movlps/movhps/movlpd/movhpd */
+        int hi = b2 >= 0x16;
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        if (b2 & 1) {                      /* 13/17: store the half */
+            if (rm.is_reg) raise_fault(s, EXC_UD);
+            st_lin64(s, rm.addr, d->q[hi]);
+        } else if (rm.is_reg) {            /* movhlps / movlhps */
+            if (pc == SSE_66) raise_fault(s, EXC_UD);
+            d->q[hi] = s->xmm[rm.reg].q[!hi];
+        } else
+            d->q[hi] = ld_lin64(s, rm.addr);
+    } break;
+    case 0x28: /* movaps/movapd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp); *d = *src;
+        break;
+    case 0x29: case 0x2b: /* movaps/movapd store; movntps/movntpd */
+        if (pc > SSE_66 || (b2 == 0x2b && rm.is_reg)) raise_fault(s, EXC_UD);
+        if (rm.is_reg) s->xmm[rm.reg] = *d;
+        else sse_st128(s, rm.addr, 1, d);
+        break;
+    case 0x6e: /* movd xmm, r/m32 */
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        { uint32_t v = rm_read(s, &rm, 4); memset(d, 0, 16); d->d[0] = v; }
+        break;
+    case 0x7e:
+        if (pc == SSE_66)                  /* movd r/m32, xmm */
+            rm_write(s, &rm, d->d[0], 4);
+        else if (pc == SSE_F3) {           /* movq xmm, xmm/m64 */
+            uint64_t v = rm.is_reg ? s->xmm[rm.reg].q[0] : ld_lin64(s, rm.addr);
+            d->q[0] = v; d->q[1] = 0;
+        } else raise_fault(s, EXC_UD);
+        break;
+    case 0xd6: /* movq xmm/m64, xmm */
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        if (rm.is_reg) { s->xmm[rm.reg].q[0] = d->q[0]; s->xmm[rm.reg].q[1] = 0; }
+        else st_lin64(s, rm.addr, d->q[0]);
+        break;
+    case 0x6f: /* movdqa / movdqu load */
+        if (pc == SSE_F2) raise_fault(s, EXC_UD);
+        if (rm.is_reg) *d = s->xmm[rm.reg];
+        else { sse_ld128(s, rm.addr, pc == SSE_66, &tmp); *d = tmp; }
+        break;
+    case 0x7f: case 0xe7: /* movdqa / movdqu store; movntdq */
+        if (pc == SSE_F2 || (b2 == 0xe7 && (pc != SSE_66 || rm.is_reg)))
+            raise_fault(s, EXC_UD);
+        if (rm.is_reg) s->xmm[rm.reg] = *d;
+        else sse_st128(s, rm.addr, pc == SSE_66, d);
+        break;
+    case 0x50: /* movmskps / movmskpd r32, xmm */
+        if (pc > SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        src = &s->xmm[rm.reg];
+        s->regs[reg] = (pc == SSE_66) ? (uint32_t)((src->q[0] >> 63) | ((src->q[1] >> 63) << 1))
+                                      : (src->d[0] >> 31) | ((src->d[1] >> 31) << 1) |
+                                        ((src->d[2] >> 31) << 2) | ((src->d[3] >> 31) << 3);
+        break;
+    case 0xd7: { /* pmovmskb r32, xmm */
+        uint32_t v = 0;
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        for (i = 0; i < 16; i++) v |= (uint32_t)(s->xmm[rm.reg].b[i] >> 7) << i;
+        s->regs[reg] = v;
+    } break;
+    case 0xf7: { /* maskmovdqu xmm, xmm -> DS:[E]DI */
+        uint32_t la;
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        la = seg_base(s, seg_override, X86_CPU_SEG_DS) + adr_get(s, REG_EDI);
+        src = &s->xmm[rm.reg];
+        probe_write(s, la, 16);
+        for (i = 0; i < 16; i++)
+            if (src->b[i] & 0x80) st_lin(s, la + i, d->b[i], 1);
+    } break;
+
+    /* ---- floating point ---- */
+    case 0x51: case 0x58: case 0x59: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : pc == SSE_F2 ? 8 : 16, &tmp);
+        switch (pc) {
+        case SSE_NP: for (i = 0; i < 4; i++) d->f[i] = sse_f32(b2, d->f[i], src->f[i]); break;
+        case SSE_66: for (i = 0; i < 2; i++) d->fd[i] = sse_f64(b2, d->fd[i], src->fd[i]); break;
+        case SSE_F3: d->f[0] = sse_f32(b2, d->f[0], src->f[0]); break;
+        default:     d->fd[0] = sse_f64(b2, d->fd[0], src->fd[0]); break;
+        }
+        break;
+    case 0x52: case 0x53: /* rsqrtps/ss, rcpps/ss: exact values satisfy the
+                           * architected 1.5*2^-12 relative error bound */
+        if (pc != SSE_NP && pc != SSE_F3) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : 16, &tmp);
+        for (i = 0; i < (pc == SSE_F3 ? 1 : 4); i++)
+            d->f[i] = (b2 == 0x52) ? 1.0f / sqrtf(src->f[i]) : 1.0f / src->f[i];
+        break;
+    case 0x54: case 0x55: case 0x56: case 0x57: /* and/andn/or/xor ps/pd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        for (i = 0; i < 2; i++) {
+            uint64_t a = d->q[i], b = src->q[i];
+            d->q[i] = b2 == 0x54 ? a & b : b2 == 0x55 ? ~a & b : b2 == 0x56 ? a | b : a ^ b;
+        }
+        break;
+    case 0xc2: { /* cmpps/cmppd/cmpss/cmpsd xmm, xmm/m, imm8 */
+        int pred;
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : pc == SSE_F2 ? 8 : 16, &tmp);
+        pred = fetch8(s);
+        switch (pc) {
+        case SSE_NP: for (i = 0; i < 4; i++) d->d[i] = sse_cmp(pred, d->f[i], src->f[i]) ? ~0u : 0; break;
+        case SSE_66: for (i = 0; i < 2; i++) d->q[i] = sse_cmp(pred, d->fd[i], src->fd[i]) ? ~0ull : 0; break;
+        case SSE_F3: d->d[0] = sse_cmp(pred, d->f[0], src->f[0]) ? ~0u : 0; break;
+        default:     d->q[0] = sse_cmp(pred, d->fd[0], src->fd[0]) ? ~0ull : 0; break;
+        }
+    } break;
+    case 0x2e: case 0x2f: /* ucomiss/comiss, ucomisd/comisd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_66 ? 8 : 4, &tmp);
+        if (pc == SSE_66) sse_comi(s, d->fd[0], src->fd[0]);
+        else sse_comi(s, d->f[0], src->f[0]);
+        break;
+    case 0x14: case 0x15: /* unpcklps/unpckhps, unpcklpd/unpckhpd */
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        sse_unpack(&r, d, src, pc == SSE_66 ? 8 : 4, b2 == 0x15);
+        *d = r;
+        break;
+    case 0xc6: { /* shufps / shufpd */
+        int imm;
+        if (pc > SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        imm = fetch8(s);
+        if (pc == SSE_66) { r.q[0] = d->q[imm & 1]; r.q[1] = src->q[(imm >> 1) & 1]; }
+        else {
+            r.d[0] = d->d[imm & 3];          r.d[1] = d->d[(imm >> 2) & 3];
+            r.d[2] = src->d[(imm >> 4) & 3]; r.d[3] = src->d[(imm >> 6) & 3];
+        }
+        *d = r;
+    } break;
+
+    /* ---- conversions ---- */
+    case 0x2a: { /* cvtsi2ss / cvtsi2sd xmm, r/m32 (the MMX cvtpi2* are #UD) */
+        int32_t v;
+        if (pc < SSE_F3) raise_fault(s, EXC_UD);
+        v = (int32_t)rm_read(s, &rm, 4);
+        if (pc == SSE_F3) d->f[0] = (float)v; else d->fd[0] = (double)v;
+    } break;
+    case 0x2c: case 0x2d: { /* cvt(t)ss2si / cvt(t)sd2si r32, xmm/m */
+        if (pc < SSE_F3) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_F3 ? 4 : 8, &tmp);
+        s->regs[reg] = (uint32_t)sse_cvt_i32(pc == SSE_F3 ? (double)src->f[0] : src->fd[0],
+                                             b2 == 0x2c);
+    } break;
+    case 0x5a: /* cvtps2pd / cvtpd2ps / cvtss2sd / cvtsd2ss */
+        src = sse_src(s, &rm, pc == SSE_NP ? 8 : pc == SSE_66 ? 16 : pc == SSE_F3 ? 4 : 8, &tmp);
+        switch (pc) {
+        case SSE_NP: r.fd[0] = src->f[0]; r.fd[1] = src->f[1]; *d = r; break;
+        case SSE_66: r.f[0] = (float)src->fd[0]; r.f[1] = (float)src->fd[1]; r.q[1] = 0; *d = r; break;
+        case SSE_F3: d->fd[0] = src->f[0]; break;
+        default:     d->f[0] = (float)src->fd[0]; break;
+        }
+        break;
+    case 0x5b: /* cvtdq2ps / cvtps2dq / cvttps2dq */
+        if (pc == SSE_F2) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        for (i = 0; i < 4; i++)
+            r.d[i] = (pc == SSE_NP) ? f32_u((float)src->sd[i])
+                                    : (uint32_t)sse_cvt_i32(src->f[i], pc == SSE_F3);
+        *d = r;
+        break;
+    case 0xe6: /* cvttpd2dq (66) / cvtdq2pd (F3) / cvtpd2dq (F2) */
+        if (pc == SSE_NP) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, pc == SSE_F3 ? 8 : 16, &tmp);
+        if (pc == SSE_F3) { r.fd[0] = src->sd[0]; r.fd[1] = src->sd[1]; }
+        else {
+            r.d[0] = (uint32_t)sse_cvt_i32(src->fd[0], pc == SSE_66);
+            r.d[1] = (uint32_t)sse_cvt_i32(src->fd[1], pc == SSE_66);
+            r.q[1] = 0;
+        }
+        *d = r;
+        break;
+
+    /* ---- 128-bit integer (66 only, except the shuffles below) ---- */
+    case 0x70: { /* pshufd (66) / pshufhw (F3) / pshuflw (F2) */
+        int imm;
+        src = sse_src(s, &rm, 16, &tmp);
+        imm = fetch8(s);
+        r = *src;
+        if (pc == SSE_66)
+            for (i = 0; i < 4; i++) r.d[i] = src->d[(imm >> (2 * i)) & 3];
+        else {
+            int base = (pc == SSE_F3) ? 4 : 0;
+            for (i = 0; i < 4; i++) r.w[base + i] = src->w[base + ((imm >> (2 * i)) & 3)];
+        }
+        *d = r;
+    } break;
+    case 0x71: case 0x72: case 0x73: { /* shift groups by imm8 */
+        int imm, esz = (b2 == 0x71) ? 2 : (b2 == 0x72) ? 4 : 8;
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        imm = fetch8(s);
+        d = &s->xmm[rm.reg];
+        if (b2 == 0x73 && (reg == 3 || reg == 7)) { /* psrldq / pslldq: bytes */
+            int n = imm > 16 ? 16 : imm;
+            memset(&r, 0, sizeof(r));
+            if (reg == 3) memcpy(r.b, d->b + n, 16 - n);
+            else memcpy(r.b + n, d->b, 16 - n);
+            *d = r;
+        } else if (reg == 2 || reg == 6 || (reg == 4 && esz != 8))
+            sse_shift(d, esz, reg, imm);
+        else
+            raise_fault(s, EXC_UD);
+    } break;
+    case 0xc4: { /* pinsrw xmm, r32/m16, imm8 */
+        uint16_t v;
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        v = (uint16_t)rm_read(s, &rm, 2);
+        d->w[fetch8(s) & 7] = v;
+    } break;
+    case 0xc5: /* pextrw r32, xmm, imm8 */
+        if (pc != SSE_66 || !rm.is_reg) raise_fault(s, EXC_UD);
+        s->regs[reg] = s->xmm[rm.reg].w[fetch8(s) & 7];
+        break;
+    default:
+        if (pc != SSE_66) raise_fault(s, EXC_UD);
+        src = sse_src(s, &rm, 16, &tmp);
+        r = *d;
+        switch (b2) {
+        case 0x60: case 0x61: case 0x62: case 0x6c: /* punpckl{bw,wd,dq,qdq} */
+            sse_unpack(&r, d, src, b2 == 0x6c ? 8 : 1 << (b2 - 0x60), 0); break;
+        case 0x68: case 0x69: case 0x6a: case 0x6d: /* punpckh{bw,wd,dq,qdq} */
+            sse_unpack(&r, d, src, b2 == 0x6d ? 8 : 1 << (b2 - 0x68), 1); break;
+        case 0x63: /* packsswb */
+            for (i = 0; i < 8; i++) { r.sb[i] = sat_s8(d->sw[i]); r.sb[8 + i] = sat_s8(src->sw[i]); } break;
+        case 0x67: /* packuswb */
+            for (i = 0; i < 8; i++) { r.b[i] = sat_u8(d->sw[i]); r.b[8 + i] = sat_u8(src->sw[i]); } break;
+        case 0x6b: /* packssdw */
+            for (i = 0; i < 4; i++) { r.sw[i] = sat_s16(d->sd[i]); r.sw[4 + i] = sat_s16(src->sd[i]); } break;
+        case 0x64: for (i = 0; i < 16; i++) r.b[i] = d->sb[i] > src->sb[i] ? 0xff : 0; break;
+        case 0x65: for (i = 0; i < 8; i++) r.w[i] = d->sw[i] > src->sw[i] ? 0xffff : 0; break;
+        case 0x66: for (i = 0; i < 4; i++) r.d[i] = d->sd[i] > src->sd[i] ? ~0u : 0; break;
+        case 0x74: for (i = 0; i < 16; i++) r.b[i] = d->b[i] == src->b[i] ? 0xff : 0; break;
+        case 0x75: for (i = 0; i < 8; i++) r.w[i] = d->w[i] == src->w[i] ? 0xffff : 0; break;
+        case 0x76: for (i = 0; i < 4; i++) r.d[i] = d->d[i] == src->d[i] ? ~0u : 0; break;
+        case 0xd1: case 0xd2: case 0xd3: /* psrl{w,d,q} by xmm/m128 */
+            sse_shift(&r, 1 << (b2 - 0xd0), 2, src->q[0]); break;
+        case 0xe1: case 0xe2: /* psra{w,d} */
+            sse_shift(&r, 1 << (b2 - 0xe0), 4, src->q[0]); break;
+        case 0xf1: case 0xf2: case 0xf3: /* psll{w,d,q} */
+            sse_shift(&r, 1 << (b2 - 0xf0), 6, src->q[0]); break;
+        case 0xd4: for (i = 0; i < 2; i++) r.q[i] = d->q[i] + src->q[i]; break;  /* paddq */
+        case 0xfb: for (i = 0; i < 2; i++) r.q[i] = d->q[i] - src->q[i]; break;  /* psubq */
+        case 0xfc: for (i = 0; i < 16; i++) r.b[i] = d->b[i] + src->b[i]; break;
+        case 0xfd: for (i = 0; i < 8; i++) r.w[i] = d->w[i] + src->w[i]; break;
+        case 0xfe: for (i = 0; i < 4; i++) r.d[i] = d->d[i] + src->d[i]; break;
+        case 0xf8: for (i = 0; i < 16; i++) r.b[i] = d->b[i] - src->b[i]; break;
+        case 0xf9: for (i = 0; i < 8; i++) r.w[i] = d->w[i] - src->w[i]; break;
+        case 0xfa: for (i = 0; i < 4; i++) r.d[i] = d->d[i] - src->d[i]; break;
+        case 0xec: for (i = 0; i < 16; i++) r.sb[i] = sat_s8(d->sb[i] + src->sb[i]); break;
+        case 0xed: for (i = 0; i < 8; i++) r.sw[i] = sat_s16(d->sw[i] + src->sw[i]); break;
+        case 0xdc: for (i = 0; i < 16; i++) r.b[i] = sat_u8(d->b[i] + src->b[i]); break;
+        case 0xdd: for (i = 0; i < 8; i++) r.w[i] = sat_u16(d->w[i] + src->w[i]); break;
+        case 0xe8: for (i = 0; i < 16; i++) r.sb[i] = sat_s8(d->sb[i] - src->sb[i]); break;
+        case 0xe9: for (i = 0; i < 8; i++) r.sw[i] = sat_s16(d->sw[i] - src->sw[i]); break;
+        case 0xd8: for (i = 0; i < 16; i++) r.b[i] = sat_u8(d->b[i] - src->b[i]); break;
+        case 0xd9: for (i = 0; i < 8; i++) r.w[i] = sat_u16(d->w[i] - src->w[i]); break;
+        case 0xda: for (i = 0; i < 16; i++) r.b[i] = d->b[i] < src->b[i] ? d->b[i] : src->b[i]; break;
+        case 0xde: for (i = 0; i < 16; i++) r.b[i] = d->b[i] > src->b[i] ? d->b[i] : src->b[i]; break;
+        case 0xea: for (i = 0; i < 8; i++) r.sw[i] = d->sw[i] < src->sw[i] ? d->sw[i] : src->sw[i]; break;
+        case 0xee: for (i = 0; i < 8; i++) r.sw[i] = d->sw[i] > src->sw[i] ? d->sw[i] : src->sw[i]; break;
+        case 0xe0: for (i = 0; i < 16; i++) r.b[i] = (d->b[i] + src->b[i] + 1) >> 1; break;
+        case 0xe3: for (i = 0; i < 8; i++) r.w[i] = (d->w[i] + src->w[i] + 1) >> 1; break;
+        case 0xd5: for (i = 0; i < 8; i++) r.w[i] = (uint16_t)(d->sw[i] * src->sw[i]); break;
+        case 0xe5: for (i = 0; i < 8; i++) r.w[i] = (uint16_t)((d->sw[i] * src->sw[i]) >> 16); break;
+        case 0xe4: for (i = 0; i < 8; i++) r.w[i] = (uint16_t)(((uint32_t)d->w[i] * src->w[i]) >> 16); break;
+        case 0xf4: for (i = 0; i < 2; i++) r.q[i] = (uint64_t)d->d[2 * i] * src->d[2 * i]; break;
+        case 0xf5: /* pmaddwd: wraps only for the all-0x8000 case, as on hardware */
+            for (i = 0; i < 4; i++)
+                r.d[i] = (uint32_t)(d->sw[2 * i] * src->sw[2 * i]) +
+                         (uint32_t)(d->sw[2 * i + 1] * src->sw[2 * i + 1]);
+            break;
+        case 0xf6: /* psadbw */
+            for (i = 0; i < 2; i++) {
+                int k; uint32_t sum = 0;
+                for (k = 0; k < 8; k++) sum += abs(d->b[8 * i + k] - src->b[8 * i + k]);
+                r.q[i] = sum;
+            }
+            break;
+        case 0xdb: for (i = 0; i < 2; i++) r.q[i] = d->q[i] & src->q[i]; break;
+        case 0xdf: for (i = 0; i < 2; i++) r.q[i] = ~d->q[i] & src->q[i]; break;
+        case 0xeb: for (i = 0; i < 2; i++) r.q[i] = d->q[i] | src->q[i]; break;
+        case 0xef: for (i = 0; i < 2; i++) r.q[i] = d->q[i] ^ src->q[i]; break;
+        default: raise_fault(s, EXC_UD);
+        }
+        *d = r;
+        break;
+    }
+}
+
+/* MXCSR.RC wrapper: like fpu_exec, run with the host rounding mode set from
+ * the guest's; a fault longjmps out and the interp loop's landing restores
+ * round-to-nearest. */
+static void sse_exec(X86CPUState *s, int b2, int pc, int seg_override)
+{
+    static const int rc_fe[4] = { FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO };
+    int rc = (s->mxcsr >> 13) & 3;
+    if (rc == 0) { sse_exec_inner(s, b2, pc, seg_override); return; }
+    fesetround(rc_fe[rc]);
+    sse_exec_inner(s, b2, pc, seg_override);
+    fesetround(FE_TONEAREST);
+}
+
+/* ---- interrupt / exception delivery (protected mode, 32-bit gates) ----- */
+
+/* `is_software` marks the INT n / INT3 / INTO opcodes.  Those, unlike hardware
+ * IRQs and exceptions, are subject to the gate's DPL: without the check any
+ * ring-3 program could invoke an arbitrary IDT vector (e.g. `int $14` to fake a
+ * page fault). */
+static BOOL deliver_interrupt(X86CPUState *s, int intno, uint32_t error,
+                              int has_error, int is_software)
+{
+    X86Seg *idt = &s->seg[X86_CPU_SEG_IDT];
+    uint32_t gaddr, lo, hi, off;
+    uint16_t sel;
+    int type, present, old_cpl, dpl;
+    uint32_t old_eflags = get_eflags(s);
+    uint16_t old_cs = s->seg[X86_CPU_SEG_CS].sel;
+    uint32_t old_eip = s->eip;
+    uint32_t old_esp = s->regs[REG_ESP];
+    uint16_t old_ss = s->seg[X86_CPU_SEG_SS].sel;
+
+    if (!(s->cr0 & CR0_PE))
+        return FALSE;                       /* real-mode IVT not yet supported */
+    if ((uint32_t)intno * 8 + 7 > idt->limit)
+        return FALSE;
+
+    gaddr = idt->base + (uint32_t)intno * 8;
+    { int sv = g_sys_access; g_sys_access = 1;   /* IDT gate read is supervisor */
+      lo = ld_lin(s, gaddr, 4);
+      hi = ld_lin(s, gaddr + 4, 4);
+      g_sys_access = sv; }
+    sel = (lo >> 16) & 0xffff;
+    off = (lo & 0xffff) | (hi & 0xffff0000u);
+    type = (hi >> 8) & 0x1f;
+    present = (hi >> 15) & 1;
+    if (!present || (type != 0x0e && type != 0x0f))
+        return FALSE;
+
+    old_cpl = old_cs & 3;
+    if (is_software && (int)((hi >> 13) & 3) < old_cpl)
+        raise_fault_err(s, EXC_GP, (uint32_t)intno * 8 + 2);
+    load_seg(s, X86_CPU_SEG_CS, sel);
+    dpl = (s->seg[X86_CPU_SEG_CS].flags >> 5) & 3;
+#ifdef X86_PROGRESS
+    { static int n; if (old_eip >= 0xc0520000u && old_eip <= 0xc0530000u && n++ < 8)
+        fprintf(stderr,
+        "[deliver] intno=%d old_cs=%04x(cpl%d) old_eip=%08x gate_sel=%04x dpl=%d cr2=%08x\n",
+        intno, old_cs, old_cpl, old_eip, sel, dpl, s->cr2); }
+#endif
+
+    if (dpl < old_cpl) {
+        /* privilege change: switch to the ring-`dpl` stack from the TSS */
+        uint32_t tss = s->seg[X86_CPU_SEG_TR].base;
+        uint32_t new_esp, new_ss16;
+        { int sv = g_sys_access; g_sys_access = 1;   /* TSS read is supervisor */
+          new_esp = ld_lin(s, tss + 4 + dpl * 8, 4);
+          new_ss16 = ld_lin(s, tss + 8 + dpl * 8, 4);
+          g_sys_access = sv; }
+        uint16_t new_ss = (uint16_t)new_ss16;
+        load_seg(s, X86_CPU_SEG_SS, new_ss);
+        s->regs[REG_ESP] = new_esp;
+        push_val(s, old_ss, 4);
+        push_val(s, old_esp, 4);
+#ifdef X86_PROGRESS
+        { static int n; if (n++ < 8) fprintf(stderr,
+            "[int->ring%d] intno=%d from cpl%d oldcs=%04x oldeip=%08x oldss=%04x oldesp=%08x -> kss=%04x kesp=%08x\n",
+            dpl, intno, old_cpl, old_cs, old_eip, old_ss, old_esp, new_ss, new_esp); }
+#endif
+    }
+    push_val(s, old_eflags, 4);
+    push_val(s, old_cs, 4);
+    push_val(s, old_eip, 4);
+    if (has_error)
+        push_val(s, error, 4);
+
+    s->eip = off;
+    if (type == 0x0e)               /* interrupt gate clears IF */
+        s->eflags_ &= ~EFL_IF;
+    s->eflags_ &= ~EFL_TF;
+    return TRUE;
+}
+
+/* IRET (32-bit) */
+static void do_iret(X86CPUState *s)
+{
+    uint32_t neip = pop_val(s, 4);
+    uint16_t ncs  = (uint16_t)pop_val(s, 4);
+    uint32_t nefl = pop_val(s, 4);
+    int old_cpl = s->seg[X86_CPU_SEG_CS].sel & 3;
+    int new_rpl = ncs & 3;
+
+    if (new_rpl > old_cpl) {
+        uint32_t nesp = pop_val(s, 4);
+        uint16_t nss  = (uint16_t)pop_val(s, 4);
+        load_seg(s, X86_CPU_SEG_CS, ncs);
+        load_seg(s, X86_CPU_SEG_SS, nss);
+        s->regs[REG_ESP] = nesp;
+#ifdef X86_PROGRESS
+        { static int n; if (n++ < 8) fprintf(stderr,
+            "[iret->ring%d] neip=%08x ncs=%04x nss=%04x nesp=%08x nefl=%08x (from cpl%d)\n",
+            new_rpl, neip, ncs, nss, nesp, nefl, old_cpl); }
+#endif
+    } else {
+        load_seg(s, X86_CPU_SEG_CS, ncs);
+    }
+    s->eip = neip;
+    {   /* IOPL is writable only at CPL 0, and IF only at CPL <= IOPL. */
+        uint32_t mask = 0x00257fd5u;
+        if (old_cpl > 0) mask &= ~0x3000u;
+        if (old_cpl > (int)((s->eflags_ >> 12) & 3)) mask &= ~(uint32_t)EFL_IF;
+        /* `mask` happens to cover all six arithmetic bits today, but sync
+         * anyway so this stays correct if it is ever narrowed. */
+        flags_sync(s);
+        set_eflags(s, (s->eflags_ & ~mask) | (nefl & mask) | 0x2);
+    }
+}
+
+/* ---- main interpreter loop -------------------------------------------- */
+
+#ifdef X86_PROGRESS
+static void scan_log(X86CPUState *s)
+{
+    PhysMemoryRange *pr = get_phys_mem_range(s->mem_map, 0x200000);
+    const char *needles[] = { "Linux version 4", "Command line:", "Kernel panic",
+                              "Oops", "BUG:", "Call Trace", 0 };
+    size_t lim, i, j; int ni;
+    if (!pr || !pr->is_ram) return;
+    lim = pr->org_size; if (lim > 0x4000000) lim = 0x4000000;
+    for (ni = 0; needles[ni]; ni++) {
+        size_t nl = strlen(needles[ni]); int hits = 0;
+        for (i = 0; i + nl < lim && hits < 4; i++) {
+            if (memcmp(pr->phys_mem + i, needles[ni], nl) == 0) {
+                hits++;
+                fprintf(stderr, "[log] '%s' #%d @%08lx: ", needles[ni], hits,
+                        (unsigned long)(pr->addr + i));
+                for (j = i; j < i + 240 && j < lim; j++) {
+                    int ch = pr->phys_mem[j];
+                    fputc((ch >= 32 && ch < 127) || ch == '\n' ? ch : '.', stderr);
+                }
+                fprintf(stderr, "\n");
+            }
+        }
+    }
+}
+#endif
+
+#ifdef X86_UFAULT
+/* Userspace-only (CPL3) instruction ring — not swamped by kernel syscall/IRQ/idle
+ * instructions the way the full trace ring is. Dumped on the first small-cr2 user
+ * #PF (a null/near-null pointer deref), to see how the bad pointer was produced. */
+#define UF_N 512
+static uint32_t g_uf_eip[UF_N], g_uf_eax[UF_N], g_uf_ecx[UF_N], g_uf_edx[UF_N],
+                g_uf_ebx[UF_N], g_uf_esp[UF_N], g_uf_ebp[UF_N], g_uf_esi[UF_N],
+                g_uf_edi[UF_N];
+static uint8_t  g_uf_op[UF_N];
+static int g_uf_i, g_uf_dumped;
+static void x86_ufault_dump(X86CPUState *s)
+{
+    int k;
+    if (g_uf_dumped) return;
+    g_uf_dumped = 1;
+    fprintf(stderr, "x86_ufault: user #PF cr2=%08x eip=%08x cs=%04x ss=%04x esp=%08x\n"
+            "  eax=%08x ecx=%08x edx=%08x ebx=%08x ebp=%08x esi=%08x edi=%08x\n",
+            s->cr2, s->cur_eip, s->seg[X86_CPU_SEG_CS].sel, s->seg[X86_CPU_SEG_SS].sel,
+            s->regs[REG_ESP], s->regs[REG_EAX], s->regs[REG_ECX], s->regs[REG_EDX],
+            s->regs[REG_EBX], s->regs[REG_EBP], s->regs[REG_ESI], s->regs[REG_EDI]);
+    /* code bytes at the faulting instruction (translate eip via the page tables) */
+    fprintf(stderr, "  code@eip:");
+    for (k = 0; k < 16; k++) fprintf(stderr, " %02x", ld_lin(s, s->cur_eip + k, 1));
+    fprintf(stderr, "\n  last %d userspace instrs (oldest..newest):\n", UF_N);
+    for (k = 0; k < UF_N; k++) {
+        int idx = (g_uf_i + k) & (UF_N - 1);
+        if (g_uf_eip[idx] || g_uf_op[idx])
+            fprintf(stderr, "  eip=%08x op=%02x eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n",
+                    g_uf_eip[idx], g_uf_op[idx], g_uf_eax[idx], g_uf_ecx[idx],
+                    g_uf_edx[idx], g_uf_ebx[idx], g_uf_esp[idx], g_uf_ebp[idx],
+                    g_uf_esi[idx], g_uf_edi[idx]);
+    }
+    fprintf(stderr, "  code bytes at the last 28 userspace eips:\n");
+    for (k = UF_N - 28; k < UF_N; k++) {
+        int idx = (g_uf_i + k) & (UF_N - 1), j;
+        if (!(g_uf_eip[idx] || g_uf_op[idx])) continue;
+        fprintf(stderr, "    %08x:", g_uf_eip[idx]);
+        for (j = 0; j < 10; j++) fprintf(stderr, " %02x", ld_lin(s, g_uf_eip[idx] + j, 1));
+        fprintf(stderr, "\n");
+    }
+}
+#endif
+
+#ifdef X86_TRACE
+static uint32_t g_trace_eip[2048];
+static uint8_t  g_trace_op[2048];
+static uint32_t g_trace_edi[2048];
+static uint32_t g_trace_esi[2048];
+static uint32_t g_trace_eax[2048];
+static uint32_t g_trace_ecx[2048];
+static uint32_t g_trace_edx[2048];
+static uint32_t g_trace_ebx[2048];
+static uint32_t g_trace_ebp[2048];
+static uint32_t g_trace_efl[2048];
+static int g_trace_i;
+static int g_trace_dumped;
+static void x86_trace_dump(X86CPUState *s)
+{
+    int k;
+    if (g_trace_dumped) return;
+    g_trace_dumped = 1;
+    fprintf(stderr, "x86_cpu: recent instruction trace (oldest..newest):\n");
+    for (k = 0; k < 2048; k++) {
+        int idx = (g_trace_i + k) & 2047;
+        if (g_trace_eip[idx] || g_trace_op[idx])
+            fprintf(stderr, "  eip=%08x op=%02x efl=%08x eax=%08x ecx=%08x edx=%08x ebx=%08x ebp=%08x esi=%08x edi=%08x\n",
+                    g_trace_eip[idx], g_trace_op[idx], g_trace_efl[idx], g_trace_eax[idx], g_trace_ecx[idx],
+                    g_trace_edx[idx], g_trace_ebx[idx], g_trace_ebp[idx], g_trace_esi[idx], g_trace_edi[idx]);
+    }
+    { uint32_t pa0 = (s->cur_eip >= 0xc0000000u) ? s->cur_eip - 0xc0000000u : s->cur_eip;
+      uint32_t pa = pa0 - 0x40;
+      fprintf(stderr, "x86_cpu: code bytes @phys %08x (fault at +0x40):", pa);
+      for (k = 0; k < 0x54; k++) {
+          if ((k & 0xf) == 0) fprintf(stderr, "\n  %08x:", pa + k);
+          fprintf(stderr, " %02x", phys_read(s, pa + k, 1));
+      }
+      fprintf(stderr, "\n"); }
+    {
+        uint32_t pd = s->cr3 & ~0xfffu;
+        uint32_t pdei = (s->cr2 >> 22) & 0x3ff;
+        uint32_t pde = phys_read(s, pd + pdei * 4, 4);
+        fprintf(stderr, "x86_cpu: cr2=%08x cr3=%08x PDE[%u]=%08x\n", s->cr2, s->cr3, pdei, pde);
+        if (pde & 1 && !(pde & 0x80)) {
+            uint32_t pt = pde & ~0xfffu, ptei = (s->cr2 >> 12) & 0x3ff;
+            int j;
+            fprintf(stderr, "x86_cpu: PT@%08x [%u..]:", pt, ptei - 2);
+            for (j = -2; j <= 3; j++)
+                fprintf(stderr, " %08x", phys_read(s, pt + (ptei + j) * 4, 4));
+            fprintf(stderr, "\n");
+        }
+    }
+}
+#endif
+
+#ifdef X86_OPHIST
+/* Opcode-mix histogram: counts every executed instruction, bucketed by opcode.
+ * Two-byte (0x0f) ops are split by mandatory prefix (none/66/f3/f2) so SSE/SSE2
+ * ops can be told apart from the integer 0x0f space. Dumped periodically to
+ * stderr and again at process exit. Answers "what fraction of retired
+ * instructions are SIMD?" before committing to an XMM/SSE implementation. */
+static uint64_t g_op1[256];        /* one-byte opcode b (b != 0x0f)            */
+static uint64_t g_op0f[4][256];    /* 0x0f b2, indexed by prefix class below   */
+static uint64_t g_op_total;
+static uint64_t g_op_next_dump = 100000000ull;
+
+/* Is (prefix-class pc, second byte b2) an SSE/SSE2 XMM instruction?
+ * Covers the SSE1/SSE2 opcode map: 10-17,28-2F,50-6F,70-7F,C2-C6,D0-FF.
+ * Excludes the non-SSE 0x0f integer space (jcc 80-8F, setcc 90-9F, cpuid A2,
+ * bt/bsf/movzx B0-BF, etc.). Prefixed forms (66/f2/f3) in these ranges are
+ * always SSE; the no-prefix (pc==0) forms in 50-6F/D0-FF are MMX, which this
+ * guest cannot run (MMX not advertised), so count them as SIMD too. */
+static int op0f_is_sse(int pc, int b2)
+{
+    (void)pc;
+    if (b2 >= 0x10 && b2 <= 0x17) return 1;
+    if (b2 >= 0x28 && b2 <= 0x2f) return 1;
+    if (b2 >= 0x50 && b2 <= 0x6f) return 1;
+    if (b2 >= 0x70 && b2 <= 0x7f) return 1;
+    if (b2 >= 0xc2 && b2 <= 0xc6) return 1;
+    if (b2 >= 0xd0 && b2 <= 0xff) return 1;
+    return 0;
+}
+
+static void ophist_dump(void)
+{
+    uint64_t sse = 0, f0 = 0, total = g_op_total;
+    int pc, i;
+    if (total == 0) return;
+    for (pc = 0; pc < 4; pc++)
+        for (i = 0; i < 256; i++) {
+            uint64_t n = g_op0f[pc][i];
+            if (!n) continue;
+            f0 += n;
+            if (op0f_is_sse(pc, i)) sse += n;
+        }
+    fprintf(stderr, "\n=== x86 opcode-mix histogram (total=%llu) ===\n",
+            (unsigned long long)total);
+    fprintf(stderr, "  SSE/SSE2 (XMM) ops: %llu  (%.4f%%)\n",
+            (unsigned long long)sse, 100.0 * (double)sse / (double)total);
+    fprintf(stderr, "  all 0x0f two-byte:  %llu  (%.4f%%)\n",
+            (unsigned long long)f0, 100.0 * (double)f0 / (double)total);
+    /* Top one-byte opcodes (non-destructive: rank over a copy). */
+    fprintf(stderr, "  --- top one-byte opcodes ---\n");
+    { uint64_t tmp[256]; int k;
+      for (i = 0; i < 256; i++) tmp[i] = g_op1[i];
+      for (k = 0; k < 16; k++) {
+        int best = -1; uint64_t bv = 0;
+        for (i = 0; i < 256; i++) if (tmp[i] > bv) { bv = tmp[i]; best = i; }
+        if (best < 0) break;
+        fprintf(stderr, "    op %02x : %llu  (%.3f%%)\n", best,
+                (unsigned long long)bv, 100.0 * (double)bv / (double)total);
+        tmp[best] = 0;
+    } }
+    /* Any SSE actually attempted? List nonzero SSE buckets. */
+    if (sse) {
+        static const char *pn[4] = { "np", "66", "f3", "f2" };
+        fprintf(stderr, "  --- SSE buckets hit ---\n");
+        for (pc = 0; pc < 4; pc++)
+            for (i = 0; i < 256; i++)
+                if (g_op0f[pc][i] && op0f_is_sse(pc, i))
+                    fprintf(stderr, "    0f.%s.%02x : %llu\n", pn[pc], i,
+                            (unsigned long long)g_op0f[pc][i]);
+    }
+    fprintf(stderr, "=== end histogram ===\n");
+}
+
+static int g_ophist_atexit;
+static void ophist_atexit(void) { ophist_dump(); }
+#endif
+
+/* 1 for every byte that is an x86 prefix (operand/address size, lock, rep/repne,
+ * and the six segment overrides). Lets the interpreter gate the prefix-decode
+ * chain on a single table lookup: prefix-free instructions -- the overwhelming
+ * majority -- then skip the ~8-compare walk that used to run before the chain
+ * fell through to `break`. */
+static const uint8_t x86_is_prefix[256] = {
+    [0x66] = 1, [0x67] = 1, [0xf0] = 1, [0xf3] = 1, [0xf2] = 1,
+    [0x2e] = 1, [0x36] = 1, [0x3e] = 1, [0x26] = 1, [0x64] = 1, [0x65] = 1,
+};
+
+static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles);
+
+/* The fault landing (setjmp) and the instruction loop live in separate
+ * functions on purpose, and the loop must stay no_inline. Emscripten lowers
+ * setjmp by rewriting the whole function that calls it so a longjmp can land
+ * back in it; with the loop inside that function, the WASM build ran the
+ * microbenchmark at 9.5 Minstr/s against 48 with the loop split out (native
+ * is unaffected). A longjmp from a fault unwinds out of x86_interp_loop, the
+ * landing below vectors the exception, and the loop is entered again. */
+void x86_cpu_interp(X86CPUState *s, int max_cycles)
+{
+    if (setjmp(s->excbuf)) {
+        /* A fault/exception was raised mid-instruction; the restart/report point
+         * is the faulting instruction. Vector it through the IDT. */
+        s->eip = s->cur_eip;
+        /* An x87 escape that faulted may have longjmp'd out with the host FPU
+         * still in the guest's RC mode; restore temu's default (see fpu_exec). */
+        fesetround(FE_TONEAREST);
+#ifdef X86_UFAULT
+        if (s->exc_intno == 14 && (s->seg[X86_CPU_SEG_CS].sel & 3) == 3 &&
+            s->cr2 < 0x1000u)
+            x86_ufault_dump(s);
+#endif
+#ifdef X86_PROGRESS
+        { static int n; if (s->exc_intno < 32 && n++ < 60)
+            fprintf(stderr, "[exc] intno=%d err=0x%x @eip=%08x cs=%04x(cpl%d) ss=%04x cr2=%08x eax=%08x cr0=%08x\n",
+                    s->exc_intno, s->exc_error, s->cur_eip,
+                    s->seg[X86_CPU_SEG_CS].sel, s->seg[X86_CPU_SEG_CS].sel & 3,
+                    s->seg[X86_CPU_SEG_SS].sel, s->cr2, s->regs[REG_EAX], s->cr0); }
+#ifdef X86_TRACE
+        { static int dd; if (s->exc_intno == 14 && !dd &&
+              (s->seg[X86_CPU_SEG_CS].sel & 3) == 3 &&
+              (s->cr2 < 0x10000u || s->cur_eip < 0x10000u)) { dd = 1; x86_trace_dump(s); } }
+#endif
+#ifdef X86_UWWATCH
+        { static int dd; if (s->exc_intno == 14 && !dd &&
+              (s->seg[X86_CPU_SEG_CS].sel & 3) == 3 &&
+              (s->cr2 < 0x10000u || s->cur_eip < 0x10000u)) { dd = 1;
+            uint32_t esp = s->regs[REG_ESP], lo = esp - 0x40, hi = esp + 0x200;
+            int k;
+            fprintf(stderr, "[uww] fault cr2=%08x eip=%08x esp=%08x; CPL3 writes into [%08x..%08x]:\n",
+                    s->cr2, s->cur_eip, esp, lo, hi);
+            for (k = 0; k < 4096; k++) {
+                int idx = (g_uw_i + k) & 4095;
+                if (g_uw_eip[idx] && g_uw_la[idx] >= lo && g_uw_la[idx] <= hi)
+                    fprintf(stderr, "  eip=%08x wrote la=%08x val=%08x sz=%d\n",
+                            g_uw_eip[idx], g_uw_la[idx], g_uw_val[idx], g_uw_sz[idx]);
+            } } }
+#endif
+#endif
+        if (!deliver_interrupt(s, s->exc_intno, s->exc_error, s->exc_has_error, 0)) {
+#ifdef X86_TRACE
+            x86_trace_dump(s);
+#endif
+            x86_stop(s, "unhandled exception %d (err=0x%x)",
+                     s->exc_intno, s->exc_error);
+        }
+    }
+
+    /* As before the split, a fault restarts the loop with a fresh budget. */
+    x86_interp_loop(s, max_cycles);
+}
+
+static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
+{
+    int i;
+
+    for (i = 0; i < max_cycles && !s->halted; i++) {
+        int op_size, seg_override = -1, rep = 0;
+        int b, reg, def_op;
+        Modrm rm;
+#ifdef X86_OPHIST
+        int pfx66 = 0;
+#endif
+
+        s->cur_eip = s->eip;
+#ifdef X86_SYSLOG
+        if (g_sys_pending && (s->seg[X86_CPU_SEG_CS].sel & 3) == 3) {
+            g_sys_pending = 0;
+            fprintf(stderr, "[sys]   ret nr=%u -> eax=%08x eip=%08x\n",
+                    g_sys_nr, s->regs[REG_EAX], s->cur_eip);
+        }
+#endif
+#ifdef X86_PROGRESS
+        { static uint64_t c = 0;
+          if ((++c % 5000000) == 0)
+              fprintf(stderr, "[prog] n=%lluM eip=%08x cs=%04x eflags=%08x irq=%d\n",
+                      (unsigned long long)(c / 1000000), s->eip,
+                      s->seg[X86_CPU_SEG_CS].sel, get_eflags(s), s->hard_irq); }
+#endif
+
+        /* Deliver a pending hardware interrupt when interrupts are enabled.
+         * `sti` and stack-segment loads inhibit delivery for exactly one
+         * instruction, so an IRQ is never taken on a transiently invalid
+         * SS:ESP (the architectural "interrupt shadow"). */
+        if (s->int_shadow) {
+            s->int_shadow = 0;
+        } else if (s->hard_irq && (s->eflags_ & EFL_IF) && s->get_hard_intno) {
+            int intno = s->get_hard_intno(s->get_hard_intno_opaque);
+            if (intno >= 0) {
+#ifdef X86_PROGRESS
+                { static uint64_t q = 0; if (intno < 0x20 || (++q % 500) == 0)
+                    fprintf(stderr, "[irq] intno=%d -> eip=%08x eflags=%08x\n",
+                            intno, s->cur_eip, get_eflags(s)); }
+#endif
+                deliver_interrupt(s, intno, 0, 0, 0);
+                s->cur_eip = s->eip;
+            }
+        }
+
+        /* Establish the fetch window for this instruction. Must come after any
+         * interrupt delivery above, which can change both CS and EIP.
+         *
+         * The window is carried across straight-line instructions: refill only
+         * when it can no longer serve CS.base+eip. It still serves when it is
+         * non-empty, CS.base is unchanged, no TLB flush marked it dirty, and
+         * fetch_ptr still tracks eip (true iff eip advanced only through fetch8,
+         * i.e. no control transfer happened). Any miss falls back to the full
+         * refill, which re-validates through tlb_code exactly as before. */
+        if (unlikely(s->fetch_dirty
+                     || !(s->fetch_ptr < s->fetch_end)
+                     || s->seg[X86_CPU_SEG_CS].base != s->win_cs_base
+                     || (uintptr_t)s->fetch_ptr != s->win_eip_addend + s->eip))
+            fetch_refill(s);
+
+        def_op = (s->seg[X86_CPU_SEG_CS].flags & 0x4000) ? 4 : 2; /* D/B bit */
+        op_size = def_op;
+        s->addr_size = def_op;
+
+        /* prefixes: the common case is no prefix, so the decode chain is gated on
+         * a table lookup the branch predictor keeps not-taken -- one array read
+         * replaces the ~8 compares every prefix-free instruction used to walk
+         * before falling out of the old `for(;;) ... else break;`. */
+        b = fetch8_fast(s);
+        while (unlikely(x86_is_prefix[b])) {
+#ifdef X86_OPHIST
+            if (b == 0x66) pfx66 = 1;
+#endif
+            if (b == 0x66) { op_size = (def_op == 4) ? 2 : 4; }
+            else if (b == 0x67) { s->addr_size = (def_op == 4) ? 2 : 4; }
+            else if (b == 0xf0) { /* lock: ignore */ }
+            else if (b == 0xf3) rep = 1;  /* rep / repe  */
+            else if (b == 0xf2) rep = 2;  /* repne       */
+            else if (b == 0x2e) seg_override = X86_CPU_SEG_CS;
+            else if (b == 0x36) seg_override = X86_CPU_SEG_SS;
+            else if (b == 0x3e) seg_override = X86_CPU_SEG_DS;
+            else if (b == 0x26) seg_override = X86_CPU_SEG_ES;
+            else if (b == 0x64) seg_override = X86_CPU_SEG_FS;
+            else if (b == 0x65) seg_override = X86_CPU_SEG_GS;
+            b = fetch8(s);
+        }
+
+#ifdef X86_OPHIST
+        if (!g_ophist_atexit) { g_ophist_atexit = 1; atexit(ophist_atexit); }
+        g_op_total++;
+        if (b != 0x0f) g_op1[b]++;   /* 0x0f recorded after b2 is known */
+        if (g_op_total >= g_op_next_dump) {
+            ophist_dump();
+            g_op_next_dump += 100000000ull;
+        }
+#endif
+
+#ifdef X86_TRACE
+        g_trace_eip[g_trace_i] = s->cur_eip;
+        g_trace_op[g_trace_i] = (uint8_t)b;
+        g_trace_eax[g_trace_i] = s->regs[REG_EAX];
+        g_trace_ecx[g_trace_i] = s->regs[REG_ECX];
+        g_trace_edx[g_trace_i] = s->regs[REG_EDX];
+        g_trace_ebx[g_trace_i] = s->regs[REG_EBX];
+        g_trace_ebp[g_trace_i] = s->regs[REG_EBP];
+        g_trace_efl[g_trace_i] = get_eflags(s);
+        g_trace_esi[g_trace_i] = s->regs[REG_ESI];
+        g_trace_edi[g_trace_i] = s->regs[REG_EDI];
+        g_trace_i = (g_trace_i + 1) & 2047;
+#endif
+#ifdef X86_UFAULT
+        if ((s->seg[X86_CPU_SEG_CS].sel & 3) == 3) {
+            int j = g_uf_i & (UF_N - 1);
+            g_uf_eip[j] = s->cur_eip; g_uf_op[j] = (uint8_t)b;
+            g_uf_eax[j] = s->regs[REG_EAX]; g_uf_ecx[j] = s->regs[REG_ECX];
+            g_uf_edx[j] = s->regs[REG_EDX]; g_uf_ebx[j] = s->regs[REG_EBX];
+            g_uf_esp[j] = s->regs[REG_ESP]; g_uf_ebp[j] = s->regs[REG_EBP];
+            g_uf_esi[j] = s->regs[REG_ESI]; g_uf_edi[j] = s->regs[REG_EDI];
+            g_uf_i++;
+        }
+#endif
+#ifdef X86_PROGRESS
+        /* Track entry into user mode (ring 3) and userspace progress. */
+        { static int seen_u3; static uint64_t uc;
+          int cpl = s->seg[X86_CPU_SEG_CS].sel & 3;
+          if (cpl == 3) {
+              if (!seen_u3) { seen_u3 = 1;
+                  fprintf(stderr, "[user] FIRST ring3: eip=%08x cs=%04x esp=%08x ss=%04x\n",
+                          s->cur_eip, s->seg[X86_CPU_SEG_CS].sel,
+                          s->regs[REG_ESP], s->seg[X86_CPU_SEG_SS].sel); }
+              if ((++uc % 2000000) == 0)
+                  fprintf(stderr, "[user] ring3 n=%lluM eip=%08x\n",
+                          (unsigned long long)(uc/1000000), s->cur_eip);
+          } }
+#endif
+
+        /* ALU family: 0x00..0x3B in blocks of 8 (add,or,adc,sbb,and,sub,xor,cmp) */
+        if (b < 0x40 && (b & 7) < 6 && (b & 0xc0) == 0) {
+            int aluop = b >> 3;
+            int form = b & 7;
+            uint32_t a, v, r;
+            switch (form) {
+            case 0: { /* r/m8, r8 */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                a = rm_read(s, &rm, 1); v = get_reg8(s, reg);
+                r = alu(s, aluop, a, v, 1);
+                if (aluop != 7) rm_write(s, &rm, r, 1);
+            } break;
+            case 1: { /* r/m, r */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                a = rm_read(s, &rm, op_size); v = get_regv(s, reg, op_size);
+                r = alu(s, aluop, a, v, op_size);
+                if (aluop != 7) rm_write(s, &rm, r, op_size);
+            } break;
+            case 2: { /* r8, r/m8 */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                a = get_reg8(s, reg); v = rm_read(s, &rm, 1);
+                r = alu(s, aluop, a, v, 1);
+                if (aluop != 7) set_reg8(s, reg, r);
+            } break;
+            case 3: { /* r, r/m */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                a = get_regv(s, reg, op_size); v = rm_read(s, &rm, op_size);
+                r = alu(s, aluop, a, v, op_size);
+                if (aluop != 7) set_regv(s, reg, r, op_size);
+            } break;
+            case 4: { /* AL, imm8 */
+                a = get_reg8(s, REG_EAX); v = (uint8_t)fetch8_fast(s);
+                r = alu(s, aluop, a, v, 1);
+                if (aluop != 7) set_reg8(s, REG_EAX, r);
+            } break;
+            case 5: { /* eAX, imm */
+                a = get_regv(s, REG_EAX, op_size); v = fetch_imm(s, op_size);
+                r = alu(s, aluop, a, v, op_size);
+                if (aluop != 7) set_regv(s, REG_EAX, r, op_size);
+            } break;
+            }
+            s->cycle_count++;
+            continue;
+        }
+
+        switch (b) {
+        case 0x40: case 0x41: case 0x42: case 0x43:
+        case 0x44: case 0x45: case 0x46: case 0x47: { /* inc reg */
+            int r = b & 7;   /* inc preserves CF; alu_incdec carries it */
+            uint32_t v = alu_incdec(s, 0, get_regv(s, r, op_size), op_size);
+            set_regv(s, r, v, op_size);
+        } break;
+        case 0x48: case 0x49: case 0x4a: case 0x4b:
+        case 0x4c: case 0x4d: case 0x4e: case 0x4f: { /* dec reg */
+            int r = b & 7;
+            uint32_t v = alu_incdec(s, 1, get_regv(s, r, op_size), op_size);
+            set_regv(s, r, v, op_size);
+        } break;
+        case 0x50: case 0x51: case 0x52: case 0x53:
+        case 0x54: case 0x55: case 0x56: case 0x57: /* push reg */
+            push_val(s, get_regv(s, b & 7, op_size), op_size);
+            break;
+        case 0x58: case 0x59: case 0x5a: case 0x5b:
+        case 0x5c: case 0x5d: case 0x5e: case 0x5f: /* pop reg */
+            set_regv(s, b & 7, pop_val(s, op_size), op_size);
+            break;
+        case 0x68: push_val(s, fetch_imm(s, op_size), op_size); break; /* push imm32 */
+        case 0x6a: push_val(s, (int32_t)(int8_t)fetch8_fast(s), op_size); break; /* push imm8 */
+
+        case 0x80: case 0x82: { /* group1 r/m8, imm8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, 1), v = (uint8_t)fetch8_fast(s);
+            uint32_t r = alu(s, reg, a, v, 1);
+            if (reg != 7) rm_write(s, &rm, r, 1);
+        } break;
+        case 0x81: { /* group1 r/m, imm */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, op_size), v = fetch_imm(s, op_size);
+            uint32_t r = alu(s, reg, a, v, op_size);
+            if (reg != 7) rm_write(s, &rm, r, op_size);
+        } break;
+        case 0x83: { /* group1 r/m, imm8 (sign-extended) */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, op_size);
+            uint32_t v = (uint32_t)(int32_t)(int8_t)fetch8_fast(s);
+            uint32_t r = alu(s, reg, a, v, op_size);
+            if (reg != 7) rm_write(s, &rm, r, op_size);
+        } break;
+
+        case 0x88: { /* mov r/m8, r8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            rm_write(s, &rm, get_reg8(s, reg), 1);
+        } break;
+        case 0x89: { /* mov r/m, r */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            rm_write(s, &rm, get_regv(s, reg, op_size), op_size);
+        } break;
+        case 0x8a: { /* mov r8, r/m8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            set_reg8(s, reg, rm_read(s, &rm, 1));
+        } break;
+        case 0x8b: { /* mov r, r/m */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            set_regv(s, reg, rm_read(s, &rm, op_size), op_size);
+        } break;
+        case 0x8d: { /* lea r, m */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            if (rm.is_reg) { x86_stop(s, "lea with register operand"); break; }
+            /* The effective address is the segment *offset*: decode_modrm may have
+             * formed rm.addr with the SS base ([esp+n] / [ebp+n]), so subtracting
+             * the DS base here would be wrong under a non-flat model. */
+            set_regv(s, reg, rm.ea, op_size);
+        } break;
+
+        case 0xb0: case 0xb1: case 0xb2: case 0xb3:
+        case 0xb4: case 0xb5: case 0xb6: case 0xb7: /* mov r8, imm8 */
+            set_reg8(s, b & 7, (uint8_t)fetch8_fast(s));
+            break;
+        case 0xb8: case 0xb9: case 0xba: case 0xbb:
+        case 0xbc: case 0xbd: case 0xbe: case 0xbf: /* mov r, imm */
+            set_regv(s, b & 7, fetch_imm(s, op_size), op_size);
+            break;
+        case 0xc6: { /* mov r/m8, imm8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            rm_write(s, &rm, (uint8_t)fetch8_fast(s), 1);
+        } break;
+        case 0xc7: { /* mov r/m, imm */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            rm_write(s, &rm, fetch_imm(s, op_size), op_size);
+        } break;
+
+        case 0x90: /* nop */ break;
+
+        case 0xeb: { /* jmp rel8 */
+            int32_t d = (int8_t)fetch8_fast(s); jmp_rel(s, d, op_size);
+        } break;
+        case 0xe9: { /* jmp rel */
+            int32_t d = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
+            jmp_rel(s, d, op_size);
+        } break;
+        case 0x70: case 0x71: case 0x72: case 0x73:
+        case 0x74: case 0x75: case 0x76: case 0x77:
+        case 0x78: case 0x79: case 0x7a: case 0x7b:
+        case 0x7c: case 0x7d: case 0x7e: case 0x7f: { /* Jcc rel8 */
+            int32_t d = (int8_t)fetch8_fast(s);
+            if (test_cc(s, b & 0xf)) jmp_rel(s, d, op_size);
+        } break;
+        case 0x0f: { /* two-byte */
+            uint8_t b2 = fetch8_fast(s);
+#ifdef X86_OPHIST
+            { int pc = (rep == 1) ? 2 : (rep == 2) ? 3 : (pfx66 ? 1 : 0);
+              g_op0f[pc][b2]++; }
+#endif
+            if (b2 >= 0x80 && b2 <= 0x8f) { /* Jcc rel */
+                int32_t d = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
+                if (test_cc(s, b2 & 0xf)) jmp_rel(s, d, op_size);
+            } else if (b2 >= 0x90 && b2 <= 0x9f) { /* setcc r/m8 */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                rm_write(s, &rm, test_cc(s, b2 & 0xf) ? 1 : 0, 1);
+            } else if (b2 == 0x02 || b2 == 0x03) { /* lar / lsl r, r/m16 */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint16_t sel = (uint16_t)rm_read(s, &rm, 2);
+                uint32_t out = 0;
+                flags_sync(s);
+                if (desc_query(s, sel, b2 == 0x03, &out)) {
+                    set_regv(s, reg, out, op_size);
+                    s->eflags_ |= EFL_ZF;
+                } else {
+                    s->eflags_ &= ~EFL_ZF;
+                }
+            } else if (b2 == 0xb2 || b2 == 0xb4 || b2 == 0xb5) { /* lss/lfs/lgs */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                int seg = (b2 == 0xb2) ? X86_CPU_SEG_SS
+                        : (b2 == 0xb4) ? X86_CPU_SEG_FS : X86_CPU_SEG_GS;
+                if (rm.is_reg) { raise_fault(s, EXC_UD); break; }
+                load_far_ptr(s, seg, reg, rm.addr, op_size);
+            } else if (b2 == 0xb6 || b2 == 0xb7) { /* movzx r, r/m8|16 */
+                int ssz = (b2 == 0xb6) ? 1 : 2;
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                set_regv(s, reg, rm_read(s, &rm, ssz), op_size);
+            } else if (b2 == 0xbe || b2 == 0xbf) { /* movsx r, r/m8|16 */
+                int ssz = (b2 == 0xbe) ? 1 : 2;
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t v = rm_read(s, &rm, ssz);
+                int32_t sv = (ssz == 1) ? (int8_t)v : (int16_t)v;
+                set_regv(s, reg, (uint32_t)sv, op_size);
+            } else if (b2 == 0x20) { /* mov r32, crN */
+                uint8_t m = fetch8(s); int cr = (m >> 3) & 7, r = m & 7;
+                uint32_t v = (cr == 0) ? s->cr0 : (cr == 2) ? s->cr2 :
+                             (cr == 3) ? s->cr3 : (cr == 4) ? s->cr4 : 0;
+                s->regs[r] = v;
+            } else if (b2 == 0x22) { /* mov crN, r32 */
+                uint8_t m = fetch8(s); int cr = (m >> 3) & 7, r = m & 7;
+                uint32_t v = s->regs[r];
+                uint32_t o0 = s->cr0, o4 = s->cr4;
+                switch (cr) {
+                case 0: s->cr0 = v; break;
+                case 2: s->cr2 = v; break;
+                /* Any CR3 write flushes, even a same-value reload: that is how
+                 * software asks for a TLB flush. */
+                case 3: s->cr3 = v; tlb_flush_all(s); break;
+                case 4: s->cr4 = v; break;
+                }
+                tlb_flush_on_cr_change(s, o0, o4);
+            } else if (b2 == 0xaf) { /* imul r, r/m */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                int64_t a = (op_size == 2) ? (int16_t)get_regv(s, reg, 2) : (int32_t)get_regv(s, reg, 4);
+                int64_t c = (op_size == 2) ? (int16_t)rm_read(s, &rm, 2) : (int32_t)rm_read(s, &rm, 4);
+                int64_t r = a * c;
+                set_regv(s, reg, (uint32_t)r, op_size);
+                flags_sync(s);
+                s->eflags_ &= ~(EFL_CF | EFL_OF);
+                if ((op_size == 2 && r != (int16_t)r) || (op_size == 4 && r != (int32_t)r))
+                    s->eflags_ |= EFL_CF | EFL_OF;
+            } else if (b2 == 0x01) { /* group7: [ls]gdt/[ls]idt/[ls]msw/invlpg */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                switch (reg) {
+                case 0: st_lin(s, rm.addr, s->seg[X86_CPU_SEG_GDT].limit, 2);
+                        st_lin(s, rm.addr + 2, s->seg[X86_CPU_SEG_GDT].base, 4); break; /* sgdt */
+                case 1: st_lin(s, rm.addr, s->seg[X86_CPU_SEG_IDT].limit, 2);
+                        st_lin(s, rm.addr + 2, s->seg[X86_CPU_SEG_IDT].base, 4); break; /* sidt */
+                case 2: s->seg[X86_CPU_SEG_GDT].limit = ld_lin(s, rm.addr, 2);
+                        s->seg[X86_CPU_SEG_GDT].base  = ld_lin(s, rm.addr + 2, 4); break; /* lgdt */
+                case 3: s->seg[X86_CPU_SEG_IDT].limit = ld_lin(s, rm.addr, 2);
+                        s->seg[X86_CPU_SEG_IDT].base  = ld_lin(s, rm.addr + 2, 4); break; /* lidt */
+                case 4: rm_write(s, &rm, s->cr0 & 0xffff, 2); break;                     /* smsw */
+                case 6: { uint32_t o0 = s->cr0;                                          /* lmsw */
+                          s->cr0 = (s->cr0 & ~0xfu) | (rm_read(s, &rm, 2) & 0xf);
+                          tlb_flush_on_cr_change(s, o0, s->cr4); } break;
+                case 7: tlb_flush_page(s, rm.addr); break;                               /* invlpg */
+                default: x86_stop(s, "0F 01 /%d", reg); break;
+                }
+            } else if (b2 == 0x00) { /* group6: [ls]ldt / [ls]tr */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                switch (reg) {
+                case 0: rm_write(s, &rm, s->seg[X86_CPU_SEG_LDT].sel, 2); break; /* sldt */
+                case 1: rm_write(s, &rm, s->seg[X86_CPU_SEG_TR].sel, 2); break;  /* str  */
+                case 2: load_seg(s, X86_CPU_SEG_LDT, (uint16_t)rm_read(s, &rm, 2)); break; /* lldt */
+                case 3: load_seg(s, X86_CPU_SEG_TR,  (uint16_t)rm_read(s, &rm, 2)); break; /* ltr  */
+                case 4: case 5: { /* verr / verw: set ZF iff the seg is r/w-able */
+                    uint16_t sel = (uint16_t)rm_read(s, &rm, 2);
+                    flags_sync(s);
+                    s->eflags_ = (s->eflags_ & ~EFL_ZF) |
+                                 (verify_seg(s, sel, reg == 5) ? EFL_ZF : 0);
+                } break;
+                default: x86_stop(s, "0F 00 /%d", reg); break;
+                }
+            } else if (b2 == 0x06) { /* clts */
+                s->cr0 &= ~CR0_TS;
+            } else if (b2 == 0xa2) { /* cpuid */
+                uint32_t leaf = s->regs[REG_EAX], a = 0, bb = 0, c = 0, d = 0;
+                switch (leaf) {
+                case 0: /* max leaf + "GenuineIntel" */
+                    a = 1; bb = 0x756e6547; d = 0x49656e69; c = 0x6c65746e;
+                    break;
+                case 1:
+                    /* Family 6, model 3. Feature set a PAE Linux needs, minus
+                     * things we don't emulate (no APIC/ACPI, no MMX). Bits: FPU
+                     * VME DE PSE TSC MSR PAE MCE CX8 SEP MTRR PGE MCA CMOV PAT,
+                     * FXSR SSE SSE2. SSE2 is the baseline of current i686
+                     * userlands (Alpine); FXSR makes the kernel set
+                     * CR4.OSFXSR and context-switch XMM state via fxsave. */
+                    a = 0x00000633;
+                    d = (1u<<0)|(1u<<1)|(1u<<2)|(1u<<3)|(1u<<4)|(1u<<5)|(1u<<6)|(1u<<7)|
+                        (1u<<8)|(1u<<11)|(1u<<12)|(1u<<13)|(1u<<14)|(1u<<15)|(1u<<16)|
+                        (1u<<24)|(1u<<25)|(1u<<26);
+                    break;
+                case 0x80000000: /* max extended leaf */
+                    a = 0x80000001;
+                    break;
+                case 0x80000001:
+                    /* Extended features: advertise NX/XD (EDX bit 20) only, so a
+                     * PAE guest enables EFER.NXE and the paging XD bit is honored.
+                     * SYSCALL and long mode are deliberately left off. */
+                    d = (1u << 20);
+                    break;
+                default: break;
+                }
+                s->regs[REG_EAX] = a; s->regs[REG_EBX] = bb;
+                s->regs[REG_ECX] = c; s->regs[REG_EDX] = d;
+            } else if (b2 == 0x31) { /* rdtsc */
+                uint64_t t = s->get_tsc ? s->get_tsc(s->get_tsc_opaque)
+                                        : (uint64_t)s->cycle_count;
+                if (!s->tsc_init) { s->tsc_base = t; s->tsc_init = 1; }
+                t -= s->tsc_base;   /* TSC starts near 0 at boot, like real hw */
+                s->regs[REG_EAX] = (uint32_t)t; s->regs[REG_EDX] = (uint32_t)(t >> 32);
+            } else if (b2 == 0x32) { /* rdmsr */
+                uint32_t ecx = s->regs[REG_ECX], lo = 0, hi = 0;
+                switch (ecx) {
+                case 0x174: lo = s->sysenter_cs;  break;
+                case 0x175: lo = s->sysenter_esp; break;
+                case 0x176: lo = s->sysenter_eip; break;
+                case MSR_EFER: lo = s->efer; break; /* high half is 0 */
+                default: break; /* unknown MSRs read as 0 */
+                }
+                s->regs[REG_EAX] = lo; s->regs[REG_EDX] = hi;
+            } else if (b2 == 0x30) { /* wrmsr */
+                uint32_t ecx = s->regs[REG_ECX], lo = s->regs[REG_EAX];
+                switch (ecx) {
+                case 0x174: s->sysenter_cs  = lo; break;
+                case 0x175: s->sysenter_esp = lo; break;
+                case 0x176: s->sysenter_eip = lo; break;
+                case MSR_EFER:
+                    /* Toggling NXE changes which pages are executable, so any
+                     * cached fetch translation may now be wrong -- flush. */
+                    if ((s->efer ^ lo) & EFER_NXE) tlb_flush_all(s);
+                    s->efer = lo;
+                    break;
+                default: break; /* unknown MSRs ignored */
+                }
+            } else if (b2 == 0x34) { /* sysenter */
+                /* Fast ring3->ring0 transition. Load flat ring0 CS/SS from the
+                 * SYSENTER_CS MSR and jump to the kernel entry (SYSENTER_EIP)
+                 * with SYSENTER_ESP. Segment descriptors are architecturally
+                 * fixed flat 32-bit (not read from the GDT). */
+                X86Seg *cs = &s->seg[X86_CPU_SEG_CS], *ss = &s->seg[X86_CPU_SEG_SS];
+                s->eflags_ &= ~(EFL_IF | EFL_TF);
+                cs->sel = s->sysenter_cs & 0xfffc;
+                cs->base = 0; cs->limit = 0xffffffffu; cs->flags = 0xc09b;
+                ss->sel = (s->sysenter_cs + 8) & 0xfffc;
+                ss->base = 0; ss->limit = 0xffffffffu; ss->flags = 0xc093;
+                s->regs[REG_ESP] = s->sysenter_esp;
+                s->eip = s->sysenter_eip;
+            } else if (b2 == 0x35) { /* sysexit */
+                /* Fast ring0->ring3 return: CS/SS from SYSENTER_CS MSR (+16/+24,
+                 * RPL 3), EIP=EDX, ESP=ECX. */
+                X86Seg *cs = &s->seg[X86_CPU_SEG_CS], *ss = &s->seg[X86_CPU_SEG_SS];
+                cs->sel = ((s->sysenter_cs + 16) & 0xfffc) | 3;
+                cs->base = 0; cs->limit = 0xffffffffu; cs->flags = 0xc0fb;
+                ss->sel = ((s->sysenter_cs + 24) & 0xfffc) | 3;
+                ss->base = 0; ss->limit = 0xffffffffu; ss->flags = 0xc0f3;
+                s->regs[REG_ESP] = s->regs[REG_ECX];
+                s->eip = s->regs[REG_EDX];
+            } else if (b2 >= 0x40 && b2 <= 0x4f) { /* cmovcc */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t v = rm_read(s, &rm, op_size);
+                if (test_cc(s, b2 & 0xf)) set_regv(s, reg, v, op_size);
+            } else if (b2 == 0xbc || b2 == 0xbd) { /* bsf / bsr */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t mask = (op_size == 2) ? 0xffff : 0xffffffffu;
+                uint32_t v = rm_read(s, &rm, op_size) & mask;
+                flags_sync(s);
+                if (!v) { s->eflags_ |= EFL_ZF; }
+                else {
+                    int idx;
+                    s->eflags_ &= ~EFL_ZF;
+                    if (b2 == 0xbc) { idx = 0; while (!((v >> idx) & 1)) idx++; }
+                    else { idx = (op_size == 2) ? 15 : 31; while (!((v >> idx) & 1)) idx--; }
+                    set_regv(s, reg, idx, op_size);
+                }
+            } else if (b2 == 0xa3 || b2 == 0xab || b2 == 0xb3 || b2 == 0xbb || b2 == 0xba) {
+                /* bt / bts / btr / btc  (reg form, and 0F BA imm form) */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                int kind, bit;
+                /* The immediate form takes the offset modulo the operand size
+                 * (even for a memory bit base); only the register-offset form
+                 * addresses a bit string beyond the addressed word. */
+                if (b2 == 0xba) { kind = reg; bit = (uint8_t)fetch8(s) & (op_size * 8 - 1); } /* /4 bt /5 bts /6 btr /7 btc */
+                else { kind = (b2 == 0xa3) ? 4 : (b2 == 0xab) ? 5 : (b2 == 0xb3) ? 6 : 7;
+                       bit = get_regv(s, reg, op_size); }
+                int cf;
+                if (rm.is_reg) {
+                    int bi = bit & (op_size * 8 - 1);
+                    uint32_t v = get_regv(s, rm.reg, op_size);
+                    cf = (v >> bi) & 1;
+                    if (kind == 5) v |= (1u << bi);
+                    else if (kind == 6) v &= ~(1u << bi);
+                    else if (kind == 7) v ^= (1u << bi);
+                    if (kind != 4) set_regv(s, rm.reg, v, op_size);
+                } else {
+                    uint32_t addr = rm.addr + ((int32_t)bit >> 3);
+                    int bi = bit & 7;
+                    uint8_t v = ld_lin(s, addr, 1);
+                    cf = (v >> bi) & 1;
+                    if (kind == 5) v |= (1 << bi);
+                    else if (kind == 6) v &= ~(1 << bi);
+                    else if (kind == 7) v ^= (1 << bi);
+                    if (kind != 4) st_lin(s, addr, v, 1);
+                }
+                flags_sync(s);
+                s->eflags_ = (s->eflags_ & ~EFL_CF) | (cf ? EFL_CF : 0);
+            } else if (b2 == 0xa4 || b2 == 0xa5 || b2 == 0xac || b2 == 0xad) {
+                /* shld / shrd */
+                int is_shld = (b2 == 0xa4 || b2 == 0xa5);
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t dst = rm_read(s, &rm, op_size), src = get_regv(s, reg, op_size);
+                int cnt = (b2 == 0xa4 || b2 == 0xac) ? (uint8_t)fetch8(s) : get_reg8(s, REG_ECX);
+                int bits = op_size * 8;
+                cnt &= 31;
+                if (cnt != 0 && cnt <= bits) {
+                    uint32_t res, mask = (op_size == 2) ? 0xffff : 0xffffffffu;
+                    int cf;
+                    if (is_shld) {
+                        cf = (dst >> (bits - cnt)) & 1;
+                        res = (cnt == bits) ? src : ((dst << cnt) | (src >> (bits - cnt)));
+                    } else {
+                        cf = (dst >> (cnt - 1)) & 1;
+                        res = (cnt == bits) ? src : ((dst >> cnt) | (src << (bits - cnt)));
+                    }
+                    res &= mask;
+                    rm_write(s, &rm, res, op_size);
+                    flags_sync(s);
+                    s->eflags_ = (s->eflags_ & ~EFL_CF) | (cf ? EFL_CF : 0);
+                    set_szp(s, res, op_size);
+                    if (cnt == 1) {
+                        /* OF is architecturally defined only for a 1-bit shift:
+                         * set when the sign of the destination changed. */
+                        uint32_t sb = (op_size == 2) ? 0x8000u : 0x80000000u;
+                        s->eflags_ = (s->eflags_ & ~EFL_OF) |
+                                     (((res ^ dst) & sb) ? EFL_OF : 0);
+                    }
+                }
+            } else if (b2 == 0xc0 || b2 == 0xc1) { /* xadd */
+                int sz = (b2 == 0xc0) ? 1 : op_size;
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t d = rm_read(s, &rm, sz);
+                uint32_t sr = (sz == 1) ? get_reg8(s, reg) : get_regv(s, reg, sz);
+                uint32_t sum = alu(s, 0, d, sr, sz);
+                /* Store first: the write can #PF (e.g. a COW / zero page that is
+                 * readable but not yet writable), and the instruction is then
+                 * restarted.  Updating the source register before the store
+                 * would make the restarted xadd add the old destination to
+                 * itself. */
+                rm_write(s, &rm, sum, sz);
+                if (sz == 1) set_reg8(s, reg, d); else set_regv(s, reg, d, sz);
+            } else if (b2 == 0xb0 || b2 == 0xb1) { /* cmpxchg */
+                int sz = (b2 == 0xb0) ? 1 : op_size;
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t mask = (sz == 1) ? 0xff : (sz == 2) ? 0xffff : 0xffffffffu;
+                uint32_t d = rm_read(s, &rm, sz), acc = get_regv(s, REG_EAX, sz) & mask;
+                (void)alu(s, 7, acc, d, sz);
+                if (acc == (d & mask)) {
+                    uint32_t sr = (sz == 1) ? get_reg8(s, reg) : get_regv(s, reg, sz);
+                    rm_write(s, &rm, sr, sz);
+                } else {
+                    set_regv(s, REG_EAX, d, sz);
+                }
+            } else if (b2 == 0xc7) { /* cmpxchg8b m64 */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+                uint32_t lo = ld_lin(s, rm.addr, 4), hi = ld_lin(s, rm.addr + 4, 4);
+                if (lo == s->regs[REG_EAX] && hi == s->regs[REG_EDX]) {
+                    /* Two separate stores: probe both dwords writable first, or a
+                     * #PF on the high one restarts the instruction against an
+                     * already-updated low dword and takes the wrong branch. */
+                    probe_write(s, rm.addr, 8);
+                    st_lin(s, rm.addr, s->regs[REG_EBX], 4);
+                    st_lin(s, rm.addr + 4, s->regs[REG_ECX], 4);
+                    flags_sync(s);
+                    s->eflags_ |= EFL_ZF;
+                } else {
+                    s->regs[REG_EAX] = lo; s->regs[REG_EDX] = hi;
+                    flags_sync(s);
+                    s->eflags_ &= ~EFL_ZF;
+                }
+            } else if (b2 >= 0xc8 && b2 <= 0xcf) { /* bswap r32 */
+                int r = b2 & 7;
+                if (op_size == 2) {
+                    /* BSWAP r16 is architecturally undefined; hardware zeroes it. */
+                    set_regv(s, r, 0, 2);
+                } else {
+                    uint32_t v = s->regs[r];
+                    s->regs[r] = (v >> 24) | ((v >> 8) & 0xff00u) |
+                                 ((v << 8) & 0xff0000u) | (v << 24);
+                }
+            } else if (b2 == 0x0b) { /* ud2 */
+                raise_exception(s, EXC_UD);
+            } else if (b2 == 0x08 || b2 == 0x09) { /* invd / wbinvd: nop */
+            } else if (b2 == 0x21) { /* mov r32, drN: report 0 */
+                uint8_t m = fetch8(s); s->regs[m & 7] = 0;
+            } else if (b2 == 0x23) { /* mov drN, r32: ignore */
+                (void)fetch8(s);
+            } else if (b2 == 0xa0) { push_val(s, s->seg[X86_CPU_SEG_FS].sel, op_size);
+            } else if (b2 == 0xa1) { pop_seg(s, X86_CPU_SEG_FS, op_size);
+            } else if (b2 == 0xa8) { push_val(s, s->seg[X86_CPU_SEG_GS].sel, op_size);
+            } else if (b2 == 0xa9) { pop_seg(s, X86_CPU_SEG_GS, op_size);
+            } else if (b2 == 0x0d || (b2 >= 0x18 && b2 <= 0x1f)) { /* hint nops */
+                uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            } else {
+                /* SSE/SSE2, or #UD. This used to be x86_stop(), which only
+                 * halted until the next IRQ and then resumed *inside* the
+                 * instruction (EIP past 0F xx), running its ModRM byte as an
+                 * opcode -- how libpython's `movd %eax,%xmm0` became a stray
+                 * `c0 /1` shift through a garbage pointer. */
+                sse_exec(s, b2, (rep == 1) ? SSE_F3 : (rep == 2) ? SSE_F2 :
+                                (op_size != def_op) ? SSE_66 : SSE_NP, seg_override);
+            }
+        } break;
+
+        case 0x84: { /* test r/m8, r8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            (void)alu(s, 4, rm_read(s, &rm, 1), get_reg8(s, reg), 1);
+        } break;
+        case 0x85: { /* test r/m, r */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            (void)alu(s, 4, rm_read(s, &rm, op_size), get_regv(s, reg, op_size), op_size);
+        } break;
+        case 0xa8: /* test al, imm8 */
+            (void)alu(s, 4, get_reg8(s, REG_EAX), (uint8_t)fetch8(s), 1);
+            break;
+        case 0xa9: /* test eAX, imm */
+            (void)alu(s, 4, get_regv(s, REG_EAX, op_size), fetch_imm(s, op_size), op_size);
+            break;
+
+        case 0x86: { /* xchg r/m8, r8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, 1), b2 = get_reg8(s, reg);
+            rm_write(s, &rm, b2, 1); set_reg8(s, reg, a);
+        } break;
+        case 0x87: { /* xchg r/m, r */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, op_size), b2 = get_regv(s, reg, op_size);
+            rm_write(s, &rm, b2, op_size); set_regv(s, reg, a, op_size);
+        } break;
+        case 0x91: case 0x92: case 0x93:
+        case 0x94: case 0x95: case 0x96: case 0x97: { /* xchg eAX, reg */
+            int r = b & 7;
+            uint32_t a = get_regv(s, REG_EAX, op_size), c = get_regv(s, r, op_size);
+            set_regv(s, REG_EAX, c, op_size); set_regv(s, r, a, op_size);
+        } break;
+
+        case 0x8c: { /* mov r/m, Sreg */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            /* reg 6/7 would index seg[6]/seg[7] = LDT/TR, which are not segment
+             * registers: the encoding is #UD, not a silent alias. */
+            if (reg > 5) raise_fault(s, EXC_UD);
+            rm_write(s, &rm, s->seg[reg].sel, 2);
+        } break;
+        case 0x8e: { /* mov Sreg, r/m16 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            /* CS cannot be loaded this way (#UD); 6/7 are not segment registers. */
+            if (reg == X86_CPU_SEG_CS || reg > 5) raise_fault(s, EXC_UD);
+            load_seg(s, reg, (uint16_t)rm_read(s, &rm, 2));
+            if (reg == X86_CPU_SEG_SS) s->int_shadow = 1;
+        } break;
+        case 0xc4: case 0xc5: { /* les / lds r, m16:off */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            if (rm.is_reg) { raise_fault(s, EXC_UD); break; }
+            load_far_ptr(s, (b == 0xc4) ? X86_CPU_SEG_ES : X86_CPU_SEG_DS,
+                         reg, rm.addr, op_size);
+        } break;
+        case 0xd7: { /* xlat/xlatb: AL <- [(e)BX + AL] in DS (or override) */
+            uint32_t a = seg_base(s, seg_override, X86_CPU_SEG_DS) +
+                         ((adr_get(s, REG_EBX) + get_reg8(s, REG_EAX)) &
+                          (s->addr_size == 2 ? 0xffffu : 0xffffffffu));
+            set_reg8(s, REG_EAX, ld_lin(s, a, 1));
+        } break;
+
+        case 0x98: /* cbw / cwde */
+            if (op_size == 2)
+                set_regv(s, REG_EAX, (uint16_t)(int16_t)(int8_t)get_reg8(s, REG_EAX), 2);
+            else
+                s->regs[REG_EAX] = (uint32_t)(int32_t)(int16_t)(s->regs[REG_EAX] & 0xffff);
+            break;
+        case 0x99: /* cwd / cdq */
+            if (op_size == 2)
+                set_regv(s, REG_EDX, (s->regs[REG_EAX] & 0x8000) ? 0xffff : 0, 2);
+            else
+                s->regs[REG_EDX] = (s->regs[REG_EAX] & 0x80000000u) ? 0xffffffffu : 0;
+            break;
+
+        case 0x9c: /* pushf */
+            push_val(s, get_eflags(s), op_size);
+            break;
+        case 0x9d: { /* popf */
+            /* IOPL is writable only at CPL 0, and IF only at CPL <= IOPL; a
+             * 16-bit popf leaves the high half of EFLAGS alone. */
+            uint32_t v = pop_val(s, op_size), mask = 0x00257fd5u;
+            int cpl = s->seg[X86_CPU_SEG_CS].sel & 3;
+            if (cpl > 0) mask &= ~0x3000u;
+            if (cpl > (int)((s->eflags_ >> 12) & 3)) mask &= ~(uint32_t)EFL_IF;
+            if (op_size == 2) mask &= 0xffffu;
+            flags_sync(s);
+            set_eflags(s, (s->eflags_ & ~mask) | (v & mask) | 0x2);
+        } break;
+        case 0x9e: /* sahf: low byte of EFLAGS <- AH (SF ZF AF PF CF) */
+            flags_sync(s);
+            set_eflags(s, (s->eflags_ & ~0xffu) | (get_reg8(s, 4) & 0xd5u) | 0x2u);
+            break;
+        case 0x9f: /* lahf: AH <- low byte of EFLAGS */
+            set_reg8(s, 4, (get_eflags(s) & 0xd5u) | 0x02u);
+            break;
+
+        case 0xc0: case 0xc1: { /* group2 r/m, imm8 */
+            int sz = (b == 0xc0) ? 1 : op_size;
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t v = rm_read(s, &rm, sz); int cnt = (uint8_t)fetch8_fast(s);
+            rm_write(s, &rm, do_shift(s, reg, v, cnt, sz), sz);
+        } break;
+        case 0xd0: case 0xd1: { /* group2 r/m, 1 */
+            int sz = (b == 0xd0) ? 1 : op_size;
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            rm_write(s, &rm, do_shift(s, reg, rm_read(s, &rm, sz), 1, sz), sz);
+        } break;
+        case 0xd2: case 0xd3: { /* group2 r/m, CL */
+            int sz = (b == 0xd2) ? 1 : op_size;
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            int cnt = get_reg8(s, REG_ECX);
+            rm_write(s, &rm, do_shift(s, reg, rm_read(s, &rm, sz), cnt, sz), sz);
+        } break;
+
+        case 0xf6: case 0xf7: { /* group3 */
+            int sz = (b == 0xf6) ? 1 : op_size;
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, sz);
+            switch (reg) {
+            case 0: case 1: /* test r/m, imm */
+                (void)alu(s, 4, a, fetch_imm(s, sz), sz);
+                break;
+            case 2: /* not */
+                rm_write(s, &rm, ~a, sz);
+                break;
+            case 3: /* neg */
+                rm_write(s, &rm, alu(s, 5, 0, a, sz), sz);
+                break;
+            case 4: { /* mul (unsigned) */
+                if (sz == 1) {
+                    uint32_t r = (get_reg8(s, REG_EAX) & 0xff) * (a & 0xff);
+                    set_regv(s, REG_EAX, r & 0xffff, 2);
+                    flags_sync(s);
+                    s->eflags_ &= ~(EFL_CF | EFL_OF);
+                    if (r & 0xff00) s->eflags_ |= EFL_CF | EFL_OF;
+                } else if (sz == 2) {
+                    uint32_t r = (s->regs[REG_EAX] & 0xffff) * (a & 0xffff);
+                    set_regv(s, REG_EAX, r & 0xffff, 2);
+                    set_regv(s, REG_EDX, (r >> 16) & 0xffff, 2);
+                    flags_sync(s);
+                    s->eflags_ &= ~(EFL_CF | EFL_OF);
+                    if (r >> 16) s->eflags_ |= EFL_CF | EFL_OF;
+                } else {
+                    uint64_t r = (uint64_t)s->regs[REG_EAX] * a;
+                    s->regs[REG_EAX] = (uint32_t)r;
+                    s->regs[REG_EDX] = (uint32_t)(r >> 32);
+                    flags_sync(s);
+                    s->eflags_ &= ~(EFL_CF | EFL_OF);
+                    if (r >> 32) s->eflags_ |= EFL_CF | EFL_OF;
+                }
+            } break;
+            case 5: { /* imul (signed, one-operand) */
+                if (sz == 1) {
+                    int32_t r = (int8_t)get_reg8(s, REG_EAX) * (int8_t)a;
+                    set_regv(s, REG_EAX, (uint16_t)r, 2);
+                    flags_sync(s);
+                    s->eflags_ &= ~(EFL_CF | EFL_OF);
+                    if (r != (int8_t)r) s->eflags_ |= EFL_CF | EFL_OF;
+                } else if (sz == 2) {
+                    int32_t r = (int16_t)s->regs[REG_EAX] * (int16_t)a;
+                    set_regv(s, REG_EAX, (uint16_t)r, 2);
+                    set_regv(s, REG_EDX, (uint16_t)(r >> 16), 2);
+                    flags_sync(s);
+                    s->eflags_ &= ~(EFL_CF | EFL_OF);
+                    if (r != (int16_t)r) s->eflags_ |= EFL_CF | EFL_OF;
+                } else {
+                    int64_t r = (int64_t)(int32_t)s->regs[REG_EAX] * (int32_t)a;
+                    s->regs[REG_EAX] = (uint32_t)r;
+                    s->regs[REG_EDX] = (uint32_t)((uint64_t)r >> 32);
+                    flags_sync(s);
+                    s->eflags_ &= ~(EFL_CF | EFL_OF);
+                    if (r != (int32_t)r) s->eflags_ |= EFL_CF | EFL_OF;
+                }
+            } break;
+            case 6: { /* div (unsigned) */
+                if (a == 0) raise_exception(s, EXC_DE);
+                if (sz == 1) {
+                    uint32_t num = s->regs[REG_EAX] & 0xffff;
+                    uint32_t q = num / (a & 0xff), r = num % (a & 0xff);
+                    if (q > 0xff) raise_exception(s, EXC_DE);
+                    set_reg8(s, REG_EAX, q); set_reg8(s, REG_EAX + 4, r); /* AL, AH */
+                } else if (sz == 2) {
+                    uint32_t num = ((s->regs[REG_EDX] & 0xffff) << 16) | (s->regs[REG_EAX] & 0xffff);
+                    uint32_t q = num / (a & 0xffff), r = num % (a & 0xffff);
+                    if (q > 0xffff) raise_exception(s, EXC_DE);
+                    set_regv(s, REG_EAX, q, 2); set_regv(s, REG_EDX, r, 2);
+                } else {
+                    uint64_t num = ((uint64_t)s->regs[REG_EDX] << 32) | s->regs[REG_EAX];
+                    uint64_t q = num / a, r = num % a;
+                    if (q > 0xffffffffu) raise_exception(s, EXC_DE);
+                    s->regs[REG_EAX] = (uint32_t)q; s->regs[REG_EDX] = (uint32_t)r;
+                }
+            } break;
+            case 7: { /* idiv (signed) */
+                if (a == 0) raise_exception(s, EXC_DE);
+                if (sz == 1) {
+                    int32_t num = (int16_t)s->regs[REG_EAX];
+                    int32_t q = num / (int8_t)a, r = num % (int8_t)a;
+                    if (q != (int8_t)q) raise_exception(s, EXC_DE);
+                    set_reg8(s, REG_EAX, (uint8_t)q); set_reg8(s, REG_EAX + 4, (uint8_t)r);
+                } else if (sz == 2) {
+                    int32_t num = (int32_t)(((s->regs[REG_EDX] & 0xffff) << 16) | (s->regs[REG_EAX] & 0xffff));
+                    int32_t d = (int16_t)a, q, r;
+                    /* MIN/-1 overflows int32 (C UB -> host SIGFPE); it also can't
+                     * fit the 16-bit quotient, so it is #DE either way. */
+                    if (d == -1 && (uint32_t)num == 0x80000000u) raise_exception(s, EXC_DE);
+                    q = num / d; r = num % d;
+                    if (q != (int16_t)q) raise_exception(s, EXC_DE);
+                    set_regv(s, REG_EAX, (uint16_t)q, 2); set_regv(s, REG_EDX, (uint16_t)r, 2);
+                } else {
+                    int64_t num = (int64_t)(((uint64_t)s->regs[REG_EDX] << 32) | s->regs[REG_EAX]);
+                    int32_t d = (int32_t)a;
+                    int64_t q, r;
+                    /* MIN/-1 overflows int64 (C UB) and overflows the 32-bit
+                     * quotient -> #DE. */
+                    if (d == -1 && (uint64_t)num == 0x8000000000000000ULL) raise_exception(s, EXC_DE);
+                    q = num / d; r = num % d;
+                    if (q != (int32_t)q) raise_exception(s, EXC_DE);
+                    s->regs[REG_EAX] = (uint32_t)q; s->regs[REG_EDX] = (uint32_t)r;
+                }
+            } break;
+            }
+        } break;
+
+        case 0xfe: { /* group4: inc/dec r/m8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t a = rm_read(s, &rm, 1);
+            rm_write(s, &rm, alu_incdec(s, reg != 0, a, 1), 1);
+        } break;
+        case 0xff: { /* group5 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            switch (reg) {
+            case 0: case 1: { /* inc/dec r/m */
+                uint32_t a = rm_read(s, &rm, op_size);
+                rm_write(s, &rm, alu_incdec(s, reg != 0, a, op_size), op_size);
+            } break;
+            case 2: { /* call near indirect */
+                /* Read the target BEFORE pushing the return address: the operand
+                 * read may #PF (e.g. demand-paging a jump table), and the push is
+                 * a side effect that must not be applied twice on restart. */
+                uint32_t target = rm_read(s, &rm, op_size);
+                push_val(s, s->eip, op_size);
+                s->eip = target;
+            } break;
+            case 4: /* jmp near indirect */
+                s->eip = rm_read(s, &rm, op_size);
+                break;
+            case 3: case 5: { /* call/jmp far m16:off */
+                uint32_t off;
+                uint16_t nsel;
+                if (rm.is_reg) raise_fault(s, EXC_UD);
+                off  = ld_lin(s, rm.addr, op_size);
+                nsel = (uint16_t)ld_lin(s, rm.addr + op_size, 2);
+                probe_seg(s, nsel);   /* fault on the descriptor before any push */
+                if (reg == 3) {
+                    push_val(s, s->seg[X86_CPU_SEG_CS].sel, op_size);
+                    push_val(s, s->eip, op_size);
+                }
+                load_seg(s, X86_CPU_SEG_CS, nsel);
+                s->eip = off;
+            } break;
+            case 6: /* push r/m */
+                push_val(s, rm_read(s, &rm, op_size), op_size);
+                break;
+            default:
+                raise_fault(s, EXC_UD);
+                break;
+            }
+        } break;
+
+        case 0x69: { /* imul r, r/m, imm */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            int64_t src = (op_size == 2) ? (int16_t)rm_read(s, &rm, 2) : (int32_t)rm_read(s, &rm, 4);
+            int64_t imm = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
+            int64_t r = src * imm;
+            set_regv(s, reg, (uint32_t)r, op_size);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if ((op_size == 2 && r != (int16_t)r) || (op_size == 4 && r != (int32_t)r))
+                s->eflags_ |= EFL_CF | EFL_OF;
+        } break;
+        case 0x6b: { /* imul r, r/m, imm8 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            int64_t src = (op_size == 2) ? (int16_t)rm_read(s, &rm, 2) : (int32_t)rm_read(s, &rm, 4);
+            int64_t imm = (int8_t)fetch8(s);
+            int64_t r = src * imm;
+            set_regv(s, reg, (uint32_t)r, op_size);
+            flags_sync(s);
+            s->eflags_ &= ~(EFL_CF | EFL_OF);
+            if ((op_size == 2 && r != (int16_t)r) || (op_size == 4 && r != (int32_t)r))
+                s->eflags_ |= EFL_CF | EFL_OF;
+        } break;
+
+        case 0xe8: { /* call rel */
+            int32_t d = (op_size == 2) ? (int16_t)fetch16(s) : (int32_t)fetch32(s);
+            push_val(s, s->eip, op_size);
+            jmp_rel(s, d, op_size);
+        } break;
+        case 0xc3: /* ret near */
+            s->eip = pop_val(s, op_size);
+            break;
+        case 0xc2: { /* ret near, imm16 */
+            uint16_t n = fetch16(s);
+            s->eip = pop_val(s, op_size);
+            s->regs[REG_ESP] += n;
+        } break;
+        case 0xc8: { /* enter imm16, imm8 */
+            /* Restart-safe: every value to push is gathered and the whole target
+             * stack range probed before the first store, so a #PF anywhere in the
+             * display copy leaves EBP/ESP untouched and the restart is clean. */
+            uint16_t alloc = fetch16(s);
+            int level = (uint8_t)fetch8(s) & 0x1f;
+            uint32_t tmp[32], sb = s->seg[X86_CPU_SEG_SS].base;
+            uint32_t ebp = s->regs[REG_EBP], esp = s->regs[REG_ESP], frame;
+            int i, n = 0;
+            tmp[n++] = get_regv(s, REG_EBP, op_size);
+            frame = esp - (uint32_t)op_size;      /* ESP after the first push */
+            for (i = 1; i < level; i++) {
+                ebp -= (uint32_t)op_size;
+                tmp[n++] = ld_lin(s, sb + ebp, op_size);
+            }
+            if (level > 0)
+                tmp[n++] = frame;
+            probe_write(s, sb + esp - (uint32_t)(n * op_size), n * op_size);
+            for (i = 0; i < n; i++) {
+                esp -= (uint32_t)op_size;
+                st_lin(s, sb + esp, tmp[i], op_size);
+            }
+            s->regs[REG_ESP] = esp - alloc;
+            set_regv(s, REG_EBP, frame, op_size);
+        } break;
+        case 0xc9: /* leave */
+            /* Restart-safe: setting ESP from EBP is idempotent, and EBP is only
+             * overwritten once the stack read has succeeded. */
+            s->regs[REG_ESP] = s->regs[REG_EBP];
+            s->regs[REG_EBP] = pop_val(s, op_size);
+            break;
+
+        case 0xe4: /* in al, imm8 */
+            check_iopl(s);
+            set_reg8(s, REG_EAX, s->port_read(s->port_opaque, (uint8_t)fetch8(s), 0));
+            break;
+        case 0xe5: /* in eAX, imm8 */
+            check_iopl(s);
+            set_regv(s, REG_EAX, s->port_read(s->port_opaque, (uint8_t)fetch8(s),
+                                              op_size == 2 ? 1 : 2), op_size);
+            break;
+        case 0xec: /* in al, dx */
+            check_iopl(s);
+            set_reg8(s, REG_EAX, s->port_read(s->port_opaque, s->regs[REG_EDX] & 0xffff, 0));
+            break;
+        case 0xed: /* in eAX, dx */
+            check_iopl(s);
+            set_regv(s, REG_EAX, s->port_read(s->port_opaque, s->regs[REG_EDX] & 0xffff,
+                                              op_size == 2 ? 1 : 2), op_size);
+            break;
+        case 0xe6: /* out imm8, al */
+            check_iopl(s);
+            s->port_write(s->port_opaque, (uint8_t)fetch8(s), get_reg8(s, REG_EAX), 0);
+            break;
+        case 0xe7: /* out imm8, eAX */
+            check_iopl(s);
+            s->port_write(s->port_opaque, (uint8_t)fetch8(s), get_regv(s, REG_EAX, op_size),
+                          op_size == 2 ? 1 : 2);
+            break;
+        case 0xee: /* out dx, al */
+            check_iopl(s);
+            s->port_write(s->port_opaque, s->regs[REG_EDX] & 0xffff, get_reg8(s, REG_EAX), 0);
+            break;
+        case 0xef: /* out dx, eAX */
+            check_iopl(s);
+            s->port_write(s->port_opaque, s->regs[REG_EDX] & 0xffff, get_regv(s, REG_EAX, op_size),
+                          op_size == 2 ? 1 : 2);
+            break;
+
+        /* ---- decimal / ASCII adjust (SDM: DAA/DAS/AAA/AAS/AAM/AAD) ---- */
+        case 0x27: case 0x2f: { /* daa / das */
+            int sub_form = (b == 0x2f);
+            uint32_t al = get_reg8(s, REG_EAX), old_al = al;
+            int old_cf, cf = 0;
+            flags_sync(s);   /* BCD adjusts read and write flags eagerly */
+            old_cf = (s->eflags_ & EFL_CF) != 0;
+            if ((al & 0xf) > 9 || (s->eflags_ & EFL_AF)) {
+                al = sub_form ? (al - 6) : (al + 6);
+                cf = old_cf || (sub_form ? (old_al < 6) : (al > 0xff));
+                s->eflags_ |= EFL_AF;
+            } else {
+                s->eflags_ &= ~EFL_AF;
+            }
+            if (old_al > 0x99 || old_cf) {
+                al = sub_form ? (al - 0x60) : (al + 0x60);
+                cf = 1;
+            }
+            al &= 0xff;
+            set_reg8(s, REG_EAX, (uint8_t)al);
+            s->eflags_ = (s->eflags_ & ~(EFL_CF | EFL_OF)) | (cf ? EFL_CF : 0);
+            set_szp(s, al, 1);
+        } break;
+        case 0x37: case 0x3f: { /* aaa / aas */
+            int sub_form = (b == 0x3f);
+            uint32_t ax = s->regs[REG_EAX] & 0xffff;
+            int cf = 0;
+            flags_sync(s);
+            if ((ax & 0xf) > 9 || (s->eflags_ & EFL_AF)) {
+                ax = sub_form ? (ax - 6) : (ax + 6);
+                ax = (ax & 0xff) | (((ax >> 8) + (sub_form ? -1 : 1)) << 8);
+                cf = 1;
+                s->eflags_ |= EFL_AF;
+            } else {
+                s->eflags_ &= ~EFL_AF;
+            }
+            ax &= 0xff0f;   /* AL keeps only the low nibble */
+            set_regv(s, REG_EAX, ax, 2);
+            s->eflags_ = (s->eflags_ & ~(EFL_CF | EFL_OF)) | (cf ? EFL_CF : 0);
+        } break;
+        case 0xd4: { /* aam imm8 */
+            uint32_t base = (uint8_t)fetch8(s), al = get_reg8(s, REG_EAX);
+            if (base == 0) raise_fault(s, EXC_DE);
+            set_regv(s, REG_EAX, ((al / base) << 8) | (al % base), 2);
+            flags_sync(s);
+            set_szp(s, al % base, 1);
+        } break;
+        case 0xd5: { /* aad imm8 */
+            uint32_t base = (uint8_t)fetch8(s);
+            uint32_t al = (get_reg8(s, REG_EAX) + base * get_reg8(s, REG_EAX + 4)) & 0xff;
+            set_regv(s, REG_EAX, al, 2);
+            flags_sync(s);
+            set_szp(s, al, 1);
+        } break;
+
+        case 0x62: { /* bound r, m16&16 / m32&32 */
+            int32_t idx, lo, hi;
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            if (rm.is_reg) raise_fault(s, EXC_UD);
+            if (op_size == 2) {
+                idx = (int16_t)get_regv(s, reg, 2);
+                lo  = (int16_t)ld_lin(s, rm.addr, 2);
+                hi  = (int16_t)ld_lin(s, rm.addr + 2, 2);
+            } else {
+                idx = (int32_t)s->regs[reg];
+                lo  = (int32_t)ld_lin(s, rm.addr, 4);
+                hi  = (int32_t)ld_lin(s, rm.addr + 4, 4);
+            }
+            if (idx < lo || idx > hi)
+                raise_fault(s, EXC_BR);
+        } break;
+        case 0x63: { /* arpl r/m16, r16 */
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t d = rm_read(s, &rm, 2), sr = get_regv(s, reg, 2);
+            if ((d & 3) < (sr & 3)) {
+                rm_write(s, &rm, (d & ~3u) | (sr & 3), 2);
+                flags_sync(s);
+                s->eflags_ |= EFL_ZF;
+            } else {
+                flags_sync(s);
+                s->eflags_ &= ~EFL_ZF;
+            }
+        } break;
+
+        case 0xf5: flags_sync(s); s->eflags_ ^= EFL_CF; break;   /* cmc */
+        case 0xf8: flags_sync(s); s->eflags_ &= ~EFL_CF; break;  /* clc */
+        case 0xf9: flags_sync(s); s->eflags_ |= EFL_CF; break;   /* stc */
+        case 0xfa: check_iopl(s); s->eflags_ &= ~EFL_IF; break;   /* cli */
+        case 0xfb: /* sti: also opens a one-instruction interrupt shadow */
+            check_iopl(s);
+            if (!(s->eflags_ & EFL_IF)) s->int_shadow = 1;
+            s->eflags_ |= EFL_IF;
+            break;
+        case 0xfc: s->eflags_ &= ~EFL_DF; break;        /* cld */
+        case 0xfd: s->eflags_ |= EFL_DF; break;         /* std */
+
+        case 0xa4: string_op(s, 0, 1, seg_override, rep); break;       /* movsb */
+        case 0xa5: string_op(s, 0, op_size, seg_override, rep); break; /* movs  */
+        case 0xaa: string_op(s, 1, 1, seg_override, rep); break;       /* stosb */
+        case 0xab: string_op(s, 1, op_size, seg_override, rep); break; /* stos  */
+        case 0xac: string_op(s, 2, 1, seg_override, rep); break;       /* lodsb */
+        case 0xad: string_op(s, 2, op_size, seg_override, rep); break; /* lods  */
+        case 0xae: string_op(s, 3, 1, seg_override, rep); break;       /* scasb */
+        case 0xaf: string_op(s, 3, op_size, seg_override, rep); break; /* scas  */
+        case 0xa6: string_op(s, 4, 1, seg_override, rep); break;       /* cmpsb */
+        case 0xa7: string_op(s, 4, op_size, seg_override, rep); break; /* cmps  */
+
+        case 0xa0: { /* mov al, [moffs] */
+            uint32_t a = seg_base(s, seg_override, X86_CPU_SEG_DS) +
+                         fetch_imm(s, s->addr_size);
+            set_reg8(s, REG_EAX, ld_lin(s, a, 1));
+        } break;
+        case 0xa1: { /* mov eAX, [moffs] */
+            uint32_t a = seg_base(s, seg_override, X86_CPU_SEG_DS) +
+                         fetch_imm(s, s->addr_size);
+            set_regv(s, REG_EAX, ld_lin(s, a, op_size), op_size);
+        } break;
+        case 0xa2: { /* mov [moffs], al */
+            uint32_t a = seg_base(s, seg_override, X86_CPU_SEG_DS) +
+                         fetch_imm(s, s->addr_size);
+            st_lin(s, a, get_reg8(s, REG_EAX), 1);
+        } break;
+        case 0xa3: { /* mov [moffs], eAX */
+            uint32_t a = seg_base(s, seg_override, X86_CPU_SEG_DS) +
+                         fetch_imm(s, s->addr_size);
+            st_lin(s, a, get_regv(s, REG_EAX, op_size), op_size);
+        } break;
+
+        case 0x60: { /* pusha(d) */
+            /* Restartable: write all 8 slots relative to a temp SP, commit ESP
+             * only after every write succeeds, so a mid-sequence #PF (e.g. the
+             * stack growing into a demand-paged page) does not double-push. */
+            uint32_t osp = s->regs[REG_ESP], base = s->seg[X86_CPU_SEG_SS].base;
+            int z = op_size;
+            st_lin(s, base + osp - 1*z, s->regs[REG_EAX], z);
+            st_lin(s, base + osp - 2*z, s->regs[REG_ECX], z);
+            st_lin(s, base + osp - 3*z, s->regs[REG_EDX], z);
+            st_lin(s, base + osp - 4*z, s->regs[REG_EBX], z);
+            st_lin(s, base + osp - 5*z, osp,               z);  /* original ESP */
+            st_lin(s, base + osp - 6*z, s->regs[REG_EBP], z);
+            st_lin(s, base + osp - 7*z, s->regs[REG_ESI], z);
+            st_lin(s, base + osp - 8*z, s->regs[REG_EDI], z);
+            s->regs[REG_ESP] = osp - 8*z;
+        } break;
+        case 0x61: { /* popa(d) */
+            /* Restartable: read all 8 slots first, then commit registers+ESP. */
+            uint32_t osp = s->regs[REG_ESP], base = s->seg[X86_CPU_SEG_SS].base;
+            int z = op_size;
+            uint32_t edi = ld_lin(s, base + osp + 0*z, z);
+            uint32_t esi = ld_lin(s, base + osp + 1*z, z);
+            uint32_t ebp = ld_lin(s, base + osp + 2*z, z);
+            /* slot 3 (saved ESP) is discarded */
+            uint32_t ebx = ld_lin(s, base + osp + 4*z, z);
+            uint32_t edx = ld_lin(s, base + osp + 5*z, z);
+            uint32_t ecx = ld_lin(s, base + osp + 6*z, z);
+            uint32_t eax = ld_lin(s, base + osp + 7*z, z);
+            set_regv(s, REG_EDI, edi, z); set_regv(s, REG_ESI, esi, z);
+            set_regv(s, REG_EBP, ebp, z); set_regv(s, REG_EBX, ebx, z);
+            set_regv(s, REG_EDX, edx, z); set_regv(s, REG_ECX, ecx, z);
+            set_regv(s, REG_EAX, eax, z);
+            s->regs[REG_ESP] = osp + 8*z;
+        } break;
+
+        case 0xea: { /* jmp far ptr16:32 */
+            uint32_t off = (op_size == 2) ? fetch16(s) : fetch32(s);
+            uint16_t sel = fetch16(s);
+            load_seg(s, X86_CPU_SEG_CS, sel); s->eip = off;
+        } break;
+        case 0x9a: { /* call far ptr16:32 */
+            uint32_t off = (op_size == 2) ? fetch16(s) : fetch32(s);
+            uint16_t sel = fetch16(s);
+            probe_seg(s, sel); /* fault on the descriptor before pushing */
+            push_val(s, s->seg[X86_CPU_SEG_CS].sel, op_size);
+            push_val(s, s->eip, op_size);
+            load_seg(s, X86_CPU_SEG_CS, sel); s->eip = off;
+        } break;
+        case 0xcb: case 0xca: { /* retf [imm16] */
+            /* Read both slots and probe the descriptor before touching ESP, so
+             * a #PF anywhere restarts the instruction with the frame intact. */
+            uint16_t n = (b == 0xca) ? fetch16(s) : 0;
+            uint32_t sb = s->seg[X86_CPU_SEG_SS].base, osp = s->regs[REG_ESP];
+            uint32_t neip = ld_lin(s, sb + osp, op_size);
+            uint16_t ncs = (uint16_t)ld_lin(s, sb + osp + op_size, op_size);
+            probe_seg(s, ncs);
+            s->regs[REG_ESP] = osp + 2 * op_size + n;
+            load_seg(s, X86_CPU_SEG_CS, ncs); s->eip = neip;
+        } break;
+
+        case 0xd8: case 0xd9: case 0xda: case 0xdb:
+        case 0xdc: case 0xdd: case 0xde: case 0xdf: /* x87 ESC */
+            fpu_exec(s, b, seg_override);
+            break;
+        case 0x9b: /* fwait */
+            if ((s->cr0 & (CR0_MP | CR0_TS)) == (CR0_MP | CR0_TS))
+                raise_exception(s, 7);
+            break;
+
+        case 0xcc: /* int3 */
+            deliver_interrupt(s, 3, 0, 0, 1);
+            break;
+        case 0xcd: { /* int n */
+            int n = (uint8_t)fetch8(s);
+#ifdef X86_SYSLOG
+            if (n == 0x80 && (s->seg[X86_CPU_SEG_CS].sel & 3) == 3) {
+                extern int g_sys_pending; extern uint32_t g_sys_nr;
+                fprintf(stderr, "[sys] nr=%u ebx=%08x ecx=%08x edx=%08x esi=%08x edi=%08x eip=%08x\n",
+                        s->regs[REG_EAX], s->regs[REG_EBX], s->regs[REG_ECX],
+                        s->regs[REG_EDX], s->regs[REG_ESI], s->regs[REG_EDI], s->cur_eip);
+                g_sys_pending = 1; g_sys_nr = s->regs[REG_EAX];
+            }
+#endif
+            deliver_interrupt(s, n, 0, 0, 1);
+        } break;
+        case 0xce: /* into */
+            if (get_of(s)) deliver_interrupt(s, 4, 0, 0, 1);
+            break;
+        case 0xcf: /* iret */
+            do_iret(s);
+            break;
+
+        case 0x06: push_val(s, s->seg[X86_CPU_SEG_ES].sel, op_size); break; /* push es */
+        case 0x0e: push_val(s, s->seg[X86_CPU_SEG_CS].sel, op_size); break; /* push cs */
+        case 0x16: push_val(s, s->seg[X86_CPU_SEG_SS].sel, op_size); break; /* push ss */
+        case 0x1e: push_val(s, s->seg[X86_CPU_SEG_DS].sel, op_size); break; /* push ds */
+        case 0x07: pop_seg(s, X86_CPU_SEG_ES, op_size); break; /* pop es */
+        case 0x17: pop_seg(s, X86_CPU_SEG_SS, op_size); break; /* pop ss */
+        case 0x1f: pop_seg(s, X86_CPU_SEG_DS, op_size); break; /* pop ds */
+        case 0x8f: { /* pop r/m.  Per Intel SDM, when ESP is the base register of
+                        the destination the effective address is computed AFTER
+                        ESP is incremented, so pop the value first (e.g. the
+                        `pushf; pop [esp]` local_irq_save idiom depends on this). */
+            uint32_t osp = s->regs[REG_ESP];
+            uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);
+            uint32_t v;
+            /* Per Intel, an ESP-based destination address is formed from the
+             * already-incremented ESP; add the delta rather than mutating ESP,
+             * so that a #PF on either access restarts the instruction with the
+             * value still on the stack (the restarted pop must not skip a
+             * slot). ESP is committed only once both accesses have succeeded. */
+            if (!rm.is_reg && rm.esp_base) rm.addr += op_size;
+            v = ld_lin(s, s->seg[X86_CPU_SEG_SS].base + osp, op_size);
+            if (rm.is_reg) {
+                s->regs[REG_ESP] = osp + op_size;
+                set_regv(s, rm.reg, v, op_size); /* `pop esp` loads from the stack */
+            } else {
+                st_lin(s, rm.addr, v, op_size);
+                s->regs[REG_ESP] = osp + op_size;
+            }
+        } break;
+
+        case 0xe0: case 0xe1: case 0xe2: { /* loopne/loope/loop */
+            int32_t d = (int8_t)fetch8(s);
+            int take;
+            adr_add(s, REG_ECX, -1);          /* CX with a 0x67 prefix */
+            take = (adr_get(s, REG_ECX) != 0);
+            if (b == 0xe1) take = take && get_zf(s);    /* loope  */
+            if (b == 0xe0) take = take && !get_zf(s);   /* loopne */
+            if (take) jmp_rel(s, d, op_size);
+        } break;
+        case 0xe3: { /* jcxz / jecxz */
+            int32_t d = (int8_t)fetch8(s);
+            if (adr_get(s, REG_ECX) == 0) jmp_rel(s, d, op_size);
+        } break;
+
+        case 0xf4: /* hlt */
+#ifdef X86_PROGRESS
+            { static uint64_t h = 0; ++h;
+              if (h <= 3 || (h % 2000) == 0)
+                fprintf(stderr, "[hlt] #%llu eip=%08x eflags=%08x irq=%d cr0=%08x\n",
+                        (unsigned long long)h, s->cur_eip, get_eflags(s), s->hard_irq, s->cr0);
+              if (h == 1) scan_log(s);
+#ifdef X86_TRACE
+              if (h == 1) x86_trace_dump(s);
+#endif
+            }
+#endif
+            /* `sti; hlt` is the idle sequence: an interrupt that became
+             * deliverable during sti's one-instruction shadow is recognized as
+             * soon as HLT takes effect, so take it here instead of halting --
+             * otherwise the guest would idle until the next timer tick. */
+            if (s->hard_irq && (s->eflags_ & EFL_IF) && s->get_hard_intno) {
+                int intno = s->get_hard_intno(s->get_hard_intno_opaque);
+                if (intno >= 0) {
+                    deliver_interrupt(s, intno, 0, 0, 0);
+                    break;
+                }
+            }
+            s->halted = TRUE;
+            break;
+
+        default:
+            x86_stop(s, "unimplemented opcode %02x", b);
+            break;
+        }
+        s->cycle_count++;
+#ifdef X86_PROGRESS
+        { static int previf = -1; int cur = (s->eflags_ >> 9) & 1;
+          if (cur != previf) { static int n; if (n++ < 80)
+              fprintf(stderr, "[IF] %d->%d @eip=%08x op=%02x\n", previf, cur, s->cur_eip, b);
+              previf = cur; } }
+#endif
+    }
+}
+
+/* ---- public interface -------------------------------------------------- */
 
 X86CPUState *x86_cpu_init(PhysMemoryMap *mem_map)
 {
-    fprintf(stderr, "x86 emulator is not supported\n");
-    exit(1);
+    X86CPUState *s = mallocz(sizeof(*s));
+    s->mem_map = mem_map;
+    s->eflags_ = 0x2;
+    s->cc_op = CC_OP_EFLAGS;
+    s->cc_size = 4;
+    s->addr_size = 4;
+    tlb_flush_all(s);   /* mallocz zeroes; 0 is a valid page tag, EMPTY is not */
+    s->fetch_ptr = x86_fetch_none;
+    s->fetch_end = x86_fetch_none;
+    fpu_init(s);
+    s->mxcsr = 0x1f80;  /* all exceptions masked, round to nearest */
+    /* Sane flat defaults; the machine overrides via set_reg/set_seg. */
+    return s;
 }
 
 void x86_cpu_end(X86CPUState *s)
 {
-}
-
-void x86_cpu_interp(X86CPUState *s, int max_cycles1)
-{
+    free(s);
 }
 
 void x86_cpu_set_irq(X86CPUState *s, BOOL set)
 {
+    s->hard_irq = set;
+    if (set) s->halted = FALSE; /* wake from HLT (delivery is a later increment) */
 }
 
 void x86_cpu_set_reg(X86CPUState *s, int reg, uint32_t val)
 {
+    if (reg < 8) s->regs[reg] = val;
+    else if (reg == X86_CPU_REG_EIP) s->eip = val;
+    else if (reg == X86_CPU_REG_CR0) {
+        uint32_t o0 = s->cr0;
+        s->cr0 = val;
+        tlb_flush_on_cr_change(s, o0, s->cr4);
+    }
+    else if (reg == X86_CPU_REG_CR2) s->cr2 = val;
 }
 
 uint32_t x86_cpu_get_reg(X86CPUState *s, int reg)
 {
+    if (reg < 8) return s->regs[reg];
+    if (reg == X86_CPU_REG_EIP) return s->eip;
+    if (reg == X86_CPU_REG_CR0) return s->cr0;
+    if (reg == X86_CPU_REG_CR2) return s->cr2;
     return 0;
 }
 
 void x86_cpu_set_seg(X86CPUState *s, int seg, const X86CPUSeg *sd)
 {
+    if (seg < 0 || seg >= 10) return;
+    s->seg[seg].sel   = sd->sel;
+    s->seg[seg].flags = sd->flags;
+    s->seg[seg].base  = sd->base;
+    s->seg[seg].limit = sd->limit;
 }
 
 void x86_cpu_set_get_hard_intno(X86CPUState *s,
                                 int (*get_hard_intno)(void *opaque),
                                 void *opaque)
 {
+    s->get_hard_intno = get_hard_intno;
+    s->get_hard_intno_opaque = opaque;
 }
 
 void x86_cpu_set_get_tsc(X86CPUState *s,
                          uint64_t (*get_tsc)(void *opaque),
                          void *opaque)
 {
+    s->get_tsc = get_tsc;
+    s->get_tsc_opaque = opaque;
 }
 
-void x86_cpu_set_port_io(X86CPUState *s, 
+void x86_cpu_set_port_io(X86CPUState *s,
                          DeviceReadFunc *port_read, DeviceWriteFunc *port_write,
                          void *opaque)
 {
+    s->port_read = port_read;
+    s->port_write = port_write;
+    s->port_opaque = opaque;
 }
 
 int64_t x86_cpu_get_cycles(X86CPUState *s)
 {
-    return 0;
+    return s->cycle_count;
 }
 
 BOOL x86_cpu_get_power_down(X86CPUState *s)
 {
-    return FALSE;
+    return s->halted;
 }
 
 void x86_cpu_flush_tlb_write_range_ram(X86CPUState *s,
                                        uint8_t *ram_ptr, size_t ram_size)
 {
+    /* A device took over write tracking for this host RAM range, so cached
+     * write translations into it must go. Called rarely (framebuffer remap),
+     * so drop the whole write TLB rather than matching host pointers. */
+    int mi, i;
+    (void)ram_ptr; (void)ram_size;
+    for (mi = 0; mi < 2; mi++)
+        for (i = 0; i < X86_TLB_SIZE; i++)
+            s->tlb_write[mi][i].vaddr = X86_TLB_EMPTY(i);
 }

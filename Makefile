@@ -32,6 +32,9 @@ CONFIG_SDL=y
 CONFIG_INT128=y
 # build x86 emulator
 CONFIG_X86EMU=y
+# x86: inflate a gzip bzImage on the host instead of running the kernel's own
+# decompressor on the emulated CPU. `make CONFIG_KERNEL_INFLATE=` turns it off.
+CONFIG_KERNEL_INFLATE=y
 # win32 build (not usable yet)
 #CONFIG_WIN32=y
 # user space network redirector
@@ -48,7 +51,25 @@ CC=$(CROSS_PREFIX)gcc
 STRIP=$(CROSS_PREFIX)strip
 CFLAGS=-O2 -Wall -g -D_FILE_OFFSET_BITS=64 -D_LARGEFILE_SOURCE -MMD
 CFLAGS+=-D_GNU_SOURCE -DCONFIG_VERSION=\"$(shell cat VERSION)\"
+CFLAGS+=$(EXTRA_CFLAGS)
 LDFLAGS=
+DIST_DIR=dist
+DIST_LINUX_DIR=$(DIST_DIR)/linux
+DIST_WINDOWS_DIR=$(DIST_DIR)/windows
+WIN_CROSS_PREFIX ?= x86_64-w64-mingw32-
+# CA bundle shipped with the Windows build so its OpenSSL-based libcurl can
+# verify HTTPS. Default path is Fedora's ca-certificates location.
+WIN_CA_BUNDLE ?= /etc/pki/tls/certs/ca-bundle.crt
+
+# x86 backend selection.
+#   default    : software x86 CPU (x86_cpu.c) — the WASM-targetable path
+#   USE_KVM=1  : native KVM acceleration, for Linux-host debugging only (not WASM)
+ifndef CONFIG_WIN32
+ifeq ($(USE_KVM),1)
+CFLAGS += -DUSE_KVM
+endif
+endif
+
 
 bindir=/usr/local/bin
 INSTALL=install
@@ -62,8 +83,11 @@ endif
 
 all: $(PROGS)
 
+.PHONY: all install clean distclean dist dist-linux-backends dist-windows
+
+# inflate.o: gzip disk chunks (temu.c, block_net.c) and, for x86, kernels
 EMU_OBJS:=virtio.o pci.o fs.o cutils.o iomem.o simplefb.o \
-    json.o machine.o temu.o
+    json.o machine.o temu.o inflate.o
 
 ifdef CONFIG_SLIRP
 CFLAGS+=-DCONFIG_SLIRP
@@ -72,8 +96,11 @@ endif
 
 ifndef CONFIG_WIN32
 EMU_OBJS+=fs_disk.o
-EMU_LIBS=-lrt
+EMU_LIBS=-lrt -lm
+else
+EMU_LIBS+=-lws2_32 -liphlpapi -lwinpthread
 endif
+
 ifdef CONFIG_FS_NET
 CFLAGS+=-DCONFIG_FS_NET
 EMU_OBJS+=fs_net.o fs_wget.o fs_utils.o block_net.o
@@ -101,10 +128,56 @@ endif
 ifdef CONFIG_X86EMU
 CFLAGS+=-DCONFIG_X86EMU
 EMU_OBJS+=x86_cpu.o x86_machine.o ide.o ps2.o vmmouse.o pckbd.o vga.o
+ifndef CONFIG_KERNEL_INFLATE
+CFLAGS+=-DX86_NO_KERNEL_INFLATE
+endif
 endif
 
 temu$(EXE): $(EMU_OBJS)
 	$(CC) $(LDFLAGS) -o $@ $^ $(EMU_LIBS)
+
+# Software x86 CPU regression self-test (see tests/x86_cpu_selftest.c).
+# Filter prerequisites to sources/objects: the -MMD .d file adds header
+# prerequisites, and a bare $^ would pass them to the compiler as inputs.
+x86-selftest: tests/x86_cpu_selftest.c x86_cpu.o iomem.o cutils.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^) -lm
+	./$@
+
+# Deterministic, network-free interpreter microbenchmark (see bench/microbench.c).
+# Times a tight scalar-mix loop straight through x86_cpu_interp -- a reproducible
+# stand-in for the awk boot benchmark, which depends on the flaky remote 9p rootfs.
+# Run e.g. `./microbench 200000000`.
+microbench: bench/microbench.c x86_cpu.o iomem.o cutils.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^) -lm
+
+# gzip decoder (used to load bzImage kernels) against gzip(1) output; see
+# tests/inflate_test.sh.
+inflate-test: tests/inflate_test.c inflate.o
+	$(CC) $(CFLAGS) -I. -o $@ $(filter %.c %.o,$^)
+
+dist-linux-backends:
+	mkdir -p $(DIST_LINUX_DIR)
+	$(MAKE) clean
+	$(MAKE) temu$(EXE)
+	cp temu$(EXE) $(DIST_LINUX_DIR)/temu-soft$(EXE)
+	$(MAKE) clean
+	$(MAKE) USE_KVM=1 temu$(EXE)
+	cp temu$(EXE) $(DIST_LINUX_DIR)/temu-kvm$(EXE)
+
+# Windows cross build. CONFIG_FS_NET (remote configs/assets over HTTP) and
+# CONFIG_SLIRP (user-mode networking) are enabled; SDL is left off (headless).
+# Required MinGW runtime DLLs are bundled next to the .exe so it runs standalone.
+dist-windows:
+	mkdir -p $(DIST_WINDOWS_DIR)
+	$(MAKE) clean
+	$(MAKE) CONFIG_WIN32=y CROSS_PREFIX=$(WIN_CROSS_PREFIX) CONFIG_SDL= all
+	cp -f temu.exe $(DIST_WINDOWS_DIR)/temu.exe
+	cp -f $(WIN_CA_BUNDLE) $(DIST_WINDOWS_DIR)/ca-bundle.crt
+	chmod u+w $(DIST_WINDOWS_DIR)/ca-bundle.crt
+	OBJDUMP=$(WIN_CROSS_PREFIX)objdump sh scripts/bundle-win-dlls.sh \
+	    $(DIST_WINDOWS_DIR)/temu.exe $(DIST_WINDOWS_DIR)
+
+dist: dist-linux-backends dist-windows
 
 riscv_cpu32.o: riscv_cpu.c
 	$(CC) $(CFLAGS) -DMAX_XLEN=32 -c -o $@ $<
@@ -128,8 +201,13 @@ install: $(PROGS)
 %.o: %.c
 	$(CC) $(CFLAGS) -c -o $@ $<
 
+# clean removes build intermediates and the in-tree dev binaries. The dist/
+# tree (Docker release artifacts) is left alone; use distclean to remove it.
 clean:
-	rm -f *.o *.d *~ $(PROGS) slirp/*.o slirp/*.d slirp/*~
+	rm -f *.o *.d *~ $(PROGS) x86-selftest slirp/*.o slirp/*.d slirp/*~
+
+distclean: clean
+	rm -rf $(DIST_DIR)
 
 -include $(wildcard *.d)
 -include $(wildcard slirp/*.d)

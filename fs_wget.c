@@ -36,6 +36,10 @@
 #include "fs_utils.h"
 #include "fs_wget.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #if defined(EMSCRIPTEN)
 #include <emscripten.h>
 #else
@@ -190,6 +194,31 @@ static size_t fs_wget_read_cb(char *ptr, size_t size, size_t nmemb,
     return s->read_cb(s->opaque, ptr, size);
 }
 
+#ifdef _WIN32
+/* MinGW/OpenSSL libcurl ships no CA store on Windows, so HTTPS verification
+ * fails and transfers return empty. Point curl at the ca-bundle.crt bundled
+ * next to the executable. */
+static const char *fs_wget_ca_bundle(void)
+{
+    static char ca_path[MAX_PATH];
+    static int inited;
+
+    if (!inited) {
+        char exe[MAX_PATH];
+        DWORD n = GetModuleFileNameA(NULL, exe, sizeof(exe));
+        inited = 1;
+        if (n > 0 && n < sizeof(exe)) {
+            char *p = strrchr(exe, '\\');
+            if (p) {
+                *p = '\0';
+                snprintf(ca_path, sizeof(ca_path), "%s\\ca-bundle.crt", exe);
+            }
+        }
+    }
+    return ca_path[0] ? ca_path : NULL;
+}
+#endif
+
 XHRState *fs_wget2(const char *url, const char *user, const char *password,
                    WGetReadCallback *read_cb, uint64_t post_data_len,
                    void *opaque, WGetWriteCallback *write_cb, BOOL single_write)
@@ -210,6 +239,13 @@ XHRState *fs_wget2(const char *url, const char *user, const char *password,
     curl_easy_setopt(s->eh, CURLOPT_URL, url);
     curl_easy_setopt(s->eh, CURLOPT_VERBOSE, 0L);
     curl_easy_setopt(s->eh, CURLOPT_ACCEPT_ENCODING, "");
+#ifdef _WIN32
+    {
+        const char *ca = fs_wget_ca_bundle();
+        if (ca)
+            curl_easy_setopt(s->eh, CURLOPT_CAINFO, ca);
+    }
+#endif
     if (user) {
         curl_easy_setopt(s->eh, CURLOPT_USERNAME, user);
         curl_easy_setopt(s->eh, CURLOPT_PASSWORD, password);

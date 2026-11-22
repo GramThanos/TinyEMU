@@ -21,6 +21,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#ifndef X86_CPU_H
+#define X86_CPU_H
+
 #include "iomem.h"
 
 typedef struct X86CPUState X86CPUState;
@@ -68,3 +71,5 @@ int64_t x86_cpu_get_cycles(X86CPUState *s);
 BOOL x86_cpu_get_power_down(X86CPUState *s);
 void x86_cpu_flush_tlb_write_range_ram(X86CPUState *s,
                                        uint8_t *ram_ptr, size_t ram_size);
+
+#endif /* X86_CPU_H */

@@ -1,0 +1,66 @@
+services:
+  build:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    command: >
+      sh -lc "
+      make dist
+      "
+
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    command: >
+      sh -lc "
+      if [ ! -x ./dist/linux/temu-soft ] || [ ! -x ./dist/linux/temu-kvm ]; then
+        echo 'Missing dist/linux binaries. Run: docker compose run --rm build';
+        exit 1;
+      fi &&
+      if [ ! -f ./dist/windows/temu.exe ]; then
+        echo 'Missing dist/windows/temu.exe. Run: docker compose run --rm build';
+        exit 1;
+      fi &&
+      echo 'Build artifacts present (temu-soft, temu-kvm, temu.exe).';
+      echo 'NOTE: the software x86 CPU (x86_cpu.c) is a work in progress,';
+      echo 'so an x86 guest boot is not yet part of the smoke test. RISC-V guests work.';
+      echo 'Smoke test complete.';
+      "
+
+  run:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+    stdin_open: true
+    tty: true
+    environment:
+      USE_KVM: ${USE_KVM:-0}
+      TEMU_CONFIG: ${TEMU_CONFIG:-}
+      TEMU_EXTRA_ARGS: ${TEMU_EXTRA_ARGS:-}
+    command: >
+      sh -lc "
+      if [ -z \"$$TEMU_CONFIG\" ]; then
+        echo 'Set TEMU_CONFIG to the VM config path inside container (e.g. /workspace/your.cfg).';
+        echo 'Example: docker compose run --rm -e TEMU_CONFIG=/workspace/your.cfg run';
+        exit 1;
+      fi &&
+      if [ ! -x ./dist/linux/temu-soft ] || [ ! -x ./dist/linux/temu-kvm ]; then
+        echo 'Build artifacts missing. Run: docker compose run --rm build';
+        exit 1;
+      fi &&
+      if [ \"$$USE_KVM\" = \"1\" ]; then
+        ./dist/linux/temu-kvm $$TEMU_EXTRA_ARGS $$TEMU_CONFIG;
+      else
+        ./dist/linux/temu-soft $$TEMU_EXTRA_ARGS $$TEMU_CONFIG;
+      fi
+      "

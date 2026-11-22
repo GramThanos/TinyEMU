@@ -85,11 +85,20 @@ static inline int min_int(int a, int b)
 void *mallocz(size_t size);
 
 #if defined(_WIN32)
+#include <time.h>
+
 static inline uint32_t bswap_32(uint32_t v)
 {
     return ((v & 0xff000000) >> 24) | ((v & 0x00ff0000) >>  8) |
         ((v & 0x0000ff00) <<  8) | ((v & 0x000000ff) << 24);
 }
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
+#endif
+
+#define localtime_r(timer, result) (localtime_s((result), (timer)) == 0 ? (result) : NULL)
+#define gmtime_r(timer, result) (gmtime_s((result), (timer)) == 0 ? (result) : NULL)
 #else
 #include <byteswap.h>
 #endif

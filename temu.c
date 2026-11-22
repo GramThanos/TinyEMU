@@ -21,6 +21,16 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#ifdef _WIN32
+/* winsock2.h must precede windows.h so the latter does not pull in the
+ * conflicting winsock v1 header. */
+#include <winsock2.h>
+#include <windows.h>
+#include <conio.h>
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -48,6 +58,7 @@
 #ifdef CONFIG_FS_NET
 #include "fs_utils.h"
 #include "fs_wget.h"
+#include "inflate.h"
 #endif
 #ifdef CONFIG_SLIRP
 #include "slirp/libslirp.h"
@@ -204,7 +215,120 @@ CharacterDevice *console_init(BOOL allow_ctrlc)
     return dev;
 }
 
-#endif /* !_WIN32 */
+#else /* _WIN32 */
+
+/* Windows console backend. Output goes to the console via WriteFile (binary,
+ * with ANSI/VT escape processing enabled); input is polled with _kbhit/_getch
+ * because Windows console handles cannot be used with select(). */
+typedef struct {
+    int console_esc_state;
+    BOOL resize_pending;
+    int last_w, last_h;
+} STDIODevice;
+
+static STDIODevice *global_stdio_device;
+
+static void console_write(void *opaque, const uint8_t *buf, int len)
+{
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD written;
+    (void)opaque;
+    WriteFile(h, buf, len, &written, NULL);
+}
+
+static int console_read(void *opaque, uint8_t *buf, int len)
+{
+    STDIODevice *s = opaque;
+    int j = 0;
+
+    while (j < len && _kbhit()) {
+        int c = _getch();
+        uint8_t ch;
+        /* extended keys (arrows, function keys) arrive as a 0x00/0xE0 prefix
+           followed by a scan code; drop both rather than feed garbage. */
+        if (c == 0x00 || c == 0xE0) {
+            if (_kbhit())
+                _getch();
+            continue;
+        }
+        ch = (uint8_t)c;
+        if (s->console_esc_state) {
+            s->console_esc_state = 0;
+            switch(ch) {
+            case 'x':
+                printf("Terminated\n");
+                exit(0);
+            case 'h':
+                printf("\n"
+                       "C-a h   print this help\n"
+                       "C-a x   exit emulator\n"
+                       "C-a C-a send C-a\n"
+                       );
+                break;
+            case 1:
+                buf[j++] = 1;
+                break;
+            default:
+                break;
+            }
+        } else {
+            if (ch == 1)
+                s->console_esc_state = 1;
+            else
+                buf[j++] = ch;
+        }
+    }
+    return j;
+}
+
+static void console_get_size(int *pw, int *ph)
+{
+    CONSOLE_SCREEN_BUFFER_INFO info;
+    HANDLE h = GetStdHandle(STD_OUTPUT_HANDLE);
+    int width = 80, height = 25;
+
+    if (GetConsoleScreenBufferInfo(h, &info)) {
+        int w = info.srWindow.Right - info.srWindow.Left + 1;
+        int hgt = info.srWindow.Bottom - info.srWindow.Top + 1;
+        if (w >= 4 && hgt >= 4) {
+            width = w;
+            height = hgt;
+        }
+    }
+    *pw = width;
+    *ph = height;
+}
+
+CharacterDevice *console_init(BOOL allow_ctrlc)
+{
+    CharacterDevice *dev;
+    STDIODevice *s;
+    HANDLE hout = GetStdHandle(STD_OUTPUT_HANDLE);
+    HANDLE hin = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode;
+    (void)allow_ctrlc;
+
+    /* enable ANSI escape sequence processing on output (Windows 10+) */
+    if (GetConsoleMode(hout, &mode))
+        SetConsoleMode(hout, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    /* raw input: no line buffering / echo (getch bypasses these regardless) */
+    if (GetConsoleMode(hin, &mode))
+        SetConsoleMode(hin, mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT |
+                                     ENABLE_PROCESSED_INPUT));
+
+    dev = mallocz(sizeof(*dev));
+    s = mallocz(sizeof(*s));
+    s->resize_pending = TRUE;
+    s->last_w = s->last_h = -1;
+    global_stdio_device = s;
+
+    dev->opaque = s;
+    dev->write_data = console_write;
+    dev->read_data = console_read;
+    return dev;
+}
+
+#endif /* _WIN32 */
 
 typedef enum {
     BF_MODE_RO,
@@ -245,6 +369,12 @@ static int bf_read_async(BlockDevice *bs,
 #endif
     if (!bf->f)
         return -1;
+    /* An out-of-range request must never walk off sector_table or issue a
+       negative-length read: return an I/O error to the guest instead of
+       corrupting/segfaulting the host. This also stops a too-small file
+       (e.g. a chunk manifest mistaken for a raw image) from crashing here. */
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
     if (bf->mode == BF_MODE_SNAPSHOT) {
         int i;
         for(i = 0; i < n; i++) {
@@ -272,6 +402,8 @@ static int bf_write_async(BlockDevice *bs,
     BlockDeviceFile *bf = bs->opaque;
     int ret;
 
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
     switch(bf->mode) {
     case BF_MODE_RO:
         ret = -1; /* error */
@@ -343,6 +475,300 @@ static BlockDevice *block_device_init(const char *filename,
     bs->get_sector_count = bf_get_sector_count;
     bs->read_async = bf_read_async;
     bs->write_async = bf_write_async;
+    return bs;
+}
+
+/**********************************************************/
+/* local split (chunked) block device
+ *
+ * Serves a disk from the multi-file layout produced by splitimg: a JSON
+ * manifest ("blk.txt": { block_size (in KB), n_block }) plus "blk%09u.bin"
+ * chunk files of block_size KB each, sitting in the same directory. This is
+ * the exact on-disk layout the browser build fetches over HTTP
+ * (block_device_init_http). Recognising it for local files lets a config.cfg
+ * point drive0 at a chunked image with the native/Docker build too, instead of
+ * the manifest being mistaken for a raw image. */
+
+typedef struct BlockDeviceSplit {
+    BlockDeviceModeEnum mode;
+    int64_t nb_sectors;
+    int block_size;         /* sectors per chunk, power of two */
+    int n_block;
+    char *dir;              /* manifest directory, incl. trailing separator */
+    uint8_t **sector_table; /* write overlay (SNAPSHOT), lazily populated */
+    FILE *cur_f;            /* cached open chunk file for reads */
+    int cur_block;          /* chunk index of cur_f, -1 if none */
+    BOOL gzip;              /* "compression": "gzip": chunks are blk%09u.bin.gz */
+    uint8_t *gz_buf;        /* the inflated chunk gz_block, for reads */
+    int gz_block;           /* -1 if none */
+} BlockDeviceSplit;
+
+/* gzip chunks: inflate a whole chunk into gz_buf and keep the latest one. A
+   missing chunk reads back as zeroes, as a missing raw chunk does. */
+static const uint8_t *bs_split_gz_chunk(BlockDeviceSplit *bf, int block_num)
+{
+    char filename[1024];
+    size_t block_bytes = (size_t)bf->block_size * SECTOR_SIZE;
+    uint8_t *src;
+    long len;
+    FILE *f;
+
+    if (bf->gz_block == block_num)
+        return bf->gz_buf;
+    if (!bf->gz_buf)
+        bf->gz_buf = malloc(block_bytes);
+    bf->gz_block = -1;
+    memset(bf->gz_buf, 0, block_bytes);
+    snprintf(filename, sizeof(filename), "%sblk%09u.bin.gz", bf->dir, block_num);
+    f = fopen(filename, "rb");
+    if (f) {
+        fseek(f, 0, SEEK_END);
+        len = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        src = malloc(len > 0 ? len : 1);
+        if (len <= 0 || fread(src, 1, len, f) != (size_t)len ||
+            gzip_size(src, len) != (long)block_bytes ||
+            gzip_inflate(bf->gz_buf, block_bytes, src, len) < 0) {
+            vm_error("%s: corrupt compressed chunk\n", filename);
+            exit(1);
+        }
+        free(src);
+        fclose(f);
+    }
+    bf->gz_block = block_num;
+    return bf->gz_buf;
+}
+
+static int64_t bs_split_get_sector_count(BlockDevice *bs)
+{
+    BlockDeviceSplit *bf = bs->opaque;
+    return bf->nb_sectors;
+}
+
+static FILE *bs_split_open_chunk(BlockDeviceSplit *bf, int block_num)
+{
+    char filename[1024];
+    if (bf->cur_f && bf->cur_block == block_num)
+        return bf->cur_f;
+    if (bf->cur_f) {
+        fclose(bf->cur_f);
+        bf->cur_f = NULL;
+        bf->cur_block = -1;
+    }
+    snprintf(filename, sizeof(filename), "%sblk%09u.bin", bf->dir, block_num);
+    bf->cur_f = fopen(filename, "rb");
+    if (bf->cur_f)
+        bf->cur_block = block_num;
+    return bf->cur_f;
+}
+
+static int bs_split_read_async(BlockDevice *bs,
+                               uint64_t sector_num, uint8_t *buf, int n,
+                               BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    BlockDeviceSplit *bf = bs->opaque;
+    int i;
+
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
+    for(i = 0; i < n; i++) {
+        if (bf->sector_table && bf->sector_table[sector_num]) {
+            memcpy(buf, bf->sector_table[sector_num], SECTOR_SIZE);
+        } else {
+            int block_num = sector_num / bf->block_size;
+            int offset = sector_num % bf->block_size;
+            FILE *f;
+            if (bf->gzip) {
+                memcpy(buf, bs_split_gz_chunk(bf, block_num) +
+                       (size_t)offset * SECTOR_SIZE, SECTOR_SIZE);
+                sector_num++;
+                buf += SECTOR_SIZE;
+                continue;
+            }
+            f = bs_split_open_chunk(bf, block_num);
+            /* a missing or short chunk reads back as zeroes */
+            memset(buf, 0, SECTOR_SIZE);
+            if (f) {
+                fseek(f, (int64_t)offset * SECTOR_SIZE, SEEK_SET);
+                if (fread(buf, 1, SECTOR_SIZE, f) != SECTOR_SIZE) {
+                    /* leave the zero fill */
+                }
+            }
+        }
+        sector_num++;
+        buf += SECTOR_SIZE;
+    }
+    return 0;
+}
+
+static int bs_split_write_async(BlockDevice *bs,
+                                uint64_t sector_num, const uint8_t *buf, int n,
+                                BlockDeviceCompletionFunc *cb, void *opaque)
+{
+    BlockDeviceSplit *bf = bs->opaque;
+    int i;
+
+    if (n < 0 || sector_num + (uint64_t)n > (uint64_t)bf->nb_sectors)
+        return -1;
+    switch(bf->mode) {
+    case BF_MODE_RO:
+        return -1;
+    case BF_MODE_SNAPSHOT:
+        /* copy-on-write into an in-memory overlay; chunk files untouched */
+        for(i = 0; i < n; i++) {
+            if (!bf->sector_table[sector_num])
+                bf->sector_table[sector_num] = malloc(SECTOR_SIZE);
+            memcpy(bf->sector_table[sector_num], buf, SECTOR_SIZE);
+            sector_num++;
+            buf += SECTOR_SIZE;
+        }
+        return 0;
+    case BF_MODE_RW:
+        for(i = 0; i < n; i++) {
+            int block_num = sector_num / bf->block_size;
+            int offset = sector_num % bf->block_size;
+            char filename[1024];
+            FILE *f;
+            /* drop the read cache if it points at the chunk we are writing */
+            if (bf->cur_f && bf->cur_block == block_num) {
+                fclose(bf->cur_f);
+                bf->cur_f = NULL;
+                bf->cur_block = -1;
+            }
+            snprintf(filename, sizeof(filename), "%sblk%09u.bin",
+                     bf->dir, block_num);
+            f = fopen(filename, "r+b");
+            if (!f)
+                return -1;
+            fseek(f, (int64_t)offset * SECTOR_SIZE, SEEK_SET);
+            fwrite(buf, 1, SECTOR_SIZE, f);
+            fclose(f);
+            sector_num++;
+            buf += SECTOR_SIZE;
+        }
+        return 0;
+    default:
+        return -1;
+    }
+}
+
+/* If filename is a splitimg JSON manifest, build a chunked block device from
+   it; otherwise return NULL so the caller falls back to a raw image. */
+static BlockDevice *block_device_init_split(const char *filename,
+                                            BlockDeviceModeEnum mode)
+{
+    BlockDevice *bs;
+    BlockDeviceSplit *bf;
+    FILE *f;
+    int64_t file_size;
+    char *data;
+    const char *p;
+    int block_size_kb, n_block, block_size, sep;
+    BOOL gzip;
+    JSONValue cfg, vbs, vnb, vcomp;
+
+    f = fopen(filename, "rb");
+    if (!f)
+        return NULL;
+    fseek(f, 0, SEEK_END);
+    file_size = ftello(f);
+    /* a manifest is tiny; anything sizeable is a raw image */
+    if (file_size <= 0 || file_size > 65536) {
+        fclose(f);
+        return NULL;
+    }
+    fseek(f, 0, SEEK_SET);
+    data = malloc(file_size + 1);
+    if (fread(data, 1, file_size, f) != (size_t)file_size) {
+        free(data);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    data[file_size] = '\0';
+
+    /* quick reject: JSON objects start with '{' */
+    p = data;
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n')
+        p++;
+    if (*p != '{') {
+        free(data);
+        return NULL;
+    }
+
+    cfg = json_parse_value_len(data, file_size);
+    free(data);
+    if (json_is_error(cfg)) {
+        json_free(cfg);
+        return NULL;
+    }
+    /* must carry both manifest fields to be treated as a split image */
+    vbs = json_object_get(cfg, "block_size");
+    vnb = json_object_get(cfg, "n_block");
+    if (vbs.type != JSON_INT || vnb.type != JSON_INT) {
+        json_free(cfg);
+        return NULL;
+    }
+    block_size_kb = vbs.u.int32;
+    n_block = vnb.u.int32;
+    /* optional, as in block_net.c: absent or "none", or "gzip" */
+    vcomp = json_object_get(cfg, "compression");
+    gzip = FALSE;
+    if (!json_is_undefined(vcomp)) {
+        const char *name = json_get_str(vcomp);
+        if (name && !strcmp(name, "gzip")) {
+            gzip = TRUE;
+        } else if (!name || strcmp(name, "none") != 0) {
+            vm_error("%s: unsupported compression\n", filename);
+            exit(1);
+        }
+    }
+    json_free(cfg);
+    /* writes go back into the chunk files, which can't be done in place
+       for gzip ones */
+    if (gzip && mode == BF_MODE_RW) {
+        vm_error("%s: a compressed split image can't be opened read-write; "
+                 "use snapshot mode\n", filename);
+        exit(1);
+    }
+
+    block_size = block_size_kb * 2; /* KB -> 512-byte sectors */
+    if (block_size_kb <= 0 || (block_size & (block_size - 1)) != 0 ||
+        n_block <= 0) {
+        vm_error("%s: invalid split-image manifest\n", filename);
+        exit(1);
+    }
+
+    bs = mallocz(sizeof(*bs));
+    bf = mallocz(sizeof(*bf));
+    bf->mode = mode;
+    bf->block_size = block_size;
+    bf->n_block = n_block;
+    bf->nb_sectors = (int64_t)block_size * n_block;
+    bf->cur_f = NULL;
+    bf->cur_block = -1;
+    bf->gzip = gzip;
+    bf->gz_buf = NULL;
+    bf->gz_block = -1;
+
+    /* directory prefix of the manifest (handles both separators) */
+    sep = -1;
+    for(p = filename; *p; p++) {
+        if (*p == '/' || *p == '\\')
+            sep = p - filename;
+    }
+    bf->dir = mallocz(sep + 2);
+    if (sep >= 0)
+        memcpy(bf->dir, filename, sep + 1); /* keep trailing separator */
+
+    if (mode == BF_MODE_SNAPSHOT)
+        bf->sector_table = mallocz(sizeof(bf->sector_table[0]) *
+                                   bf->nb_sectors);
+
+    bs->opaque = bf;
+    bs->get_sector_count = bs_split_get_sector_count;
+    bs->read_async = bs_split_read_async;
+    bs->write_async = bs_split_write_async;
     return bs;
 }
 
@@ -550,9 +976,9 @@ void virt_machine_run(VirtMachine *m)
     FD_ZERO(&wfds);
     FD_ZERO(&efds);
     fd_max = -1;
-#ifndef _WIN32
     if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
         STDIODevice *s = m->console->opaque;
+#ifndef _WIN32
         stdin_fd = s->stdin_fd;
         FD_SET(stdin_fd, &rfds);
         fd_max = stdin_fd;
@@ -563,8 +989,19 @@ void virt_machine_run(VirtMachine *m)
             virtio_console_resize_event(m->console_dev, width, height);
             s->resize_pending = FALSE;
         }
-    }
+#else
+        /* console input is polled after select() (not selectable on Windows);
+           here we only propagate host console resizes to the guest. */
+        int width, height;
+        console_get_size(&width, &height);
+        if (s->resize_pending || width != s->last_w || height != s->last_h) {
+            virtio_console_resize_event(m->console_dev, width, height);
+            s->resize_pending = FALSE;
+            s->last_w = width;
+            s->last_h = height;
+        }
 #endif
+    }
     if (m->net) {
         m->net->select_fill(m->net, &fd_max, &rfds, &wfds, &efds, &delay);
     }
@@ -573,6 +1010,14 @@ void virt_machine_run(VirtMachine *m)
 #endif
     tv.tv_sec = delay / 1000;
     tv.tv_usec = (delay % 1000) * 1000;
+#ifdef _WIN32
+    /* select() with no descriptors errors out immediately on Windows, which
+       would busy-loop; sleep for the delay instead. */
+    if (fd_max < 0) {
+        Sleep(delay);
+        ret = 0;
+    } else
+#endif
     ret = select(fd_max + 1, &rfds, &wfds, &efds, &tv);
     if (m->net) {
         m->net->select_poll(m->net, &rfds, &wfds, &efds, ret);
@@ -591,6 +1036,18 @@ void virt_machine_run(VirtMachine *m)
         }
 #endif
     }
+#ifdef _WIN32
+    /* Windows console input is not selectable; poll it each iteration. */
+    if (m->console_dev && virtio_console_can_write_data(m->console_dev)) {
+        uint8_t buf[128];
+        int rlen, len;
+        len = virtio_console_get_write_len(m->console_dev);
+        len = min_int(len, (int)sizeof(buf));
+        rlen = m->console->read_data(m->console->opaque, buf, len);
+        if (rlen > 0)
+            virtio_console_write_data(m->console_dev, buf, rlen);
+    }
+#endif
 
 #ifdef CONFIG_SDL
     sdl_refresh(m);
@@ -612,10 +1069,27 @@ static struct option options[] = {
     { NULL },
 };
 
+static void print_backend_info(void)
+{
+#if defined(USE_KVM)
+    {
+        int kvm_fd = open("/dev/kvm", O_RDONLY);
+        if (kvm_fd >= 0) {
+            printf("x86 backend : KVM (available)\n");
+            close(kvm_fd);
+        } else {
+            printf("x86 backend : KVM (built-in, /dev/kvm not accessible on this host)\n");
+        }
+    }
+#else
+    printf("x86 backend : software interpreter (no acceleration)\n");
+#endif
+}
+
 void help(void)
 {
     printf("temu version " CONFIG_VERSION ", Copyright (c) 2016-2018 Fabrice Bellard\n"
-           "usage: riscvemu [options] config_file\n"
+           "usage: temu [options] config_file\n"
            "options are:\n"
            "-m ram_size       set the RAM size in MB\n"
            "-rw               allow write access to the disk image (default=snapshot)\n"
@@ -625,7 +1099,9 @@ void help(void)
            "-no-accel         disable VM acceleration (KVM, x86 machine only)\n"
            "\n"
            "Console keys:\n"
-           "Press C-a x to exit the emulator, C-a h to get some help.\n");
+           "Press C-a x to exit the emulator, C-a h to get some help.\n"
+           "\n");
+    print_backend_info();
     exit(1);
 }
 
@@ -742,7 +1218,11 @@ int main(int argc, char **argv)
         } else
 #endif
         {
-            drive = block_device_init(fname, drive_mode);
+            /* recognise a splitimg chunk manifest (e.g. blk.txt); fall back to
+               a raw image otherwise */
+            drive = block_device_init_split(fname, drive_mode);
+            if (!drive)
+                drive = block_device_init(fname, drive_mode);
         }
         free(fname);
         p->tab_drive[i].block_dev = drive;
@@ -808,19 +1288,14 @@ int main(int argc, char **argv)
     } else
 #endif
     {
-#ifdef _WIN32
-        fprintf(stderr, "Console not supported yet\n");
-        exit(1);
-#else
         p->console = console_init(allow_ctrlc);
-#endif
     }
     p->rtc_real_time = TRUE;
 
     s = virt_machine_init(p);
     if (!s)
         exit(1);
-    
+
     virt_machine_free_config(p);
 
     if (s->net) {
