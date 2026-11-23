@@ -103,6 +103,7 @@ This repo has no page of its own that boots a VM. To try the engine in a browser
 - **x86:** `tests/alpine-x86.cfg` boots Alpine 3.12 i686 over the network (Bellard's jslinux kernel + 9P rootfs) on `hvc0`. A good boot reaches a root shell (`uname -a` → `4.12.0-rc6 ... i686`). The fetch can be slow or stall; retry.
 - **RISC-V:** `./temu https://bellard.org/jslinux/buildroot-riscv64.cfg`, or the TinyEMU-distros riscv64 images (OpenSBI `bios:` + Linux 6.12 `kernel:`).
 - **Current images** for both machines (Alpine 3.20, Debian) come from TinyEMU-distros' releases.
+- **Inline configs:** the config may also be a `data:` URL (native and browser) or a `blob:` URL (browser only). It has no directory, so the files it names are relative to the working directory natively and to the page in the browser (`Module.pageUrl`, which a host running the engine in a worker sets to the page's URL). Files in an `http(s)` config are relative to the config. Natively `machine.c` decodes `data:` itself, without `CONFIG_FS_NET`; in WASM every file goes to the XHR.
 - **Offline, fast loop:** a config whose `kernel:` is a local `kernel-x86.bin` and whose `fs0:` is a local directory holding a static i686 busybox (`/bin/sh` → busybox, `dev/console`), with `init=/bin/sh` in `cmdline`, boots in about 12 s.
 
 Console notes: only `hvc0` (the VirtIO console) receives stdin — x86 `ttyS0` and the RISC-V HTIF console are output-only, so use `console=hvc0`. Keep stdin open (not `/dev/null`), or temu exits on console EOF. `C-a x` exits, `C-a h` lists the keys.

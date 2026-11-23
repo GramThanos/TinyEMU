@@ -44,6 +44,14 @@ mergeInto(LibraryManager.library, {
 		let _password = password ? UTF8ToString(password) : null;
 		let _post_data = _request == "POST" ? HEAPU8.subarray(post_data, post_data + post_data_len) : null;
 
+		// A relative URL (from a blob: or data: config, or a relative config
+		// URL) is relative to the page. In a worker the XHR would resolve it
+		// against the worker's script, so the host may give the page's URL as
+		// Module.pageUrl. Absolute URLs (http:, blob:, data:, ...) are unchanged.
+		if (Module.pageUrl && !/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(_url)) {
+			try { _url = new URL(_url, Module.pageUrl).href; } catch (e) { /* leave it */ }
+		}
+
 		let http = new XMLHttpRequest();
 		http.open(_request, _url, true);
 		http.responseType = 'arraybuffer';

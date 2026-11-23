@@ -339,7 +339,10 @@ static void init_vm_fs_next(void *arg)
             continue;   /* synchronous: go straight to the next entry */
         }
 #endif
-        p->tab_fs[i].fs_dev = fs_net_init(fname, init_vm_fs_next, s);
+        /* relative to the config file, like the kernel and the drives */
+        char *url = get_file_path(p->cfg_filename, fname);
+        p->tab_fs[i].fs_dev = fs_net_init(url, init_vm_fs_next, s);
+        free(url);
         if (s->pwd)
             fs_net_set_pwd(p->tab_fs[i].fs_dev, s->pwd);
         s->fs_index++;
@@ -395,7 +398,9 @@ static void init_vm(void *arg)
     int i;
     
     p->rtc_real_time = TRUE;
-    p->ram_size = s->ram_size << 20;
+    /* ram_size <= 0: the config's memory_size (as temu.c does) */
+    if (s->ram_size > 0)
+        p->ram_size = (uint64_t)s->ram_size << 20;
     if (s->cmdline && s->cmdline[0] != '\0') {
         vm_add_cmdline(s->p, s->cmdline);
     }

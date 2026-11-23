@@ -25,6 +25,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <strings.h>
+#include <ctype.h>
 #include <inttypes.h>
 #include <assert.h>
 #include <fcntl.h>
@@ -418,13 +420,21 @@ static void config_additional_file_load(VMConfigLoadState *s);
 static void config_additional_file_load_cb(void *opaque,
                                            uint8_t *buf, int buf_len);
 
+/* A config given inline, as a data: URL (or, in the browser, a blob: URL), has
+   no directory of its own: the files it names are relative to the page in the
+   browser and to the working directory natively. */
+static BOOL is_inline_url(const char *path)
+{
+    return strstart(path, "data:", NULL) || strstart(path, "blob:", NULL);
+}
+
 /* XXX: win32, URL */
 char *get_file_path(const char *base_filename, const char *filename)
 {
     int len, len1;
     char *fname, *p;
-    
-    if (!base_filename)
+
+    if (!base_filename || is_inline_url(base_filename))
         goto done;
     if (strchr(filename, ':'))
         goto done; /* full URL */
@@ -476,6 +486,89 @@ static int load_file(uint8_t **pbuf, const char *filename)
 }
 #endif
 
+#ifndef EMSCRIPTEN
+static int hex_digit(int c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+static int base64_digit(int c)
+{
+    if (c >= 'A' && c <= 'Z')
+        return c - 'A';
+    if (c >= 'a' && c <= 'z')
+        return c - 'a' + 26;
+    if (c >= '0' && c <= '9')
+        return c - '0' + 52;
+    if (c == '+' || c == '-')
+        return 62;
+    if (c == '/' || c == '_')
+        return 63;
+    return -1;
+}
+
+/* Decode a data: URL (RFC 2397): "data:[<type>][;base64],<data>", with the
+   data percent-encoded (and then base64-decoded if ";base64" is given).
+   Returns the length, or -1 if it is malformed. *pbuf is malloc'ed and
+   NUL-terminated. */
+static int load_data_url(uint8_t **pbuf, const char *url)
+{
+    const char *comma, *p;
+    uint8_t *buf;
+    BOOL b64;
+    int len, h1, h2, bits, nbits, d;
+
+    comma = strchr(url, ',');
+    if (!strstart(url, "data:", NULL) || !comma)
+        return -1;
+    b64 = (comma - url >= 12 && !strncasecmp(comma - 7, ";base64", 7));
+
+    /* percent-decode */
+    buf = malloc(strlen(comma + 1) + 1);
+    len = 0;
+    for(p = comma + 1; *p != '\0'; p++) {
+        if (*p == '%' && (h1 = hex_digit(p[1])) >= 0 &&
+            (h2 = hex_digit(p[2])) >= 0) {
+            buf[len++] = (h1 << 4) | h2;
+            p += 2;
+        } else {
+            buf[len++] = *p;
+        }
+    }
+
+    if (b64) {
+        int i, out = 0;
+        bits = 0;
+        nbits = 0;
+        for(i = 0; i < len; i++) {
+            if (buf[i] == '=' || isspace(buf[i]))
+                continue;
+            d = base64_digit(buf[i]);
+            if (d < 0) {
+                free(buf);
+                return -1;
+            }
+            bits = (bits << 6) | d;
+            nbits += 6;
+            if (nbits >= 8) {
+                nbits -= 8;
+                buf[out++] = (bits >> nbits) & 0xff;
+            }
+        }
+        len = out;
+    }
+    buf[len] = '\0';
+    *pbuf = buf;
+    return len;
+}
+#endif
+
 #ifdef CONFIG_FS_NET
 static void config_load_file_cb(void *opaque, int err, void *data, size_t size)
 {
@@ -494,8 +587,32 @@ static void config_load_file(VMConfigLoadState *s, const char *filename,
                              FSLoadFileCB *cb, void *opaque)
 {
     //    printf("loading %s\n", filename);
+#ifndef EMSCRIPTEN
+    if (strstart(filename, "data:", NULL)) {
+        uint8_t *buf;
+        int size;
+        size = load_data_url(&buf, filename);
+        if (size < 0) {
+            vm_error("Invalid data: URL\n");
+            exit(1);
+        }
+        cb(opaque, buf, size);
+        free(buf);
+        return;
+    }
+    if (strstart(filename, "blob:", NULL)) {
+        vm_error("blob: URLs only work in the browser\n");
+        exit(1);
+    }
+#endif
 #ifdef CONFIG_FS_NET
+#ifdef EMSCRIPTEN
+    /* every name goes to the XHR, which also takes blob:, data: and
+       page-relative URLs (there is no local file system to read) */
+    if (TRUE) {
+#else
     if (is_url(filename)) {
+#endif
         s->file_load_cb = cb;
         s->file_load_opaque = opaque;
         fs_wget(filename, NULL, NULL, s, config_load_file_cb, TRUE);
