@@ -93,7 +93,12 @@
 
 #define MAX_QUEUE 8
 #define MAX_CONFIG_SPACE_SIZE 256
-#define MAX_QUEUE_NUM 16
+/* Ring size offered to the guest. Linux's virtio-net (tx NAPI, the
+   default since 4.x) stops the tx queue when fewer than
+   2 + MAX_SKB_FRAGS (= 19) descriptors are free and only wakes it once
+   that many are free again: with a ring smaller than 19 it sends one
+   packet and then stalls forever. 256 is what QEMU offers. */
+#define MAX_QUEUE_NUM 256
 
 typedef struct {
     uint32_t ready; /* 0 or 1 */
@@ -743,7 +748,7 @@ static void virtio_mmio_write(void *opaque, uint32_t offset,
                 s->queue_sel = val;
             break;
         case VIRTIO_MMIO_QUEUE_NUM:
-            if ((val & (val - 1)) == 0 && val > 0) {
+            if ((val & (val - 1)) == 0 && val > 0 && val <= MAX_QUEUE_NUM) {
                 s->queue[s->queue_sel].num = val;
             }
             break;
@@ -843,7 +848,7 @@ static uint32_t virtio_pci_read(void *opaque, uint32_t offset1, int size_log2)
         } else if (size_log2 == 1) {
             switch(offset) {
             case VIRTIO_PCI_NUM_QUEUES:
-                val = MAX_QUEUE_NUM;
+                val = MAX_QUEUE;
                 break;
             case VIRTIO_PCI_QUEUE_SEL:
                 val = s->queue_sel;
@@ -934,7 +939,7 @@ static void virtio_pci_write(void *opaque, uint32_t offset1,
                     s->queue_sel = val;
                 break;
             case VIRTIO_PCI_QUEUE_SIZE:
-                if ((val & (val - 1)) == 0 && val > 0) {
+                if ((val & (val - 1)) == 0 && val > 0 && val <= MAX_QUEUE_NUM) {
                     s->queue[s->queue_sel].num = val;
                 }
                 break;

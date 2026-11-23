@@ -122,7 +122,7 @@ CI (`test.yml`) runs all but the boot test on every push and pull request. There
 
 ### Releasing
 
-Bump `VERSION` (a date, e.g. `2026-11-22`) and push a `v*` tag: `pages.yml` tests, builds and publishes `engine/<version>/` and `bin/<version>/` to the `gh-pages` branch. It can also be run by hand from the Actions tab.
+Push a `v*` tag (e.g. `v2026-11-22`): `pages.yml` tests, builds and publishes `engine/<tag>/` and `bin/<tag>/` to the `gh-pages` branch, and points `engine/latest/` and `index.json` at it. The tag name is the published version; `VERSION` is only what the native binary reports (`CONFIG_VERSION`), so keep it in step with the tag. A manual run (Actions tab) takes an optional version name, defaulting to `<VERSION>-<short sha>`; it also moves `latest`. One-time setup: Settings → Pages → Deploy from a branch → `gh-pages`, `/`.
 
 ## Conventions
 
