@@ -4,85 +4,278 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TinyEMU builds</title>
-<style>
-  body { font: 16px/1.5 system-ui, sans-serif; max-width: 52rem; margin: 2rem auto; padding: 0 1rem; color: #222; }
-  code, pre { font-family: ui-monospace, monospace; font-size: 0.9em; }
-  pre { background: #f4f4f4; padding: 0.8rem; overflow-x: auto; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #ddd; }
-  @media (prefers-color-scheme: dark) {
-    body { background: #161616; color: #ddd; } pre { background: #252525; } th, td { border-color: #333; }
-    a { color: #8ab4f8; }
-  }
-</style>
+<title>TinyEMU: Linux on x86 and RISC-V, in your browser</title>
+<meta name="description" content="A small system emulator with a software x86 CPU and RISC-V that boots Linux natively or in the browser as WebAssembly. Release builds of the engine and the native binaries.">
+<meta name="theme-color" content="#1b1b1f">
+<link rel="icon" type="image/svg+xml" href="logo.svg">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+<link rel="stylesheet" href="style.css">
+<script>
+  (function () {
+    var t = localStorage.getItem('tinyemu-theme');
+    if (t === 'dark' || (!t && matchMedia('(prefers-color-scheme: dark)').matches)) document.documentElement.classList.add('dark');
+  })();
+</script>
 </head>
 <body>
-<h1>TinyEMU builds</h1>
-<p>Release builds of <a href="https://github.com/gramthanos/TinyEMU">TinyEMU</a>
-(MIT): a system emulator with a software x86 CPU and RISC-V that boots Linux,
-natively or in the browser as WebAssembly.</p>
 
-<h2>WebAssembly engine</h2>
-<p>One engine runs both the PC (x86) and RISC-V machines. Other sites can load
-it from here directly. Pin a version rather than <code>latest/</code>, since a
-release can change the engine's JS API:</p>
-<pre id="urls">engine/&lt;version&gt;/x86emu-wasm.js
-engine/&lt;version&gt;/x86emu-wasm.wasm</pre>
-<p>It needs WebAssembly exception handling: Chrome 95+, Safari 15.4+, Firefox 131+.
-The JavaScript runtime that drives it (VMs, volumes, snapshots, networking) is
-<a href="https://github.com/gramthanos/jsLab">jsLab</a>:</p>
-<pre id="usage">import { VMManager } from './jsLab/lib/vm/index.js';
+<header class="nav">
+  <div class="nav-inner">
+    <a class="logo" href="#"><img src="logo.svg" alt=""> TinyEMU</a>
+    <nav class="nav-links">
+      <a href="#playground" class="hide-xs">Playground</a>
+      <a href="#download" class="hide-xs">Download</a>
+      <a href="#getting-started" class="hide-sm">Guide</a>
+      <a href="#engine" class="hide-sm">Engine</a>
+      <a href="#build" class="hide-sm">Build</a>
+      <span class="nav-sep"></span>
+      <button class="icon-btn theme-toggle" id="theme-toggle" aria-label="Toggle dark mode" title="Toggle dark mode">
+        <svg class="sun" viewBox="0 0 24 24"><path d="M12 18a6 6 0 1 1 0-12 6 6 0 0 1 0 12zm0-2a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM11 1h2v3h-2V1zm0 19h2v3h-2v-3zM3.5 4.9l1.4-1.4L7 5.6 5.6 7 3.5 4.9zM17 18.4l1.4-1.4 2.1 2.1-1.4 1.4-2.1-2.1zM20.5 3.5l1.4 1.4L19.8 7l-1.4-1.4 2.1-2.1zM5.6 17 7 18.4l-2.1 2.1-1.4-1.4L5.6 17zM23 11v2h-3v-2h3zM4 11v2H1v-2h3z"/></svg>
+        <svg class="moon" viewBox="0 0 24 24"><path d="M10 7a7 7 0 0 0 12 4.9v.1c0 5.5-4.5 10-10 10S2 17.5 2 12 6.5 2 12 2h.1A7 7 0 0 0 10 7zm-6 5a8 8 0 0 0 15.9 1.4A9 9 0 0 1 10.6 4.1 8 8 0 0 0 4 12z"/></svg>
+      </button>
+      <a class="icon-btn" href="https://github.com/GramThanos/TinyEMU" aria-label="GitHub" title="GitHub">
+        <svg viewBox="0 0 24 24"><path d="M12 .3a12 12 0 0 0-3.8 23.4c.6.1.8-.3.8-.6v-2c-3.3.7-4-1.6-4-1.6-.6-1.4-1.4-1.8-1.4-1.8-1-.7.1-.7.1-.7 1.2.1 1.8 1.2 1.8 1.2 1 1.8 2.8 1.3 3.5 1 0-.8.4-1.3.7-1.6-2.7-.3-5.5-1.3-5.5-6 0-1.2.5-2.3 1.3-3.1-.2-.4-.6-1.6 0-3.2 0 0 1-.3 3.4 1.2a11.5 11.5 0 0 1 6 0c2.3-1.5 3.3-1.2 3.3-1.2.6 1.6.2 2.8 0 3.2.9.8 1.3 1.9 1.3 3.2 0 4.6-2.8 5.6-5.5 5.9.5.4.9 1 .9 2.2v3.3c0 .3.1.7.8.6A12 12 0 0 0 12 .3"/></svg>
+      </a>
+    </nav>
+  </div>
+</header>
+
+<main>
+
+<section class="hero">
+  <div class="hero-inner">
+    <div>
+      <h1 class="hero-name">TinyEMU</h1>
+      <p class="hero-text">Linux on x86 and RISC&#8209;V, in your browser</p>
+      <p class="hero-tagline">A small system emulator that boots real Linux distributions, natively or as WebAssembly. A from-scratch 32-bit x86 CPU with an x86&nbsp;→&nbsp;WASM JIT, RISC-V RV32/64/128, VirtIO devices and disks streamed over HTTP.</p>
+      <div class="hero-actions">
+        <a class="btn btn-brand" href="#playground">Boot Linux in the browser</a>
+        <a class="btn btn-alt" href="#download">Download</a>
+        <a class="btn btn-alt" href="https://github.com/GramThanos/TinyEMU">View on GitHub</a>
+      </div>
+    </div>
+    <div class="hero-image" aria-hidden="true">
+      <div class="hero-glow"></div>
+      <div class="hero-mark"><img src="logo.svg" alt=""></div>
+    </div>
+  </div>
+</section>
+
+<section class="section">
+  <div class="container features">
+    <div class="feature">
+      <div class="feature-icon">🖥️</div>
+      <h3>Two machines, one engine</h3>
+      <p>A PC with a 32-bit protected-mode x86 CPU (x87, SSE/SSE2) and a RISC-V machine (RV32/64/128 IMAFDQC), sharing the same device layer.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">🐧</div>
+      <h3>Boots real Linux</h3>
+      <p>Alpine and Debian on i686, Linux 6.12 on riscv64 through OpenSBI. Kernels load directly, with no BIOS; gzip bzImages are inflated on the host.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">⚡</div>
+      <h3>x86 → WebAssembly JIT</h3>
+      <p>Hot guest code pages compile into WASM functions in the background while the interpreter keeps running. Boots Alpine in about 10 seconds.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">🌐</div>
+      <h3>Disks over HTTP</h3>
+      <p>Block devices stream in chunks (raw or gzip) and 9P filesystems load on demand, so a multi-GB image boots after downloading only what it reads.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">🧩</div>
+      <h3>VirtIO everything</h3>
+      <p>Console, block, network (user-mode SLIRP natively), 9P, input and a simple framebuffer, described by a short JSON config.</p>
+    </div>
+    <div class="feature">
+      <div class="feature-icon">📦</div>
+      <h3>Native too, MIT licensed</h3>
+      <p><code>temu</code> builds for Linux (software CPU or KVM) and Windows. Based on Fabrice Bellard's TinyEMU, MIT like the original.</p>
+    </div>
+  </div>
+</section>
+
+<section class="playground" id="playground">
+  <div class="section-head">
+    <h2>Try it in your browser</h2>
+    <p>Pick an image from <a href="https://gramthanos.github.io/TinyEMU-distros/">TinyEMU-distros</a> and boot it. The engine runs in a web worker on this page; the kernel and the disk chunks it reads are fetched from GitHub Pages. The <em>lite</em> images skip init and drop straight into a root shell.</p>
+  </div>
+  <div class="play-controls">
+    <select id="play-distro" aria-label="Guest image"><option>Loading images…</option></select>
+    <button class="btn btn-brand" id="play-boot">Boot</button>
+    <button class="btn btn-alt" id="play-reset">Reset</button>
+    <span class="play-desc" id="play-desc"></span>
+  </div>
+  <div class="term-window">
+    <div class="term-bar">
+      <i></i><i></i><i></i>
+      <span class="term-title" id="term-title">TinyEMU</span>
+      <span class="term-stats" id="term-stats"></span>
+    </div>
+    <div class="term-body">
+      <div id="terminal"></div>
+      <div class="term-overlay" id="term-overlay">
+        <button class="btn btn-brand" id="play-overlay-boot" disabled>▶ Boot Linux</button>
+        <p>Downloads a few MB of kernel and disk. Needs a browser with WebAssembly exception handling (Chrome 95+, Safari 15.4+, Firefox 131+).</p>
+      </div>
+    </div>
+  </div>
+  <div class="play-cmds" aria-label="Example commands">
+    <button>uname -a</button>
+    <button>mount -t proc proc /proc</button>
+    <button>cat /proc/cpuinfo</button>
+    <button>free -m</button>
+    <button>ls /</button>
+    <button>for i in 1 2 3 4 5; do echo "$i squared is $((i*i))"; done</button>
+    <button>time sh -c 'i=0; while [ $i -lt 20000 ]; do i=$((i+1)); done'</button>
+  </div>
+  <p class="play-note">A <em>lite</em> image runs the shell as init, so mount <code>/proc</code> before using <code>free</code> or <code>ps</code>. The guest has no network here. Its clock starts at boot time on x86; the RISC-V machine has no RTC, so it starts in 1970.</p>
+</section>
+
+<div class="doc">
+
+<h2 id="download">Download</h2>
+<p>The newest release is <code id="latest-version">…</code> <span class="muted" id="latest-date"></span>. Every release is built and tested by CI from a <code>v*</code> tag and stays online here.</p>
+<div class="dl-grid" id="dl-grid"><p class="muted">Loading releases…</p></div>
+
+<h3>All releases</h3>
+<table>
+  <thead><tr><th>Version</th><th>Date</th><th>Engine</th><th>Binaries</th><th>Commit</th></tr></thead>
+  <tbody id="releases"><tr><td colspan="5" class="muted">Loading index.json…</td></tr></tbody>
+</table>
+<p>Each release directory has a <code>SHA256SUMS</code> file. Machine-readable list: <a href="index.json">index.json</a> (<code>latest</code> plus every version's <code>engine/</code> and <code>bin/</code> paths).</p>
+
+<h2 id="getting-started">Getting Started</h2>
+
+<h3>Linux</h3>
+<div class="code"><span class="lang">sh</span><pre><code data-version>curl -LO https://gramthanos.github.io/TinyEMU/bin/&lt;version&gt;/temu-linux-x86_64.tar.gz
+tar xzf temu-linux-x86_64.tar.gz
+./temu-soft https://gramthanos.github.io/TinyEMU-distros/alpine-3.20-x86-lite/config.cfg</code></pre></div>
+<p><code>temu-soft</code> has the software x86 CPU and RISC-V, with HTTP disks, user-mode networking and an SDL window for framebuffer guests. <code>temu-kvm</code> runs the PC machine through KVM (needs <code>/dev/kvm</code>).</p>
+
+<h3>Windows</h3>
+<div class="code"><span class="lang">powershell</span><pre><code data-version>Invoke-WebRequest https://gramthanos.github.io/TinyEMU/bin/&lt;version&gt;/temu-windows.zip -OutFile temu-windows.zip
+Expand-Archive temu-windows.zip temu
+.\temu\temu.exe https://gramthanos.github.io/TinyEMU-distros/alpine-3.20-x86-lite/config.cfg</code></pre></div>
+<p>The Windows build is headless (console only), with HTTP disks and user-mode networking.</p>
+
+<h3>Options and console keys</h3>
+<table>
+  <thead><tr><th>Option</th><th>Meaning</th></tr></thead>
+  <tbody>
+    <tr><td><code>-m &lt;MB&gt;</code></td><td>RAM size, overriding the config's <code>memory_size</code></td></tr>
+    <tr><td><code>-rw</code></td><td>write to the disk image (the default keeps writes in memory)</td></tr>
+    <tr><td><code>-append &lt;cmdline&gt;</code></td><td>append to the kernel command line</td></tr>
+    <tr><td><code>-ctrlc</code></td><td>Ctrl-C stops the emulator instead of reaching the guest</td></tr>
+    <tr><td><code>-no-accel</code></td><td>don't use KVM (x86 machine)</td></tr>
+    <tr><td><code>Ctrl-A x</code> / <code>Ctrl-A h</code></td><td>exit / list the console keys</td></tr>
+  </tbody>
+</table>
+<div class="tip"><b>TIP</b>The VirtIO console <code>hvc0</code> is the one that takes keyboard input, so guests should use <code>console=hvc0</code>. The config may also be a local file or a <code>data:</code> URL.</div>
+
+<h3>A config</h3>
+<p>A VM is a small JSON5-style file. Paths are relative to the config:</p>
+<div class="code"><span class="lang">cfg</span><pre><code>{
+  version: 1,
+  machine: "pc",                 // or "riscv32", "riscv64", "riscv128"
+  memory_size: 128,              // MB
+  bios: "fw_jump.bin",           // RISC-V: OpenSBI; the PC has no BIOS
+  kernel: "kernel.bin",          // bzImage (gzip inflated on the host) or ELF
+  cmdline: "console=hvc0 root=/dev/vda rw",
+  drive0: { file: "blk.txt" },   // chunked HTTP disk, or a raw image
+  fs0: { file: "rootfs", tag: "/dev/root" },  // 9P filesystem
+  eth0: { driver: "user" },      // SLIRP natively; the host's network in the browser
+  display0: { device: "simplefb", width: 800, height: 600 },
+}</code></pre></div>
+
+<h3>Machines</h3>
+<table>
+  <thead><tr><th>Machine</th><th><code>machine:</code></th><th>CPU</th><th>Guests</th></tr></thead>
+  <tbody>
+    <tr><td>PC</td><td><code>pc</code></td><td>32-bit protected-mode x86 interpreter (x87, SSE/SSE2), x86 → WASM JIT in the browser, KVM natively</td><td>Linux i686 booted from a kernel image (no BIOS, so no DOS or Windows)</td></tr>
+    <tr><td>RISC-V</td><td><code>riscv32</code>, <code>riscv64</code>, <code>riscv128</code></td><td>RV32/64/128 IMAFDQC with SoftFP</td><td>Linux 6.12 via OpenSBI <code>fw_jump</code>, Buildroot (riscv128 native only)</td></tr>
+  </tbody>
+</table>
+
+<h2 id="engine">The WebAssembly engine</h2>
+<p><code>x86emu-wasm.js</code> and <code>x86emu-wasm.wasm</code> are one engine with both machines (the name is historical). Load them from here with a pinned version rather than <code>engine/latest/</code>, since a release may change the engine's JS API:</p>
+<div class="code"><span class="lang">url</span><pre><code data-engine-url>https://gramthanos.github.io/TinyEMU/engine/&lt;version&gt;/x86emu-wasm.js
+https://gramthanos.github.io/TinyEMU/engine/&lt;version&gt;/x86emu-wasm.wasm</code></pre></div>
+
+<h3>With jsLab</h3>
+<p><a href="https://github.com/GramThanos/jsLab">jsLab</a> is the runtime that drives the engine in a page: several VMs, volumes, snapshots and a virtual network between them.</p>
+<div class="code"><span class="lang">js</span><pre><code data-engine-url>import { VMManager } from './jsLab/lib/vm/index.js';
+
 const vms = new VMManager({ urls: {
   wasmJsUrl:  'https://gramthanos.github.io/TinyEMU/engine/&lt;version&gt;/x86emu-wasm.js',
   wasmBinUrl: 'https://gramthanos.github.io/TinyEMU/engine/&lt;version&gt;/x86emu-wasm.wasm',
-} });</pre>
+} });</code></pre></div>
 
-<h2>Native binaries</h2>
-<p><code>temu-linux-x86_64.tar.gz</code> holds <code>temu-soft</code> (software x86 CPU + RISC-V)
-and <code>temu-kvm</code> (x86 through KVM). <code>temu-windows.zip</code> holds
-<code>temu.exe</code> with its DLLs. Guest images:
-<a href="https://github.com/gramthanos/TinyEMU-distros">TinyEMU-distros</a>.</p>
+<h3>Driving it yourself</h3>
+<p>The engine is a classic Emscripten script that reads a global <code>Module</code>. Give it a console, an XHR table, then call <code>vm_start</code>. This is all the playground above does, in a <a href="play-worker.js">worker</a>:</p>
+<div class="code"><span class="lang">js</span><pre><code>self.Module = {
+  locateFile: (f) =&gt; engineBase + f,          // where the .wasm is
+  x86jit: true,                                 // turn on the x86 JIT
+  api: {
+    terminal: {
+      write: (bytes) =&gt; term.write(bytes.slice()), // console output
+      getSize: () =&gt; [80, 25],
+    },
+    wgetRequests: { n: 1, new(x) { return this.n++; }, remove() {} },
+    downloading: { update(flag) {} },
+  },
+  onRuntimeInitialized() {
+    Module.ccall('vm_start', null,
+      ['string', 'number', 'string', 'string', 'number', 'number', 'number'],
+      [configUrl, 0 /* RAM: from config */, '' /* cmdline */, null,
+       0, 0 /* no framebuffer */, 0 /* no network */]);
+  },
+};
+importScripts(engineUrl);
 
-<h2>Releases</h2>
+// keyboard input, one byte at a time
+for (const b of new TextEncoder().encode(text)) Module._console_queue_char(b);</code></pre></div>
 <table>
-  <thead><tr><th>Version</th><th>Date</th><th>Engine</th><th>Binaries</th></tr></thead>
-  <tbody id="releases"><tr><td colspan="4">Loading index.json…</td></tr></tbody>
+  <thead><tr><th>Export</th><th>Use</th></tr></thead>
+  <tbody>
+    <tr><td><code>vm_start(url, ramMB, cmdline, pwd, width, height, net)</code></td><td>load a config (<code>http(s):</code>, <code>data:</code> or <code>blob:</code>) and boot it; <code>width</code>/<code>height</code> &gt; 0 adds a framebuffer drawn through <code>Module.api.display</code></td></tr>
+    <tr><td><code>vm_pause</code>, <code>vm_resume</code>, <code>vm_stop</code></td><td>control the run loop</td></tr>
+    <tr><td><code>console_queue_char(c)</code></td><td>console input</td></tr>
+    <tr><td><code>display_key_event</code>, <code>display_mouse_event</code>, <code>display_wheel_event</code></td><td>framebuffer input (VirtIO input)</td></tr>
+    <tr><td><code>net_write_packet</code>, <code>net_set_carrier</code></td><td>Ethernet frames in; frames out arrive at <code>Module.api.net.recvPacket</code></td></tr>
+    <tr><td><code>vm_snapshot_clock</code>, <code>vm_reserve_memory</code>, <code>vm_restore</code></td><td>snapshots: save the whole WASM memory between ticks, restore into a fresh instance</td></tr>
+    <tr><td><code>vm_cycles</code>, <code>vm_disk_chunks</code>, <code>vm_disk_bytes</code>, <code>vm_jit_blocks</code></td><td>statistics</td></tr>
+  </tbody>
 </table>
-<p>Each release directory has a <code>SHA256SUMS</code> file. Machine-readable list:
-<a href="index.json">index.json</a>.</p>
+<p>The engine needs WebAssembly exception handling: Chrome 95+, Safari 15.4+, Firefox 131+.</p>
 
-<script>
-'use strict';
-fetch('index.json', { cache: 'no-cache' }).then((r) => r.json()).then((idx) => {
-  const body = document.getElementById('releases');
-  body.textContent = '';
-  for (const e of idx.versions || []) {
-    const tr = document.createElement('tr');
-    const cell = (text, href) => {
-      const td = document.createElement('td');
-      if (href) { const a = document.createElement('a'); a.href = href; a.textContent = text; td.append(a); }
-      else td.textContent = text;
-      tr.append(td);
-    };
-    cell(e.version + (e.version === idx.latest ? ' (latest)' : ''));
-    cell((e.date || '').slice(0, 10));
-    cell('x86emu-wasm.js', e.engine + 'x86emu-wasm.js');
-    const td = document.createElement('td');
-    for (const [t, f] of [['linux', 'temu-linux-x86_64.tar.gz'], ['windows', 'temu-windows.zip'], ['sums', 'SHA256SUMS']]) {
-      const a = document.createElement('a'); a.href = e.bin + f; a.textContent = t; td.append(a, ' ');
-    }
-    tr.append(td);
-    body.append(tr);
-  }
-  if (idx.latest) {
-    const base = new URL('engine/' + idx.latest + '/', location.href).href;
-    document.getElementById('usage').textContent = document.getElementById('usage').textContent
-      .replaceAll('https://gramthanos.github.io/TinyEMU/engine/<version>/', base);
-  }
-}).catch(() => {
-  document.getElementById('releases').innerHTML = '<tr><td colspan="4">No releases published yet.</td></tr>';
-});
-</script>
+<h2 id="build">Building from source</h2>
+<p>Docker is the supported path; the image has every native and Windows cross-build dependency.</p>
+<div class="code"><span class="lang">sh</span><pre><code>git clone https://github.com/GramThanos/TinyEMU && cd TinyEMU
+docker compose build build
+docker compose run --rm build              # release binaries into dist/
+docker run --rm -v "$PWD":/src -w /src emscripten/emsdk:3.1.74 make -f Makefile.js   # dist/wasm/</code></pre></div>
+<p>On Linux or WSL a plain <code>make</code> builds <code>./temu</code> (<code>make USE_KVM=1</code> for KVM); turn off what you lack with <code>CONFIG_SDL=</code> or <code>CONFIG_FS_NET=</code>. Tests: <code>make x86-selftest</code>, <code>sh tests/x86_jit_test.sh</code> and <code>make inflate-test</code>; CI runs them on every push. See <a href="https://github.com/GramThanos/TinyEMU/blob/main/AGENTS.md">AGENTS.md</a> for the source map and the engine's rules.</p>
+
+<h2 id="related">Related projects</h2>
+<ul>
+  <li><a href="https://bellard.org/tinyemu/">TinyEMU</a> by Fabrice Bellard, the emulator this fork started from (2019-12-21 release).</li>
+  <li><a href="https://bellard.org/jslinux/">JSLinux</a> by Fabrice Bellard, Linux and other operating systems in the browser; its RISC-V machines run on TinyEMU.</li>
+  <li><a href="https://github.com/GramThanos/TinyEMU-distros">TinyEMU-distros</a>: recipes for the guest kernels, root filesystems and firmware, published as <a href="https://gramthanos.github.io/TinyEMU-distros/">ready-to-boot images</a>.</li>
+  <li><a href="https://github.com/GramThanos/jsLab">jsLab</a>: the browser runtime around the engine (VMs, volumes, snapshots, virtual network).</li>
+  <li><a href="https://github.com/GramThanos/tinyemu-agent">tinyemu-agent</a>: a browser AI agent whose computer is a VM on this engine.</li>
+</ul>
+
+</div>
+</main>
+
+<footer>
+  MIT licensed · Based on TinyEMU by Fabrice Bellard · <a href="https://github.com/GramThanos/TinyEMU">GitHub</a>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+<script src="site.js"></script>
 </body>
 </html>

@@ -1,7 +1,8 @@
 # Publish a release to GitHub Pages, for other sites to load:
 #   engine/<version>/x86emu-wasm.{js,wasm}   engine/latest/ (the newest)
 #   bin/<version>/temu-linux-x86_64.tar.gz, temu-windows.zip
-#   index.json, index.html
+#   index.json, and the site from pages/ (landing page, downloads, and a
+#   playground that boots TinyEMU-distros images on engine/latest/)
 #
 # Releases accumulate on the gh-pages branch, so older versions stay online.
 # One-time setup: Settings -> Pages -> Source: "Deploy from a branch",
@@ -16,6 +17,10 @@ on:
       version:
         description: 'Version directory name (default: the tag, or VERSION-<short sha>)'
         required: false
+      site_only:
+        description: 'Only update the site (pages/), without building a release'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -26,6 +31,7 @@ concurrency:
 
 jobs:
   native:
+    if: ${{ !inputs.site_only }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +48,7 @@ jobs:
         with: { name: native, path: dist/ }
 
   wasm:
+    if: ${{ !inputs.site_only }}
     runs-on: ubuntu-latest
     container: emscripten/emsdk:3.1.74
     steps:
@@ -53,11 +60,14 @@ jobs:
 
   publish:
     needs: [native, wasm]
+    # native and wasm are skipped in a site-only run
+    if: ${{ !cancelled() && (inputs.site_only || (needs.native.result == 'success' && needs.wasm.result == 'success')) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with: { path: src }
       - name: Version
+        if: ${{ !inputs.site_only }}
         id: v
         run: |
           v='${{ inputs.version }}'
@@ -66,6 +76,7 @@ jobs:
           case "$v" in *[!A-Za-z0-9._-]*|''|latest) echo "bad version: $v"; exit 1;; esac
           echo "version=$v" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
+        if: ${{ !inputs.site_only }}
         with: { path: art }
       - name: Check out gh-pages (or start it)
         run: |
@@ -76,6 +87,7 @@ jobs:
             git init -b gh-pages site && git -C site remote add origin "$url"
           fi
       - name: Add the release
+        if: ${{ !inputs.site_only }}
         env:
           V: ${{ steps.v.outputs.version }}
         run: |
@@ -88,9 +100,6 @@ jobs:
           (cd ../art/native/windows && zip -qr "$OLDPWD/bin/$V/temu-windows.zip" .)
           for d in "engine/$V" "bin/$V"; do (cd "$d" && sha256sum * > SHA256SUMS); done
           cp -r "engine/$V" engine/latest
-          cp ../src/LICENSE LICENSE
-          cp ../src/pages/index.html index.html
-          touch .nojekyll
           node - "$V" "$(git -C ../src rev-parse HEAD)" <<'EOF'
           const fs = require('fs');
           const [v, commit] = process.argv.slice(2);
@@ -102,6 +111,12 @@ jobs:
           idx.latest = v;
           fs.writeFileSync('index.json', JSON.stringify(idx, null, 2) + '\n');
           EOF
+      - name: Update the site
+        run: |
+          cd site
+          cp ../src/LICENSE LICENSE
+          cp -r ../src/pages/. .
+          touch .nojekyll
       - name: Push gh-pages
         env:
           V: ${{ steps.v.outputs.version }}
@@ -110,5 +125,6 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
-          git commit -m "Publish $V"
+          if git diff --cached --quiet; then echo 'Nothing changed'; exit 0; fi
+          git commit -m "${V:+Publish $V}${V:-Update the site}"
           git push origin gh-pages

@@ -47,7 +47,7 @@ jsLab and tinyemu-agent are GPL-3.0-or-later: never copy code from them here.
 | Browser glue | `Makefile.js`, `wasm/lib.js` (the `Module.api` binding Emscripten links in) |
 | Tests | `tests/x86_cpu_selftest.c`, `tests/x86_jit_fuzz.c` + `tests/x86_jit_test.sh`, `tests/inflate_test.*`, `tests/alpine-x86.cfg` |
 | Benchmarks | `bench/microbench.c` (`make microbench`), `bench/bootbench.sh` |
-| CI / release | `.github/workflows/test.yml` (build + tests), `pages.yml` (publishes engine and binaries to GitHub Pages on a `v*` tag, onto `gh-pages` so older versions stay online); `pages/index.html` is the site's landing page |
+| CI / release | `.github/workflows/test.yml` (build + tests), `pages.yml` (publishes engine and binaries to GitHub Pages on a `v*` tag, onto `gh-pages` so older versions stay online); `pages/` is the site: landing page, downloads from `index.json`, and a playground that boots TinyEMU-distros images on `engine/latest/` in a worker (`play-worker.js`) |
 
 ## Quick start
 
@@ -123,7 +123,7 @@ CI (`test.yml`) runs all but the boot test on every push and pull request. There
 
 ### Releasing
 
-Push a `v*` tag (e.g. `v2026-11-22`): `pages.yml` tests, builds and publishes `engine/<tag>/` and `bin/<tag>/` to the `gh-pages` branch, and points `engine/latest/` and `index.json` at it. The tag name is the published version; `VERSION` is only what the native binary reports (`CONFIG_VERSION`), so keep it in step with the tag. A manual run (Actions tab) takes an optional version name, defaulting to `<VERSION>-<short sha>`; it also moves `latest`. One-time setup: Settings → Pages → Deploy from a branch → `gh-pages`, `/`.
+Push a `v*` tag (e.g. `v2026-11-22`): `pages.yml` tests, builds and publishes `engine/<tag>/` and `bin/<tag>/` to the `gh-pages` branch, and points `engine/latest/` and `index.json` at it. The tag name is the published version; `VERSION` is only what the native binary reports (`CONFIG_VERSION`), so keep it in step with the tag. A manual run (Actions tab) takes an optional version name, defaulting to `<VERSION>-<short sha>`; it also moves `latest`. A manual run with `site_only` republishes only `pages/` (no build, no new version). One-time setup: Settings → Pages → Deploy from a branch → `gh-pages`, `/`.
 
 ## Conventions
 
