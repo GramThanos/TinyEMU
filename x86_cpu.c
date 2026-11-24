@@ -3867,7 +3867,10 @@ static no_inline void x86_interp_loop(X86CPUState *s, int max_cycles)
             /* reg 6/7 would index seg[6]/seg[7] = LDT/TR, which are not segment
              * registers: the encoding is #UD, not a silent alias. */
             if (reg > 5) raise_fault(s, EXC_UD);
-            rm_write(s, &rm, s->seg[reg].sel, 2);
+            /* A register destination takes the operand size: with 32 bits the
+             * selector is zero-extended (P6+), and glibc's i386 pthread_create
+             * relies on it (mov %gs,%eax; sar $3,%eax). Memory is always 16. */
+            rm_write(s, &rm, s->seg[reg].sel, rm.is_reg ? op_size : 2);
         } break;
         case 0x8e: { /* mov Sreg, r/m16 */
             uint8_t m = fetch8_fast(s); decode_modrm(s, m, seg_override, &reg, &rm);

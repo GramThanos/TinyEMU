@@ -338,6 +338,33 @@ static void test_bswap(void)
     x86_cpu_end(s);
 }
 
+/* mov r/m, Sreg (8C): a 32-bit register destination is zero-extended, a 16-bit
+ * one keeps the upper half, and a memory destination is a 16-bit store whatever
+ * the operand size. glibc's i386 pthread_create depends on the first. */
+static void test_mov_from_sreg(void)
+{
+    static const uint8_t p[] = {
+        0xB8,0xEF,0xBE,0xAD,0xDE,         /* mov eax,0xdeadbeef     */
+        0x8C,0xD8,                        /* mov eax,ds             */
+        0xBB,0xEF,0xBE,0xAD,0xDE,         /* mov ebx,0xdeadbeef     */
+        0x66,0x8C,0xDB,                   /* mov bx,ds              */
+        0xC7,0x05,0x00,0x30,0,0,          /* mov dword [0x3000],    */
+              0xEF,0xBE,0xAD,0xDE,        /*     0xdeadbeef         */
+        0x8C,0x1D,0x00,0x30,0,0,          /* mov [0x3000],ds        */
+        0x8B,0x0D,0x00,0x30,0,0,          /* mov ecx,[0x3000]       */
+        0xF4                              /* hlt                    */
+    };
+    PhysMemoryMap *map = mk_map(0x10000);
+    X86CPUState *s = mk_cpu(map, 0x8000);
+    memcpy(g_ram, p, sizeof(p));
+    x86_cpu_interp(s, 1000);
+    printf("  mov r/m, Sreg: zero-extend r32, keep r16 high, 16-bit store\n");
+    CHECK(s, 0 /*EAX*/, 0x00000018);
+    CHECK(s, 3 /*EBX*/, 0xDEAD0018);
+    CHECK(s, 1 /*ECX*/, 0xDEAD0018);
+    x86_cpu_end(s);
+}
+
 static void test_call_indirect_pf_restart(void)
 {
     /* Regression for the "non-restartable instruction" bug: an indirect
@@ -2107,6 +2134,7 @@ int main(void)
     test_paging();
     test_pop_esp();
     test_bswap();
+    test_mov_from_sreg();
     test_unmapped_read_width();
     test_call_indirect_pf_restart();
     test_page_cross();
